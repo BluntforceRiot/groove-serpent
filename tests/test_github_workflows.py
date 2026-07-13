@@ -56,3 +56,17 @@ def test_windows_ci_installs_pinned_full_ffmpeg_with_libsoxr_smoke() -> None:
     assert (
         'aresample=44100:resampler=soxr:precision=33:cutoff=0.99' in text
     )
+
+
+def test_macos_ci_pins_libsoxr_enabled_ffmpeg_formula() -> None:
+    text = _ci_workflow_text()
+
+    assert "brew uninstall --ignore-dependencies ffmpeg || true" in text
+    assert "brew tap homebrew-ffmpeg/ffmpeg" in text
+    assert (
+        'git -C "$(brew --repo homebrew-ffmpeg/ffmpeg)" checkout --detach '
+        "c771da5a0a6bd5ddde6c07cb014570f872e851da" in text
+    )
+    assert (
+        "brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libsoxr" in text
+    )

@@ -59,9 +59,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes ffmpeg
 
-      - name: Install FFmpeg on macOS
+      - name: Install FFmpeg with libsoxr on macOS
         if: runner.os == 'macOS'
-        run: brew install ffmpeg
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew uninstall --ignore-dependencies ffmpeg || true
+          brew tap homebrew-ffmpeg/ffmpeg
+          git -C "$(brew --repo homebrew-ffmpeg/ffmpeg)" checkout --detach c771da5a0a6bd5ddde6c07cb014570f872e851da
+          brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libsoxr
 
       - name: Install FFmpeg on Windows
         if: runner.os == 'Windows'

@@ -23,8 +23,9 @@ First public alpha of the local-first vinyl digitization and conservative restor
 - Fresh-checkout provenance checks that require release archives to match canonical Git bytes.
 - Capability-accurate Alpha 1 artwork paired with a real workbench screenshot from synthetic audio.
 - Hosted CI explicitly exercises the libsoxr precision-33 resampling path, uses Chocolatey's
-  pinned full FFmpeg build on Windows, and keeps macOS temporary files under the canonical runner
-  directory without weakening symlink/reparse-point publication defenses.
+  pinned full FFmpeg build on Windows and a commit-pinned option-enabled Homebrew formula on
+  macOS. macOS temporary files stay under the canonical runner directory without weakening
+  symlink/reparse-point publication defenses.
 
 ### Known limitations
 

@@ -44,6 +44,14 @@ On Windows, Chocolatey's full build provides the required resampler:
 choco install ffmpeg-full --version=8.1.2
 ```
 
+Homebrew's core FFmpeg 8.1.2 formula does not enable libsoxr. On macOS, install the
+option-enabled formula from the `homebrew-ffmpeg` tap:
+
+```console
+brew tap homebrew-ffmpeg/ffmpeg
+brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libsoxr
+```
+
 ## Install from a checkout
 
 ```console

@@ -16,6 +16,10 @@ Groove Serpent depends on or interoperates with the projects and services below.
 
 FFmpeg licensing depends on how a particular FFmpeg build was configured. The upstream project explains its LGPL/GPL licensing and compliance considerations at <https://ffmpeg.org/legal.html>. Anyone who later redistributes an FFmpeg binary with Groove Serpent must review that exact build and satisfy its license obligations.
 
+Fixed speed correction uses FFmpeg's optional [libsoxr](https://sourceforge.net/projects/soxr/)
+resampling engine. libsoxr is not bundled with Groove Serpent; the selected FFmpeg build must
+enable it. libsoxr is distributed under its own LGPL license terms.
+
 ### Chromaprint and fpcalc
 
 [Chromaprint](https://acoustid.org/chromaprint) provides the optional external `fpcalc` executable used to calculate acoustic fingerprints for AcoustID lookup. Groove Serpent does not presently bundle it. Fingerprinting and AcoustID lookup are optional; core local analysis and export do not require them.
@@ -41,4 +45,3 @@ FFmpeg licensing depends on how a particular FFmpeg build was configured. The up
 [Audacity](https://www.audacityteam.org/) is not a Groove Serpent runtime dependency and is not bundled. Groove Serpent performs read-only discovery of a local Audacity installation for interoperability information; it does not modify Audacity configuration or control Audacity's audio processing.
 
 Project and product names are used only to identify the relevant dependencies, tools, and services. This notice does not imply endorsement by their respective maintainers.
-
