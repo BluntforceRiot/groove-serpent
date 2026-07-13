@@ -1,0 +1,22 @@
+{
+  "artist": "Example Artist",
+  "album": "Example Album",
+  "album_artist": "Example Artist",
+  "year": "1978",
+  "genre": "Rock",
+  "side": "A",
+  "tracks": [
+    {
+      "title": "Opening Track",
+      "duration": "4:12"
+    },
+    {
+      "title": "Second Track",
+      "duration": "3:48"
+    },
+    {
+      "title": "Side Finale",
+      "duration": "6:01"
+    }
+  ]
+}

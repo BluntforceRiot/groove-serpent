@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a reproducible problem using synthetic, privacy-safe evidence.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Groove Serpent.
+
+        **Do not upload copyrighted recordings or downloaded artwork, API keys, credentials, private project files, or private local paths.** Use a small synthetic reproduction whenever possible. Redact collection metadata and hashes from logs.
+
+        Report suspected vulnerabilities through [private vulnerability reporting](https://github.com/BluntforceRiot/groove-serpent/security/advisories/new), not this form.
+
+  - type: checkboxes
+    id: safe-report
+    attributes:
+      label: Privacy and reproduction check
+      options:
+        - label: I have not included copyrighted recordings or artwork, API keys, credentials, private project files, or private local paths.
+          required: true
+        - label: I used synthetic audio, or explained why a reproduction can be described without attaching audio.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Groove Serpent version or commit
+      description: Paste `groove-serpent --version` output or a commit SHA.
+      placeholder: 0.5.0a1
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python, FFmpeg, ffprobe, and browser versions. Redact usernames and paths.
+      placeholder: Windows 11; Python 3.13.x; FFmpeg 8.x; Edge 150
+    validations:
+      required: true
+
+  - type: textarea
+    id: synthetic-reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Give the smallest deterministic steps or script that reproduces the problem. Prefer `scripts/create_demo_audio.py` or generated tones/noise.
+      placeholder: |
+        1. Generate the synthetic demo...
+        2. Run Groove Serpent with...
+        3. Review or export...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Explain whether the source or a derivative was involved.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sanitized-diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste only the smallest relevant log or traceback after removing local paths, metadata, hashes, tokens, and credentials.
+      render: shell
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add privacy-safe details about preservation, identity, performance, or interoperability impact.
+

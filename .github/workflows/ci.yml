@@ -1,0 +1,282 @@
+name: CI
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+        python:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install FFmpeg on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+
+      - name: Verify external tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          node --version
+
+      - name: Sync frozen development environment
+        run: uv sync --frozen --group dev
+
+      - name: Run synthetic FFmpeg integration
+        run: uv run --frozen --group dev python -m pytest -q tests/test_integration.py
+
+      - name: Run complete test suite
+        run: uv run --frozen --group dev python -m pytest -q
+
+      - name: Run strict typing, Flake8, Ruff, and Node syntax checks
+        run: uv run --frozen --group dev python scripts/check_quality.py
+
+      - name: Compile Python source
+        run: uv run --frozen --group dev python -m compileall -q src tests scripts
+
+  package:
+    name: Build and audit distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx --from twine==6.2.0 twine check dist/*
+
+      - name: Audit package contents for private material
+        shell: python {0}
+        run: |
+          from __future__ import annotations
+
+          import pathlib
+          import re
+          import tarfile
+          import zipfile
+
+          forbidden_endings = (
+              ".aif",
+              ".aiff",
+              ".album.json",
+              ".click-scan.json",
+              ".flac",
+              ".groove.json",
+              ".m4a",
+              ".mp3",
+              ".restoration-recipe.json",
+              ".wav",
+          )
+          private_patterns = (
+              re.compile(rb"[A-Za-z]:\\Users\\[^\\/\r\n]+", re.IGNORECASE),
+              re.compile(rb"[A-Za-z]:\\HomelabForge(?:\\|/)", re.IGNORECASE),
+              re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+              re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
+          )
+
+          archives = sorted(pathlib.Path("dist").glob("*"))
+          assert archives, "No distributions were built."
+          for archive in archives:
+              payloads: dict[str, bytes] = {}
+              if archive.suffix == ".whl":
+                  with zipfile.ZipFile(archive) as package:
+                      payloads = {
+                          info.filename: package.read(info)
+                          for info in package.infolist()
+                          if not info.is_dir()
+                      }
+              elif archive.name.endswith(".tar.gz"):
+                  with tarfile.open(archive, "r:gz") as package:
+                      links = [member.name for member in package if member.issym() or member.islnk()]
+                      assert not links, f"Linked package members are forbidden: {links}"
+                      for member in package.getmembers():
+                          if member.isfile():
+                              handle = package.extractfile(member)
+                              assert handle is not None
+                              payloads[member.name] = handle.read()
+              else:
+                  continue
+
+              assert payloads, f"No regular files found in {archive}"
+              for name, data in payloads.items():
+                  path = pathlib.PurePosixPath(name)
+                  assert not path.is_absolute() and ".." not in path.parts, (
+                      f"Unsafe package member: {name}"
+                  )
+                  lowered = name.casefold()
+                  assert not lowered.endswith(forbidden_endings), (
+                      f"Private media/project artifact packaged: {name}"
+                  )
+                  for pattern in private_patterns:
+                      assert pattern.search(data) is None, (
+                          f"Private or secret material matched in {archive.name}:{name}"
+                      )
+
+          print(f"Audited {len(archives)} distributions without private-content matches.")
+
+      - name: Install and smoke-test the wheel in a clean environment
+        shell: python {0}
+        run: |
+          from __future__ import annotations
+
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          wheels = list(pathlib.Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          environment = pathlib.Path(os.environ["RUNNER_TEMP"]) / "groove-serpent-wheel-smoke"
+          subprocess.run(
+              ["uv", "venv", str(environment), "--python", sys.executable],
+              check=True,
+          )
+          python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+          subprocess.run(
+              ["uv", "pip", "install", "--python", str(python), str(wheels[0])],
+              check=True,
+          )
+          subprocess.run([str(python), "-m", "groove_serpent", "--version"], check=True)
+          subprocess.run([str(python), "-m", "groove_serpent", "doctor"], check=True)
+          subprocess.run(
+              [
+                  str(python),
+                  "-c",
+                  (
+                      "from importlib.resources import files; "
+                      "root=files('groove_serpent').joinpath('web'); "
+                      "assert all(root.joinpath(n).is_file() for n in "
+                      "('index.html','app.js','styles.css'))"
+                  ),
+              ],
+              check=True,
+          )
+
+  source-archive:
+    name: Deterministic source ZIP / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Build normalized source archive
+        run: python scripts/build_public_archive.py
+
+      - name: Upload archive and manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: source-archive-${{ runner.os }}
+          path: |
+            dist/groove-serpent-0.5.0-alpha.1-source.zip
+            dist/SOURCE_MANIFEST.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  compare-source-archives:
+    name: Compare cross-platform source ZIPs
+    needs: source-archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download source archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: source-archive-*
+          path: comparison
+
+      - name: Require byte-identical archives
+        shell: python {0}
+        run: |
+          import hashlib
+          import pathlib
+
+          archives = sorted(pathlib.Path("comparison").rglob("*.zip"))
+          assert len(archives) == 3, archives
+          receipts = {}
+          for archive in archives:
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              receipts[str(archive)] = digest
+              print(f"{digest}  {archive}")
+          assert len(set(receipts.values())) == 1, receipts

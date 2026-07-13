@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Groove Serpent Review</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2311100f'/%3E%3Cpath d='M13 38c8-20 30-20 38 0M20 42c7-11 17-11 24 0' fill='none' stroke='%23d8ff4f' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">LOCAL-FIRST VINYL DIGITIZATION</div>
+      <h1>Groove Serpent <small>0.5</small></h1>
+      <p id="sourceSummary">Loading project…</p>
+    </div>
+    <div class="integrity-strip" aria-label="Project integrity status">
+      <span id="sourceIntegrity" class="integrity-badge pending">VERIFYING SOURCE</span>
+      <span id="revisionIdentity" class="integrity-detail">REVISION —</span>
+      <span id="saveIdentity" class="integrity-detail">STATE · loading</span>
+    </div>
+    <div class="toolbar">
+      <button id="saveButton" class="primary" disabled>Save project</button>
+      <button id="exportButton" aria-controls="exportPanel" aria-expanded="false" disabled>Export tracks</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel metadata-panel">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">RELEASE</span>
+          <h2>Album details</h2>
+        </div>
+        <span id="status" class="status" role="status" aria-live="polite">Loading</span>
+      </div>
+      <div class="release-layout">
+        <div class="cover-card">
+          <img id="coverArt" class="hidden" alt="Selected release artwork">
+          <div id="coverPlaceholder" class="cover-placeholder" aria-hidden="true">
+            <span>GS</span>
+            <small>NO ARTWORK YET</small>
+          </div>
+          <p id="coverCaption">Artwork stays beside this project.</p>
+        </div>
+        <div class="release-fields">
+          <div class="metadata-grid">
+            <label>Artist<input id="metaArtist" autocomplete="off"></label>
+            <label>Album<input id="metaAlbum" autocomplete="off"></label>
+            <label>Album artist<input id="metaAlbumArtist" autocomplete="off"></label>
+            <label>Year<input id="metaYear" autocomplete="off"></label>
+            <label>Genre<input id="metaGenre" autocomplete="off"></label>
+            <label>Side<input id="metaSide" autocomplete="off" placeholder="A"></label>
+          </div>
+          <div class="lookup-actions">
+            <button id="findReleaseButton" aria-controls="lookupPanel" aria-expanded="false" disabled>Find release &amp; artwork</button>
+            <span id="releaseIdentity" class="quiet">Manual metadata is always available offline.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="lookupPanel" class="panel lookup-panel hidden" aria-label="Release lookup" tabindex="-1">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">OPTIONAL ONLINE LOOKUP</span>
+          <h2>Match this record</h2>
+        </div>
+        <button id="closeLookup" class="text-button">Close</button>
+      </div>
+      <p class="lookup-explainer">
+        Search MusicBrainz for the exact vinyl pressing, inspect its side-specific track list,
+        then choose what to apply. Groove Serpent never contacts a provider until you press a lookup button.
+      </p>
+      <div class="lookup-search">
+        <label>Artist<input id="lookupArtist" autocomplete="off"></label>
+        <label>Album<input id="lookupAlbum" autocomplete="off"></label>
+        <button id="runReleaseSearch" class="primary">Search releases</button>
+      </div>
+      <div id="recognitionReadiness" class="recognition-readiness" role="status" aria-live="polite"></div>
+      <div id="metadataResults" class="metadata-results" aria-live="polite"></div>
+      <div id="releasePreview" class="release-preview hidden" aria-live="polite"></div>
+    </section>
+
+    <section class="panel waveform-panel">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">SIDE MAP</span>
+          <h2>Drag the cut markers</h2>
+        </div>
+        <div id="analysisStats" class="analysis-stats"></div>
+      </div>
+      <canvas id="waveform" tabindex="0" aria-label="Audio waveform and track boundaries" aria-describedby="markerReadout"></canvas>
+      <div class="boundary-toolbar" aria-label="Boundary editing controls">
+        <div class="boundary-toolbar-group">
+          <span class="control-label">MARKERS</span>
+          <button id="addMarkerAtPlayhead" data-boundary-edit disabled>Add at playhead</button>
+          <button id="deleteMarker" data-boundary-edit disabled>Delete selected</button>
+        </div>
+        <div class="boundary-toolbar-group">
+          <span class="control-label">HISTORY</span>
+          <button id="undoBoundary" data-boundary-edit disabled aria-label="Undo boundary edit">Undo</button>
+          <button id="redoBoundary" data-boundary-edit disabled aria-label="Redo boundary edit">Redo</button>
+          <button id="restoreAnalyzerMarker" data-boundary-edit disabled>Restore analyzer</button>
+        </div>
+      </div>
+      <div class="marker-controls" aria-label="Fine marker controls">
+        <label class="marker-selector">Marker<select id="markerSelect" aria-label="Marker to fine-tune"></select></label>
+        <span id="markerReadout" class="marker-readout" aria-live="polite">Select a marker to fine-tune it</span>
+        <div class="marker-buttons">
+          <button data-nudge-samples="-1" data-boundary-edit disabled aria-label="Move marker left by one sample">−1 sample</button>
+          <button data-nudge-samples="1" data-boundary-edit disabled aria-label="Move marker right by one sample">+1 sample</button>
+          <button data-nudge-ms="-1000" data-boundary-edit disabled>−1 s</button>
+          <button data-nudge-ms="-100" data-boundary-edit disabled>−100 ms</button>
+          <button data-nudge-ms="-10" data-boundary-edit disabled>−10 ms</button>
+          <button data-nudge-ms="10" data-boundary-edit disabled>+10 ms</button>
+          <button data-nudge-ms="100" data-boundary-edit disabled>+100 ms</button>
+          <button data-nudge-ms="1000" data-boundary-edit disabled>+1 s</button>
+          <button id="snapMarker" data-boundary-edit disabled>Snap to nearest gap</button>
+        </div>
+      </div>
+      <div class="audition-controls" aria-label="Selected boundary audition controls">
+        <span class="control-label">AUDITION SELECTED BOUNDARY</span>
+        <div class="audition-buttons">
+          <button id="playBeforeMarker" disabled>Play before</button>
+          <button id="playAcrossMarker" disabled>Play across</button>
+          <button id="playAfterMarker" disabled>Play after</button>
+          <button id="loopMarker" disabled aria-pressed="false">Loop across</button>
+          <button id="cancelBoundaryPreview" disabled>Stop</button>
+        </div>
+        <span id="auditionStatus" class="quiet" role="status" aria-live="polite">Select a marker to audition its boundary.</span>
+      </div>
+      <div class="waveform-legend">
+        <span><i class="legend-track"></i>Approved track boundary</span>
+        <span><i class="legend-candidate"></i>Other detected gap</span>
+        <span>Markers use exact source samples</span>
+      </div>
+      <audio id="audioPlayer" controls preload="metadata" src="/audio"></audio>
+      <p id="audioNote" class="quiet">Playback depends on your browser supporting the source audio format. Marker editing and export do not.</p>
+    </section>
+
+    <section class="panel evidence-panel" aria-labelledby="evidenceHeading">
+      <div class="section-heading evidence-heading">
+        <div>
+          <span class="kicker">LOCAL MICROSCOPE</span>
+          <h2 id="evidenceHeading">Waveform + spectrum + audio context</h2>
+        </div>
+        <div class="evidence-zoom">
+          <label>Window
+            <select id="evidenceZoom" aria-label="Evidence window duration">
+              <option value="2">2 seconds</option>
+              <option value="5">5 seconds</option>
+              <option value="10" selected>10 seconds</option>
+              <option value="20">20 seconds</option>
+              <option value="30">30 seconds</option>
+            </select>
+          </label>
+          <button id="refreshEvidence" disabled>Refresh evidence</button>
+        </div>
+      </div>
+      <div class="evidence-layout">
+        <div class="microscope-column">
+          <canvas id="evidenceCanvas" tabindex="0" aria-label="Synchronized local waveform and spectrogram; drag to select exact source samples"></canvas>
+          <div class="evidence-readouts" aria-live="polite">
+            <span><small>VIEW</small><strong id="evidenceViewReadout">Select a marker</strong></span>
+            <span><small>FOCUS</small><strong id="evidenceFocusReadout">—</strong></span>
+            <span><small>SELECTION</small><strong id="evidenceSelectionReadout">None</strong></span>
+            <span><small>PLAYHEAD</small><strong id="evidencePlayheadReadout">—</strong></span>
+          </div>
+          <div class="evidence-actions">
+            <button id="playEvidenceSelection" disabled>Play exact selection</button>
+            <button id="clearEvidenceSelection" disabled>Clear selection</button>
+            <span class="quiet">Drag across either graph. Both views use the same exact source-sample grid.</span>
+          </div>
+        </div>
+        <aside class="evidence-copy" aria-live="polite">
+          <span class="kicker">EVIDENCE FOR SELECTED BOUNDARY</span>
+          <div id="evidenceStatus" class="evidence-status">Select any track marker to inspect its local evidence.</div>
+          <dl id="evidenceMetrics" class="evidence-metrics"></dl>
+          <ul id="evidenceObservations" class="evidence-observations"></ul>
+          <div id="transientEvidence" class="transient-evidence"></div>
+          <p class="evidence-policy">Measurements explain what the detector sees. They never accept a marker or alter audio; your audition remains decisive.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel speed-panel" aria-labelledby="speedHeading">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">SPEED CORRECTION</span>
+          <h2 id="speedHeading">Pitch and tempo together</h2>
+        </div>
+        <span id="speedSummary" class="speed-factor">SOURCE FACTOR 1.000000×</span>
+      </div>
+      <div class="speed-layout">
+        <div class="speed-controls">
+          <label>Measured capture RPM<input id="speedCaptureRpm" type="number" min="10" max="100" step="0.000001" inputmode="decimal" value="33.333333"></label>
+          <label>Intended RPM<input id="speedIntendedRpm" type="number" min="10" max="100" step="0.000001" inputmode="decimal" value="33.333333"></label>
+          <label>Fine factor<input id="speedFineFactor" type="number" min="0.5" max="2" step="0.000001" inputmode="decimal" value="1.000000"></label>
+          <div class="rpm-presets" aria-label="Intended record speed presets">
+            <button type="button" data-intended-rpm="16.666667">16⅔ RPM</button>
+            <button type="button" data-intended-rpm="33.333333">33⅓ RPM</button>
+            <button type="button" data-intended-rpm="45">45 RPM</button>
+            <button type="button" data-intended-rpm="78">78 RPM</button>
+            <button type="button" data-intended-rpm="80">80 RPM</button>
+          </div>
+          <div class="speed-derived" aria-live="polite">
+            <span><small>CORRECTED DURATION</small><strong id="speedDuration">—</strong></span>
+            <span><small>PITCH CHANGE</small><strong id="speedPitch">—</strong></span>
+            <span><small>REALIZABLE RATE</small><strong id="speedRealizable">—</strong></span>
+          </div>
+        </div>
+        <div class="listening-outputs" aria-label="Listening output">
+          <button id="listenArchival" class="listening-card active" type="button" aria-pressed="true">
+            <strong>ARCHIVAL</strong><span>Untouched source playback</span>
+          </button>
+          <button id="listenCorrected" class="listening-card" type="button" aria-pressed="false">
+            <strong>CORRECTED</strong><span id="correctedListeningLabel">Pitch + tempo derivative</span>
+          </button>
+        </div>
+      </div>
+      <p class="speed-safety">The archival capture remains immutable. Browser corrected audition disables pitch preservation; exported derivatives use Groove Serpent’s exact integer-rate mapping and carry the requested and effective factors in their manifest.</p>
+    </section>
+
+    <section class="panel restoration-panel" aria-labelledby="restorationHeading">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">CONSERVATIVE RESTORATION</span>
+          <h2 id="restorationHeading">Candidate triage + removed-signal proof</h2>
+        </div>
+        <span id="restorationStatus" class="status">No click scan in this session</span>
+      </div>
+      <div class="restoration-scan-controls">
+        <label>Scan start (seconds)<input id="restorationScanStart" type="number" min="0" step="0.001" inputmode="decimal"></label>
+        <label>Scan end (seconds)<input id="restorationScanEnd" type="number" min="0" step="0.001" inputmode="decimal"></label>
+        <label>Maximum candidates<input id="restorationMaxCandidates" type="number" min="1" max="10000" step="1" value="250"></label>
+        <button id="useEvidenceWindow" type="button" disabled>Use microscope window</button>
+        <button id="startRestorationScan" class="primary" type="button" disabled>Scan exact PCM</button>
+      </div>
+      <p class="restoration-explainer">Start with a short reviewed range. Nothing is repaired during scanning. Needle-drop, needle-pickup, handling, and structural events are protected decisions—not clicks to erase.</p>
+      <div id="restorationLayout" class="restoration-layout single-column">
+        <div>
+          <div id="restorationSummary" class="restoration-summary"></div>
+          <div id="restorationCandidates" class="restoration-candidates" aria-live="polite">
+            <p class="quiet">Run a scan to inspect candidate morphology and audition proposals.</p>
+          </div>
+        </div>
+        <aside id="restorationPreviewPanel" class="restoration-preview hidden" aria-live="polite">
+          <span class="kicker">MATCHED-LEVEL AUDITION</span>
+          <h3 id="restorationPreviewTitle">Select a candidate</h3>
+          <p id="restorationPreviewProof" class="quiet">Original and Proposed remain at identical gain. Removed Signal is a declared-gain residue.</p>
+          <div class="audition-stack">
+            <label>ORIGINAL<audio id="restorationOriginal" controls preload="metadata"></audio></label>
+            <label>PROPOSED<audio id="restorationProposed" controls preload="metadata"></audio></label>
+            <label>REMOVED SIGNAL<audio id="restorationRemoved" controls preload="metadata"></audio></label>
+          </div>
+          <div id="restorationPreviewMetrics" class="preview-proof-grid"></div>
+        </aside>
+      </div>
+      <div class="restoration-publish">
+        <span id="restorationDecisionSummary" class="quiet">Every retained candidate needs an explicit decision.</span>
+        <button id="saveRestorationRecipe" type="button" disabled>Save reviewed recipe</button>
+        <button id="renderRestoredSide" class="primary" type="button" disabled>Render full restored side</button>
+      </div>
+    </section>
+
+    <section class="panel tracks-panel">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">TRACKS</span>
+          <h2>Names and timing</h2>
+        </div>
+        <span class="quiet">Low-confidence rows deserve a listen.</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Listen / ID</th>
+              <th>Boundary edits</th>
+              <th>Title</th>
+              <th>Artist</th>
+              <th>Start</th>
+              <th>End</th>
+              <th>Length</th>
+              <th>Confidence</th>
+            </tr>
+          </thead>
+          <tbody id="trackRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel history-panel" aria-labelledby="historyHeading">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">HISTORY + CHECKPOINTS</span>
+          <h2 id="historyHeading">Persistent, reversible project states</h2>
+        </div>
+        <div class="checkpoint-create">
+          <label>Checkpoint label<input id="checkpointLabel" maxlength="120" placeholder="Ready to export"></label>
+          <button id="saveCheckpoint" disabled>Save checkpoint</button>
+        </div>
+      </div>
+      <div class="history-layout">
+        <div id="historyTimeline" class="history-timeline" aria-live="polite">
+          <p class="quiet">Saved edits will appear here after the project loads.</p>
+        </div>
+        <div class="history-restore">
+          <label>Restore point<select id="restorePoint" disabled><option value="">Choose a saved state…</option></select></label>
+          <button id="restoreSavedState" disabled>Preview restore</button>
+          <p class="quiet">A restore is itself recorded as a new reversible history entry. Nothing is deleted from the timeline.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="exportPanel" class="panel export-panel hidden" aria-label="Export tracks" tabindex="-1">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">OUTPUT</span>
+          <h2>Export tracks</h2>
+        </div>
+        <button id="closeExport" class="text-button">Close</button>
+      </div>
+      <div class="export-grid">
+        <label class="wide">Output directory<input id="outputDir"></label>
+        <label class="check"><input id="formatFlac" type="checkbox" checked> FLAC, lossless</label>
+        <label class="check"><input id="formatM4a" type="checkbox" checked> AAC / M4A, 256 kbps</label>
+      </div>
+      <p class="quiet">Exports publish as one complete new batch. Choose a directory that does not already exist.</p>
+      <p id="exportIdentityNote" class="quiet">Export identity will be pinned to the loaded revision, project hash, and verified source receipt.</p>
+      <p id="exportSpeedNote" class="quiet">Archival timing will be exported.</p>
+      <button id="runExport" class="primary">Start export</button>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

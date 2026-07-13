@@ -1,0 +1,10 @@
+# Metadata lines are optional.
+Artist: Example Artist
+Album: Example Album
+Year: 1978
+Genre: Rock
+Side: A
+
+01 | Opening Track | 4:12
+02 | Second Track | 3:48
+03 | Side Finale | 6:01

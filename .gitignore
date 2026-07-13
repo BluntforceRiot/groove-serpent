@@ -1,0 +1,46 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+.env*
+
+# Generated demos, exports, restoration work, and incomplete staging trees.
+/demo/
+/demo-output/
+**/exports/
+**/album-exports/
+**/restoration-previews/
+**/restoration-workspace/
+**/.groove-serpent/
+**/.groove-serpent-export-*.partial/
+**/.groove-serpent-album-*.partial/
+**/*.partial/
+**/*.groove.json.tmp
+**/*.album.json.tmp
+
+# Local collection captures, projects, artwork, and review artifacts. These
+# may be irreplaceable or copyrighted and must never be swept into a public
+# commit with `git add .`, including when nested in per-album directories.
+**/*.flac
+**/*.wav
+**/*.aif
+**/*.aiff
+**/*.m4a
+**/*.groove.json
+**/*.tracklist.json
+**/*.click-scan.json
+**/*.restoration-recipe.json
+**/*.album.json
+**/artwork/
+
+# Versioned handoff archives are generated locally and audited separately.
+/groove-serpent-codex-handoff-*.zip

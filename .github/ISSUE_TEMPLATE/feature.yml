@@ -1,0 +1,68 @@
+name: Feature request
+description: Propose a collector workflow, preservation, or interoperability improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the collector problem before proposing an implementation. Do not attach copyrighted recordings or artwork, credentials, private project files, collection metadata, or private local paths. Use synthetic examples.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Collector problem
+      description: What repeated vinyl digitization task is difficult, unsafe, or unclear today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Desired workflow
+      description: Describe the smallest complete workflow and where human review belongs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: preservation
+    attributes:
+      label: Preservation and privacy impact
+      description: Explain effects on source immutability, derivatives, receipts, network access, uncertainty, and failure behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: synthetic-example
+    attributes:
+      label: Synthetic acceptance example
+      description: Provide a generated or conceptual example that does not use copyrighted audio, artwork, private files, or local paths.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options:
+        - Boundary review
+        - Metadata and artwork
+        - Restoration
+        - Speed correction
+        - Album publication
+        - Accessibility and browser UI
+        - Installation and interoperability
+        - Developer tooling
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: local-first
+    attributes:
+      label: Local-first check
+      options:
+        - label: This request can preserve the untouched source and keep automatic audio changes reviewable.
+          required: true
+
