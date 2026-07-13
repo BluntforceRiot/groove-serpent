@@ -484,7 +484,9 @@ class ExporterTests(unittest.TestCase):
             source.write_bytes(b"source")
             project = self._project(source, bits=24, rate=48_000)
 
-            with self.assertRaisesRegex(ExportError, "symlink or reparse point"):
+            with self.assertRaisesRegex(
+                ExportError, "symlink or reparse point"
+            ) as raised:
                 export_project(
                     project,
                     root / "side.groove.json",
@@ -492,6 +494,7 @@ class ExporterTests(unittest.TestCase):
                     formats=["flac"],
                 )
 
+            self.assertIn(str(link), str(raised.exception))
             self.assertEqual(list(outside.iterdir()), [])
 
     def test_portable_directory_cache_invalidates_for_new_equivalent_sibling(

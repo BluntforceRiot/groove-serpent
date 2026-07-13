@@ -33,9 +33,16 @@ The evidence analyzer limits decoded float32 input to 256 MiB. That is an input 
 ## Requirements
 
 - Python 3.11, 3.12, or 3.13
-- [FFmpeg](https://ffmpeg.org/) and `ffprobe` on `PATH`
+- [FFmpeg](https://ffmpeg.org/) and `ffprobe` on `PATH`. Speed correction
+  requires an FFmpeg build with libsoxr enabled.
 - A browser for the review workbench
 - Optional: Chromaprint's `fpcalc` for AcoustID fingerprint lookup
+
+On Windows, Chocolatey's full build provides the required resampler:
+
+```console
+choco install ffmpeg-full --version=8.1.2
+```
 
 ## Install from a checkout
 

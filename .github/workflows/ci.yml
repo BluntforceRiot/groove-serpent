@@ -47,6 +47,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - name: Use canonical temporary directory on macOS
+        if: runner.os == 'macOS'
+        # macOS exposes /var as a system symlink. Keep tempfile output under
+        # the runner directory without weakening portable-path checks.
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Install FFmpeg on Ubuntu
         if: runner.os == 'Linux'
         run: |
@@ -60,13 +66,14 @@ jobs:
       - name: Install FFmpeg on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install ffmpeg --yes --no-progress
+        run: choco install ffmpeg-full --version=8.1.2 --yes --no-progress
 
       - name: Verify external tools
         run: |
           ffmpeg -version
           ffprobe -version
           node --version
+          ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 0.02 -af "aresample=44100:resampler=soxr:precision=33:cutoff=0.99" -f null -
 
       - name: Sync frozen development environment
         run: uv sync --frozen --group dev

@@ -30,3 +30,29 @@ def test_action_references_are_immutable_and_version_annotated() -> None:
     assert references, "No action references found"
     message = "Action references must use 40-hex SHAs and version comments:\n"
     assert not invalid, message + "\n".join(invalid)
+
+
+def _ci_workflow_text() -> str:
+    workflow = WORKFLOWS / "ci.yml"
+    assert workflow.is_file(), f"CI workflow is missing: {workflow}"
+    return workflow.read_text(encoding="utf-8")
+
+
+def test_ci_uses_canonical_runner_temp_without_weakening_path_checks() -> None:
+    text = _ci_workflow_text()
+    test_job = text.split("\n  package:", maxsplit=1)[0]
+
+    assert "if: runner.os == 'macOS'" in test_job
+    assert 'echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"' in test_job
+
+
+def test_windows_ci_installs_pinned_full_ffmpeg_with_libsoxr_smoke() -> None:
+    text = _ci_workflow_text()
+
+    assert (
+        "choco install ffmpeg-full --version=8.1.2 --yes --no-progress" in text
+    )
+    assert "choco install ffmpeg --yes --no-progress" not in text
+    assert (
+        'aresample=44100:resampler=soxr:precision=33:cutoff=0.99' in text
+    )
