@@ -218,7 +218,11 @@ class BuildPublicArchiveTests(unittest.TestCase):
             source = base / "source"
             source.mkdir()
             (source / "bad\nname.md").write_bytes(b"ambiguous\n")
-            self._commit(source)
+            self._git(source, "init", "--quiet")
+            self._git(source, "config", "user.name", "Release Test")
+            self._git(source, "config", "user.email", "release-test@example.invalid")
+            self._git(source, "add", "--all")
+            self._git(source, "commit", "--quiet", "--message", "Release fixture")
             archive = base / "release.zip"
             manifest = base / "SOURCE_MANIFEST.sha256"
 

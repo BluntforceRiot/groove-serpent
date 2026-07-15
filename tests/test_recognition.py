@@ -54,8 +54,12 @@ class _FakeProcess:
         self.killed = False
         self.waited = False
 
-    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
-        del timeout
+    def communicate(
+        self,
+        input: bytes | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes, bytes]:
+        del input, timeout
         if self._wait_timeout and not self.terminated:
             raise subprocess.TimeoutExpired("fpcalc", 1)
         return self.stdout.read(), self.stderr.read()

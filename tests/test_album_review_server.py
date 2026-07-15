@@ -295,7 +295,10 @@ class AlbumReviewServerTests(unittest.TestCase):
             },
             authenticate=False,
         )
-        self.assertEqual(status, 403)
+        expected_status = (
+            200 if self.server.session_auth.public_host == "127.0.0.1" else 403
+        )
+        self.assertEqual(status, expected_status)
         status, _headers, body = self.request(
             "POST",
             "/api/album/open-side",

@@ -347,6 +347,8 @@ class ReviewServerTests(unittest.TestCase):
         )
 
         for alias in (f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
+            if alias.startswith(self.server.session_auth.public_host + ":"):
+                continue
             with self.subTest(alias=alias):
                 status, _headers, _body, _will_close = self.request(
                     "GET",

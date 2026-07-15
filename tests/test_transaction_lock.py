@@ -278,6 +278,8 @@ class TransactionLockTests(unittest.TestCase):
             self.assertEqual(load_project(path).revision, 1)
 
     def test_portable_equivalent_project_creators_cannot_both_commit(self) -> None:
+        if sys.platform == "darwin":
+            self.skipTest("Portable-equivalent final-file collision is filesystem-specific.")
         with tempfile.TemporaryDirectory() as directory_value:
             root = Path(directory_value)
             composed = root / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.groove.json"
@@ -437,6 +439,8 @@ class TransactionLockTests(unittest.TestCase):
             self.assertEqual(album.revision, MAX_ALBUM_REVISION)
 
     def test_portable_equivalent_album_creators_cannot_both_commit(self) -> None:
+        if sys.platform == "darwin":
+            self.skipTest("Portable-equivalent final-file collision is filesystem-specific.")
         with tempfile.TemporaryDirectory() as directory_value:
             root = Path(directory_value)
             composed = root / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.groove-album.json"
