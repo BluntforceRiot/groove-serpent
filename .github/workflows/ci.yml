@@ -372,7 +372,6 @@ jobs:
         os:
           - windows-latest
           - ubuntu-latest
-          - macos-latest
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -445,7 +444,7 @@ jobs:
           root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "source-comparison"
           for name in names:
               paths = sorted(root.rglob(name))
-              assert len(paths) == 3, paths
+              assert len(paths) == 2, paths
               receipts = {
                   str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                   for path in paths

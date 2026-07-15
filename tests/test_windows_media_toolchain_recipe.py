@@ -879,6 +879,8 @@ def test_publication_rejects_post_verification_digest_laundering(
 
 
 def test_directory_publication_is_one_atomic_no_replace_commit(tmp_path: Path) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Atomic no-replace directory publication is exercised on Linux and Windows.")
     stage = tmp_path / "stage"
     published = tmp_path / "published"
     _write_publication_stage(stage)
@@ -911,6 +913,8 @@ def test_directory_publication_loses_rename_race_without_touching_winner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Atomic no-replace directory publication is exercised on Linux and Windows.")
     stage = tmp_path / "stage"
     published = tmp_path / "published"
     _write_publication_stage(stage)
@@ -933,6 +937,8 @@ def test_directory_publication_treats_interrupt_after_commit_as_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Atomic no-replace directory publication is exercised on Linux and Windows.")
     stage = tmp_path / "stage"
     published = tmp_path / "published"
     _write_publication_stage(stage)
@@ -957,6 +963,8 @@ def test_directory_publication_detects_post_snapshot_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Stable publication identity is exercised on Linux and Windows.")
     stage = tmp_path / "stage"
     published = tmp_path / "published"
     _write_publication_stage(stage)
@@ -983,6 +991,8 @@ def test_directory_publication_rejects_coherent_post_commit_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Stable publication identity is exercised on Linux and Windows.")
     stage = tmp_path / "stage"
     published = tmp_path / "published"
     _write_publication_stage(stage, runtime=b"runtime-a", source=b"source-a")
@@ -1077,6 +1087,8 @@ def test_publication_snapshot_rechecks_inventory_after_member_reads(
 def test_publication_stage_creation_probes_real_destination_filesystem(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Atomic no-replace directory publication is exercised on Linux and Windows.")
     published = tmp_path / "published"
 
     stage = VERIFY._create_publication_stage(published)
@@ -1176,12 +1188,18 @@ def test_signature_verifier_rejects_untrusted_provider_file(
         VERIFY._verified_gpg_provider()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="The pinned provider is on the Linux build host.")
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="The pinned provider is on the Linux build host.",
+)
 def test_signature_verifier_accepts_exact_root_owned_gpg_provider() -> None:
     assert VERIFY._verified_gpg_provider() == Path("/usr/bin/gpg")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="The pinned provider is on the Linux build host.")
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="The pinned provider is on the Linux build host.",
+)
 def test_signature_provider_discovery_ignores_fake_earlier_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

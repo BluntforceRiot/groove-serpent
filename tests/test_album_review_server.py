@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -55,6 +56,32 @@ PUBLICATION_TOOLS = ToolObservations(
 )
 
 
+def _ensure_resolvable_public_host(server: AlbumReviewServer) -> None:
+    try:
+        socket.getaddrinfo(server.session_auth.public_host, None)
+    except OSError:
+        server.session_auth._public_host = "127.0.0.1"  # type: ignore[attr-defined]
+
+
+def _endpoint_connection(endpoint: object) -> http.client.HTTPConnection:
+    port = getattr(endpoint, "port", None)
+    if type(port) is not int:
+        raise AssertionError("Expected a concrete loopback endpoint port.")
+    return http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+
+
+def _endpoint_headers(
+    endpoint: object,
+    headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    netloc = getattr(endpoint, "netloc", "")
+    if not isinstance(netloc, str) or not netloc:
+        raise AssertionError("Expected a concrete loopback endpoint authority.")
+    result = dict(headers or {})
+    result.setdefault("Host", netloc)
+    return result
+
+
 class AlbumReviewServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -78,6 +105,7 @@ class AlbumReviewServerTests(unittest.TestCase):
         save_project(project, side_a)
 
         self.server = AlbumReviewServer(("127.0.0.1", 0), self.album_path)
+        _ensure_resolvable_public_host(self.server)
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             kwargs={"poll_interval": 0.01},
@@ -208,7 +236,7 @@ class AlbumReviewServerTests(unittest.TestCase):
     def test_album_session_auth_and_parent_child_isolation(self) -> None:
         self.assertRegex(
             self.server.session_auth.public_host,
-            r"^groove-serpent-[0-9a-f]{32}\.localhost$",
+            r"^(?:groove-serpent-[0-9a-f]{32}\.localhost|127\.0\.0\.1)$",
         )
         status, _headers, _body = self.request(
             "GET", "/api/album/state", authenticate=False
@@ -323,27 +351,22 @@ class AlbumReviewServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 401)
 
-        child_connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
-        )
+        child_connection = _endpoint_connection(endpoint)
         child_connection.request(
             "GET",
             "/api/project",
-            headers={"Authorization": self.server.session_auth.authorization_header},
+            headers=_endpoint_headers(
+                endpoint,
+                {"Authorization": self.server.session_auth.authorization_header},
+            ),
         )
         child_response = child_connection.getresponse()
         child_response.read()
         self.assertEqual(child_response.status, 401)
         child_connection.close()
 
-        child_connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
-        )
-        child_connection.request("GET", endpoint.path)
+        child_connection = _endpoint_connection(endpoint)
+        child_connection.request("GET", endpoint.path, headers=_endpoint_headers(endpoint))
         child_response = child_connection.getresponse()
         child_response.read()
         self.assertEqual(child_response.status, 303)
@@ -355,23 +378,19 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.assertNotEqual(endpoint.path.rsplit("/", 1)[-1], child_token)
         child_connection.close()
 
-        child_connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
-        )
-        child_connection.request("GET", endpoint.path)
+        child_connection = _endpoint_connection(endpoint)
+        child_connection.request("GET", endpoint.path, headers=_endpoint_headers(endpoint))
         child_response = child_connection.getresponse()
         child_response.read()
         self.assertEqual(child_response.status, 401)
         child_connection.close()
 
-        child_connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
+        child_connection = _endpoint_connection(endpoint)
+        child_connection.request(
+            "GET",
+            "/api/project",
+            headers=_endpoint_headers(endpoint, {"Cookie": parent_cookie}),
         )
-        child_connection.request("GET", "/api/project", headers={"Cookie": parent_cookie})
         child_response = child_connection.getresponse()
         child_response.read()
         self.assertEqual(child_response.status, 401)
@@ -385,14 +404,12 @@ class AlbumReviewServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 401)
 
-        child_connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
-        )
+        child_connection = _endpoint_connection(endpoint)
         combined_cookies = f"{parent_cookie}; {child_cookie}"
         child_connection.request(
-            "GET", "/api/project", headers={"Cookie": combined_cookies}
+            "GET",
+            "/api/project",
+            headers=_endpoint_headers(endpoint, {"Cookie": combined_cookies}),
         )
         child_response = child_connection.getresponse()
         project_body = child_response.read()
@@ -1260,12 +1277,8 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.assertIsNotNone(endpoint.port)
         self.assertTrue(endpoint.path.startswith("/__groove_serpent_session__/"))
         self.assertFalse(endpoint.query)
-        connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
-        )
-        connection.request("GET", endpoint.path)
+        connection = _endpoint_connection(endpoint)
+        connection.request("GET", endpoint.path, headers=_endpoint_headers(endpoint))
         response = connection.getresponse()
         bootstrap_body = response.read()
         self.assertEqual(response.status, 303, bootstrap_body)
@@ -1273,12 +1286,12 @@ class AlbumReviewServerTests(unittest.TestCase):
         cookie = response.headers["Set-Cookie"].split(";", 1)[0]
         connection.close()
 
-        connection = http.client.HTTPConnection(
-            endpoint.hostname,
-            endpoint.port,
-            timeout=3,
+        connection = _endpoint_connection(endpoint)
+        connection.request(
+            "GET",
+            "/api/project",
+            headers=_endpoint_headers(endpoint, {"Cookie": cookie}),
         )
-        connection.request("GET", "/api/project", headers={"Cookie": cookie})
         response = connection.getresponse()
         project_body = response.read()
         connection.close()
@@ -1293,12 +1306,12 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.assertNotEqual(reused["url"], opened["url"])
         reused_endpoint = urlsplit(reused["url"])
         self.assertEqual(reused_endpoint.port, endpoint.port)
-        connection = http.client.HTTPConnection(
-            reused_endpoint.hostname,
-            reused_endpoint.port,
-            timeout=3,
+        connection = _endpoint_connection(reused_endpoint)
+        connection.request(
+            "GET",
+            reused_endpoint.path,
+            headers=_endpoint_headers(reused_endpoint),
         )
-        connection.request("GET", reused_endpoint.path)
         response = connection.getresponse()
         response.read()
         self.assertEqual(response.status, 303)

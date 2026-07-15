@@ -443,8 +443,12 @@ def _identity_from_json(value: Any, label: str) -> _DirectoryIdentity:
         {"device", "inode", "file_type", "birth_ns", "file_attributes"},
         label,
     )
-    device = _strict_integer(value["device"], f"{label} device")
-    inode = _strict_integer(value["inode"], f"{label} inode")
+    device = _strict_integer(
+        value["device"], f"{label} device", maximum=(1 << 64) - 1
+    )
+    inode = _strict_integer(
+        value["inode"], f"{label} inode", maximum=(1 << 64) - 1
+    )
     file_type = _strict_integer(value["file_type"], f"{label} file type")
     for name in ("birth_ns", "file_attributes"):
         if value[name] is not None:

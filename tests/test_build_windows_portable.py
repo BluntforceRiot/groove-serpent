@@ -19,10 +19,18 @@ try:
 except ImportError:  # Sanitized public releases intentionally omit private handoff tooling.
     build_handoff = None  # type: ignore[assignment]
 from scripts import build_windows_portable as portable
+from scripts._release_fs import require_stable_creation_identity
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _require_publication_filesystem(path: Path, context: str) -> None:
+    try:
+        require_stable_creation_identity(path, context)
+    except RuntimeError as exc:
+        raise unittest.SkipTest(str(exc)) from exc
 
 
 def _write(path: Path, payload: bytes) -> portable.ExactInput:
@@ -298,6 +306,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_synthetic_build_is_exact_deterministic_and_side_by_side(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             first_root = root / "first"
             second_root = root / "second"
@@ -390,6 +399,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_exact_input_hash_mismatch_removes_partial_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             source = _write(root / "source.bin", b"expected")
             wrong = portable.ExactInput(source.path, "0" * 64, source.label)
             destination = root / "copied.bin"
@@ -470,6 +480,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_manifest_reopen_detects_payload_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             output_root = root / "output"
             output_root.mkdir()
@@ -503,6 +514,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_private_path_in_explicit_notice_fails_output_audit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             private_notice = _write(
                 root / "inputs" / "private-notice.txt",
@@ -598,6 +610,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_failed_build_cleanup_preserves_swapped_stage_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             output_root = root / "output"
             displaced = root / "displaced-owned-stage"
@@ -647,6 +660,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_rename_completion_before_interrupt_removes_published_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             output_root = root / "output"
             output_root.mkdir()
@@ -685,6 +699,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_manifest_records_every_payload_member_except_itself(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            _require_publication_filesystem(root, "Portable output")
             inputs = _inputs(root / "inputs")
             output_root = root / "output"
             output_root.mkdir()

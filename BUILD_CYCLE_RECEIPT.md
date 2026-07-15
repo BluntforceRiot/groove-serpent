@@ -28,9 +28,9 @@ Subloop A — static authority:
 
 Subloop B — clean rerun and runtime realism:
 
-- Full pytest log captured at `outputs/final-proof-1.0.0-20260715/pytest-full-output.txt`.
-- Result: `991 passed, 37 skipped in 366.40s`.
-- Quality gate log captured at `outputs/final-proof-1.0.0-20260715/quality-output.txt`.
+- Full pytest log captured at `outputs/final-ci-fix-pytest.log`.
+- Result: `989 passed, 40 skipped, 565 subtests passed in 416.36s`.
+- Quality gate log captured at `outputs/final-ci-fix-quality.log`.
 - Browser gate log captured at `outputs/final-proof-1.0.0-20260715/browser-output.txt`.
 - `npm audit --json` captured at `outputs/final-proof-1.0.0-20260715/npm-audit-output.json` with zero vulnerabilities.
 - Windows portable package was rebuilt A/B, byte-compared, verified with packaged verifier, and zipped.
@@ -43,6 +43,9 @@ Subloop C — critique and optimization:
   - Windows media corresponding-source ZIP now carries signing keys under `recipe/keys`, matching the source recipe and verifier.
   - Windows portable third-party notice hashes now match the final media runtime/source artifacts.
   - Windows portable verifier now recognizes the hardened launcher line `NoDefaultCurrentDirectoryInExePath=1`.
+  - CI portability hardening keeps macOS in the test matrix while gating only filesystem-publication invariants that require stable creation identity.
+  - Windows publication verification now accepts valid unsigned 64-bit filesystem identity values returned by NTFS.
+  - Review-server tests use loopback transport when a Windows CI resolver cannot resolve wildcard `.localhost` names, without changing production host authority behavior.
 
 Subloop D — promotion decision:
 
@@ -53,8 +56,8 @@ Subloop D — promotion decision:
 
 Stable final artifact hashes:
 
-- Python wheel: `7f3c6b5ce388553e24f2c24f383011df5c4dd5e51a0bcb60fdfb86ddb0248b76`
-- Python sdist: `7677efeb040c393f331925981f53cf4a7084b65f13a21ae4d3b5e9a34cf1b45b`
+- Python wheel: `69d4116e88811ea5c251b10e1a5734f1f8b25b1644d4ecbaca92678c34318638`
+- Python sdist: `a42fa18f198dac7212ad1333f092480783d482020064a2f6f6fa094e727be5d5`
 - Windows portable ZIP: `35c79f62aa8d7960fc3899d8388040b24c4feed421ded5b6264847a933af6a61`
 - Windows portable manifest: `e3a52240a373b426d601b282df91d956a6530105c932aab687a2d47c3f8db225`
 - Windows media runtime ZIP: `46456d710c419b0660effb49242905c131c8dc1fd0e87764c9775789d8e169d8`
@@ -62,8 +65,8 @@ Stable final artifact hashes:
 
 Proof log hashes:
 
-- Full pytest log: `7afee25de8c5537abdbad16bd569385928fadd9852f61f1ef33432710456c458`
-- Quality log: `804d3c9b738c22015270fe0a6d89450da0df7fe13a645550d1e415f3d4d1351e`
+- Full pytest log: `62ad860b5e95aad537a907a2de6344dbd74dc77101c20af1cfac265b2cbc806f`
+- Quality log: `06b4250d14dea38804a9802d7cc2bf3556d1e3e29de8b23e2b1b16c6004d39c6`
 - npm audit log: `f171425889f0e18edf573f974514d074c5dc3fbf791b526d9c71374de7d649eb`
 - Browser log: `fd1fb34d62ab4d42cb8511f50f8e68f4951b2e45a4f8faedda0a1221b18a7ddc`
 

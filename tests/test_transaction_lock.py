@@ -282,6 +282,22 @@ class TransactionLockTests(unittest.TestCase):
             root = Path(directory_value)
             composed = root / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.groove.json"
             decomposed = root / "cafe\N{COMBINING ACUTE ACCENT}.groove.json"
+            try:
+                composed.write_text("probe", encoding="utf-8")
+                decomposed.write_text("probe", encoding="utf-8")
+                if composed.is_file() and decomposed.is_file() and not composed.samefile(
+                    decomposed
+                ):
+                    self.skipTest(
+                        "Filesystem allows both portable-equivalent names "
+                        "as distinct final files."
+                    )
+            finally:
+                for candidate in (composed, decomposed):
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
             barrier = threading.Barrier(2)
             real_lease = exclusive_target_write_lease
 
@@ -425,6 +441,22 @@ class TransactionLockTests(unittest.TestCase):
             root = Path(directory_value)
             composed = root / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.groove-album.json"
             decomposed = root / "cafe\N{COMBINING ACUTE ACCENT}.groove-album.json"
+            try:
+                composed.write_text("probe", encoding="utf-8")
+                decomposed.write_text("probe", encoding="utf-8")
+                if composed.is_file() and decomposed.is_file() and not composed.samefile(
+                    decomposed
+                ):
+                    self.skipTest(
+                        "Filesystem allows both portable-equivalent names "
+                        "as distinct final files."
+                    )
+            finally:
+                for candidate in (composed, decomposed):
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
             barrier = threading.Barrier(2)
             real_lease = exclusive_target_write_lease
 

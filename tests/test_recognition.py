@@ -60,6 +60,14 @@ class _FakeProcess:
             raise subprocess.TimeoutExpired("fpcalc", 1)
         return self.stdout.read(), self.stderr.read()
 
+    def __enter__(self) -> _FakeProcess:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self.poll() is None:
+            self.kill()
+        self.wait()
+
     def wait(self, timeout: float | None = None) -> int:
         del timeout
         self.waited = True

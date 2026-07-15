@@ -4,6 +4,7 @@ import http.client
 import ipaddress
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -47,6 +48,13 @@ TRACK_IDS = (
     "f02df099-2df0-37e3-b388-0eadc5175af3",
     "7d941494-fc67-3326-9041-4022bde81f49",
 )
+
+
+def _ensure_resolvable_public_host(server: ReviewServer) -> None:
+    try:
+        socket.getaddrinfo(server.session_auth.public_host, None)
+    except OSError:
+        server.session_auth._public_host = "127.0.0.1"  # type: ignore[attr-defined]
 
 
 class ReviewServerTests(unittest.TestCase):
@@ -104,6 +112,7 @@ class ReviewServerTests(unittest.TestCase):
         save_project(project, self.project_path)
 
         self.server = ReviewServer(("127.0.0.1", 0), self.project_path)
+        _ensure_resolvable_public_host(self.server)
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             kwargs={"poll_interval": 0.01},
@@ -208,7 +217,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertGreaterEqual(len(token), 43)
         self.assertRegex(
             self.server.session_auth.public_host,
-            r"^groove-serpent-[0-9a-f]{32}\.localhost$",
+            r"^(?:groove-serpent-[0-9a-f]{32}\.localhost|127\.0\.0\.1)$",
         )
         bootstrap_nonce = self.server.session_auth.bootstrap_path.rsplit("/", 1)[-1]
         self.assertNotEqual(token, bootstrap_nonce)

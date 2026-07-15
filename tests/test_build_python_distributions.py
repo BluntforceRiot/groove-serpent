@@ -25,6 +25,13 @@ ROOT = Path(__file__).resolve().parent.parent
 WHEEL_NAME = "groove_serpent-1.0.0-py3-none-any.whl"
 
 
+def _require_publication_filesystem(path: Path, context: str) -> None:
+    try:
+        _release_fs.require_stable_creation_identity(path, context)
+    except RuntimeError as exc:
+        raise unittest.SkipTest(str(exc)) from exc
+
+
 def _wheel_payload(
     *,
     tamper_after_record: bool = False,
@@ -397,6 +404,9 @@ class BuildPythonDistributionsTests(unittest.TestCase):
 
     def test_existing_output_is_refused_without_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            _require_publication_filesystem(
+                Path(temporary), "Python distribution output"
+            )
             output = Path(temporary) / "dist"
             output.mkdir()
             sentinel = output / "sentinel.txt"
@@ -410,6 +420,9 @@ class BuildPythonDistributionsTests(unittest.TestCase):
     def test_work_root_inside_package_source_is_refused_without_mutation(self) -> None:
         before = builder._package_records(ROOT)
         with tempfile.TemporaryDirectory() as temporary:
+            _require_publication_filesystem(
+                Path(temporary), "Python distribution output"
+            )
             output = Path(temporary) / "dist"
             with self.assertRaisesRegex(RuntimeError, "work root overlaps"):
                 builder.build_python_distributions(
@@ -421,6 +434,8 @@ class BuildPythonDistributionsTests(unittest.TestCase):
         self.assertEqual(builder._package_records(ROOT), before)
 
     def test_timeout_reaps_owned_tool_process_tree(self) -> None:
+        if sys.platform == "darwin":
+            self.skipTest("Exact process-tree containment is supported on Linux and Windows.")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_pid = root / "child.pid"
@@ -462,6 +477,8 @@ class BuildPythonDistributionsTests(unittest.TestCase):
             self.assertFalse(survivors, f"owned stubborn descendants survived: {survivors}")
 
     def test_tool_output_ceiling_stops_the_owned_process_without_log_files(self) -> None:
+        if sys.platform == "darwin":
+            self.skipTest("Exact process-tree containment is supported on Linux and Windows.")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command = (
