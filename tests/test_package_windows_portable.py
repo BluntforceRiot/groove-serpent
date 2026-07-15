@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 from unittest import mock
 
+from scripts._release_fs import require_stable_creation_identity
 from scripts import package_windows_portable as packager
 from scripts import verify_windows_portable as verifier
 from tests.test_verify_windows_portable import _bundle
@@ -47,6 +48,18 @@ def _rewrite_archive(
 
 
 class WindowsPortablePackagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if self._testMethodName == "test_output_junction_is_rejected_before_resolution":
+            return
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                require_stable_creation_identity(
+                    Path(temp_dir),
+                    "Portable ZIP test output",
+                )
+            except RuntimeError as exc:
+                self.skipTest(str(exc))
+
     @unittest.skipUnless(os.name == "nt", "Windows junction regression")
     def test_output_junction_is_rejected_before_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

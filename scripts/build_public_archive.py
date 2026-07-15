@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 if not __package__:
     sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "src"))
 
 from scripts._release_fs import (  # noqa: E402
     PathIdentity,

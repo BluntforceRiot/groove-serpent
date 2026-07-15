@@ -10,11 +10,24 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+from scripts._release_fs import require_stable_creation_identity
 from scripts import _release_evidence, build_public_archive
 from tests._release_evidence_fixtures import write_public_release_commit
 
 
 class BuildPublicArchiveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if self._testMethodName == "test_member_bytes_are_platform_independent":
+            return
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                require_stable_creation_identity(
+                    Path(temp_dir),
+                    "Public source archive test output",
+                )
+            except RuntimeError as exc:
+                self.skipTest(str(exc))
+
     @staticmethod
     def _git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
