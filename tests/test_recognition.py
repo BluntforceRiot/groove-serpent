@@ -35,19 +35,28 @@ from groove_serpent.recognition import (
 from groove_serpent.subprocess_policy import BoundedProcessResult
 
 
+class _FakePipe(io.BytesIO):
+    def close(self) -> None:
+        # Production closes inherited pipe handles after handing them to the
+        # child process. Keep test payloads readable for background-capture
+        # threads and subprocess.run cleanup paths that race with that close.
+        return None
+
+
 class _FakeProcess:
     def __init__(
         self,
         *,
+        args: tuple[object, ...] = ("synthetic-fingerprint-process",),
         stdout: bytes = b"",
         stderr: bytes = b"",
         returncode: int = 0,
         wait_timeout: bool = False,
         on_wait: Callable[[], None] | None = None,
     ) -> None:
-        self.args = ("synthetic-fingerprint-process",)
-        self.stdout = io.BytesIO(stdout)
-        self.stderr = io.BytesIO(stderr)
+        self.args = args
+        self.stdout = _FakePipe(stdout)
+        self.stderr = _FakePipe(stderr)
         self.returncode = returncode
         self._wait_timeout = wait_timeout
         self._on_wait = on_wait
@@ -93,6 +102,17 @@ class _FakeProcess:
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
+
+
+def _is_macos_namespace_probe(command: list[str]) -> bool:
+    return command == ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"]
+
+
+def _macos_namespace_probe_process(command: list[str]) -> _FakeProcess:
+    return _FakeProcess(
+        args=tuple(command),
+        stdout=b"00000000-0000-0000-0000-000000000000\n",
+    )
 
 
 class _FakeResponse:
@@ -594,8 +614,12 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         def fake_popen(command: list[str], **kwargs: object) -> _FakeProcess:
             del kwargs
+            if _is_macos_namespace_probe(command):
+                return _macos_namespace_probe_process(command)
             popen_calls.append(command)
-            return ffmpeg_process if len(popen_calls) == 1 else fpcalc_process
+            process = ffmpeg_process if len(popen_calls) == 1 else fpcalc_process
+            process.args = tuple(command)
+            return process
 
         captured_request: dict[str, object] = {}
 
@@ -721,10 +745,20 @@ class RecognitionPipelineTests(unittest.TestCase):
             with mock.patch(
                 "groove_serpent.recognition._discover_fingerprint_runtime",
                 return_value=(_runtime_status(runtime), runtime),
-            ), mock.patch(
-                "groove_serpent.recognition.subprocess.Popen",
-                side_effect=[ffmpeg_process, fpcalc_process],
-            ):
+            ), mock.patch("groove_serpent.recognition.subprocess.Popen") as popen:
+                fingerprint_processes = 0
+
+                def fake_popen(command: list[str], **kwargs: object) -> _FakeProcess:
+                    nonlocal fingerprint_processes
+                    del kwargs
+                    if _is_macos_namespace_probe(command):
+                        return _macos_namespace_probe_process(command)
+                    fingerprint_processes += 1
+                    process = ffmpeg_process if fingerprint_processes == 1 else fpcalc_process
+                    process.args = tuple(command)
+                    return process
+
+                popen.side_effect = fake_popen
                 with self.assertRaisesRegex(RecognitionError, "timed out"):
                     provider.identify_track(source, 0, 44_100 * 60, 44_100)
         self.assertTrue(ffmpeg_process.waited)
