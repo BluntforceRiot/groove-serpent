@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Groove Serpent Album Workbench</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2307090c'/%3E%3Cpath d='M13 38c8-20 30-20 38 0M20 42c7-11 17-11 24 0' fill='none' stroke='%23cfff38' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/album.css">
+</head>
+<body>
+  <a class="skip-link" href="#attentionHeading" tabindex="0">Skip to needs attention</a>
+  <div class="aurora aurora-one" aria-hidden="true"></div>
+  <div class="aurora aurora-two" aria-hidden="true"></div>
+
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="Groove Serpent album workbench">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 48 48" role="img">
+          <path d="M8 29c6-15 26-15 32 0M14 34c6-9 14-9 20 0"></path>
+        </svg>
+      </span>
+      <span><strong>Groove Serpent</strong><small>Album Workbench</small></span>
+    </a>
+    <button id="refreshButton" class="quiet-button" type="button" aria-label="Refresh album state">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"></path></svg>
+      <span>Refresh state</span>
+    </button>
+  </header>
+
+  <main id="workbench" aria-busy="true">
+    <section class="album-overview" aria-labelledby="albumTitle">
+      <div class="album-copy">
+        <p class="section-label">CURRENT ALBUM</p>
+        <h1 id="albumTitle">Loading album…</h1>
+        <p id="albumArtist" class="album-artist">Reading the local album project</p>
+        <p id="albumPath" class="album-path"></p>
+      </div>
+      <div id="readiness" class="readiness loading" role="status" aria-live="polite">
+        <span class="readiness-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><small>READINESS</small><strong id="readinessValue">Checking</strong><em id="readinessNote">Verifying every side</em></span>
+      </div>
+    </section>
+
+    <div id="globalNotice" class="global-notice" role="status" aria-live="polite">
+      <span id="globalNoticeText">Loading the latest album state…</span>
+      <button id="noticeReloadButton" class="text-button hidden" type="button">Reload current state</button>
+    </div>
+
+    <section id="loadFailure" class="load-failure hidden" role="alert" aria-labelledby="loadFailureHeading">
+      <span class="failure-symbol" aria-hidden="true">!</span>
+      <div>
+        <h2 id="loadFailureHeading">The album state could not be loaded</h2>
+        <p id="loadFailureMessage">Check that this review server is still running.</p>
+        <button id="retryButton" class="primary-button" type="button">Try again</button>
+      </div>
+    </section>
+
+    <div id="workbenchContent" class="workbench-content">
+      <section class="side-section" aria-labelledby="sideHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">ALBUM MAP</p>
+            <h2 id="sideHeading">Record sides</h2>
+          </div>
+          <p id="sideSummary" class="section-summary">Loading sides…</p>
+        </div>
+        <p class="side-open-explainer">Open any exact side in Groove Serpent's full waveform, spectrogram, marker, and restoration review. Opening a side is navigation, not approval.</p>
+        <div id="sideCards" class="side-cards" aria-live="polite">
+          <div class="side-card skeleton" aria-hidden="true"></div>
+          <div class="side-card skeleton" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <section class="pairing-section" aria-labelledby="pairingHeading">
+        <details id="pairingEditor" class="pairing-editor">
+          <summary>
+            <span>
+              <small class="section-label">SAFE EDITING</small>
+              <strong id="pairingHeading">Pair sides and edit album details</strong>
+            </span>
+            <span class="summary-action">Open editor</span>
+          </summary>
+          <p class="pairing-intro">Every save is checked against this exact album revision, file hash, and current side identities. Adding or changing order never approves a side.</p>
+          <div class="pairing-grid">
+            <form id="albumDetailsForm" class="editor-form" novalidate>
+              <div class="editor-heading">
+                <div>
+                  <p class="section-label">ALBUM DETAILS</p>
+                  <h3>Metadata and artwork</h3>
+                </div>
+                <span id="detailsStatus" class="editor-status" role="status" aria-live="polite"></span>
+              </div>
+              <div class="field-grid">
+                <label>Album title<input id="metadataAlbum" name="album" maxlength="4096"></label>
+                <label>Album artist<input id="metadataAlbumArtist" name="album_artist" maxlength="4096"></label>
+                <label>Artist<input id="metadataArtist" name="artist" maxlength="4096"></label>
+                <label>Year<input id="metadataYear" name="year" maxlength="4096" inputmode="numeric"></label>
+                <label>Genre<input id="metadataGenre" name="genre" maxlength="4096"></label>
+                <label class="wide-field">Artwork path <span>(relative JPEG or PNG; blank removes)</span><input id="artworkPath" name="artwork_path" maxlength="4096" placeholder="artwork/cover.png"></label>
+              </div>
+              <button id="saveDetailsButton" class="primary-button" type="submit">Save album details</button>
+            </form>
+
+            <form id="addSideForm" class="editor-form" novalidate>
+              <div class="editor-heading">
+                <div>
+                  <p class="section-label">PAIR AN EXISTING SIDE</p>
+                  <h3>Add a reviewed project</h3>
+                </div>
+                <span id="addSideStatus" class="editor-status" role="status" aria-live="polite"></span>
+              </div>
+              <label>Side label<input id="newSideLabel" maxlength="32" required placeholder="C" autocomplete="off"></label>
+              <label>Project path <span>(relative to this album)</span><input id="newSideProject" maxlength="4096" required placeholder="side-c.groove.json" autocomplete="off"></label>
+              <p class="form-note">Only a contained, current schema-4 project with its unchanged source can be added. The new side starts unpinned.</p>
+              <button id="addSideButton" class="primary-button" type="submit">Add unpinned side</button>
+            </form>
+          </div>
+          <div class="order-policy">
+            <div>
+              <p class="section-label">ORDER IS APPROVAL-RELEVANT</p>
+              <strong>Moving or removing a side clears every remaining side pin.</strong>
+              <p id="orderPolicyReason">Side order controls continuous track numbering and publication order.</p>
+            </div>
+            <label class="review-check compact-check">
+              <input id="orderApprovalCheckbox" type="checkbox">
+              <span>I understand that changing order requires reviewing and repinning every side.</span>
+            </label>
+            <p id="orderStatus" class="editor-status" role="status" aria-live="polite"></p>
+          </div>
+        </details>
+      </section>
+
+      <section class="identification-section" aria-labelledby="identificationHeading">
+        <div class="section-heading publication-heading">
+          <div>
+            <p class="section-label">PROPOSAL-ONLY RELEASE EVIDENCE</p>
+            <h2 id="identificationHeading">Identify this album</h2>
+          </div>
+          <span id="identificationReadiness" class="publication-readiness" role="status" aria-live="polite">Checking provider...</span>
+        </div>
+        <p class="publication-intro">Groove Serpent fingerprints each exact current track locally, then asks the explicitly configured recognition provider for recording and release candidates. Source audio is never uploaded. A database release is evidence, not proof that your physical pressing is that edition.</p>
+        <div class="identification-grid">
+          <form id="identificationScanForm" class="editor-form identification-form" novalidate>
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">EXPLICIT NETWORK ACTION</p>
+                <h3>Scan current track ranges</h3>
+              </div>
+              <span id="identificationStatus" class="editor-status" role="status" aria-live="polite"></span>
+            </div>
+            <dl id="identificationProvider" class="identification-provider"></dl>
+            <p class="operation-warning">Only bounded fingerprints, durations, and the provider request are sent. Album and side files remain unchanged; the result is an immutable review proposal beside this album.</p>
+            <label class="review-check publication-review-check">
+              <input id="identificationNetworkReviewed" type="checkbox">
+              <span>I reviewed this network action and understand that candidates will not change metadata, artwork, speed, boundaries, restoration, or publication.</span>
+            </label>
+            <button id="identificationScanButton" class="primary-button" type="submit" disabled>Scan for release candidates</button>
+            <p class="form-note">If recognition abstains or the pressing remains uncertain, use the manual album details and artwork path above. Manual input remains the final fallback.</p>
+          </form>
+
+          <section class="identification-catalog" aria-labelledby="identificationCatalogHeading">
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">REOPENED FROM DISK</p>
+                <h3 id="identificationCatalogHeading" tabindex="-1">Identification proposals</h3>
+              </div>
+              <span id="identificationCatalogSummary" class="editor-status"></span>
+            </div>
+            <div id="identificationCatalog" class="identification-proposal-list" aria-live="polite"></div>
+          </section>
+        </div>
+        <section id="identificationReview" class="identification-review hidden" aria-labelledby="identificationReviewHeading" aria-live="polite">
+          <div class="editor-heading">
+            <div>
+              <p class="section-label">HUMAN REVIEW REQUIRED</p>
+              <h3 id="identificationReviewHeading">Ranked release evidence</h3>
+            </div>
+            <button id="closeIdentificationReview" class="quiet-button" type="button">Close evidence</button>
+          </div>
+          <div id="identificationDecision" class="identification-decision"></div>
+          <div class="release-network-review">
+            <label class="review-check publication-review-check">
+              <input id="releaseDetailsNetworkReviewed" type="checkbox">
+              <span>I reviewed the MusicBrainz release-details request. It is read-only, is bound to this exact proposal and candidate, and cannot prove the physical pressing.</span>
+            </label>
+            <span id="releaseDetailsStatus" class="editor-status" role="status" aria-live="polite"></span>
+          </div>
+          <div id="identificationCandidates" class="identification-candidates"></div>
+          <section id="releaseDetailsReview" class="release-details-review hidden" aria-labelledby="releaseDetailsHeading">
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">EXACT MUSICBRAINZ FACTS</p>
+                <h4 id="releaseDetailsHeading" tabindex="-1">Reviewed release details</h4>
+              </div>
+              <button id="copyReleaseMetadataButton" class="quiet-button" type="button">Copy facts to manual form (does not save)</button>
+            </div>
+            <div id="releaseDetailsContent"></div>
+            <div class="release-artwork-action">
+              <label class="review-check publication-review-check">
+                <input id="artworkNetworkReviewed" type="checkbox">
+                <span>I reviewed the separate Cover Art Archive download. It saves one new no-overwrite review file; it does not apply that file to the album.</span>
+              </label>
+              <button id="downloadArtworkButton" class="primary-button" type="button" disabled>Download front artwork for review</button>
+              <span id="artworkReviewStatus" class="editor-status" role="status" aria-live="polite"></span>
+            </div>
+            <div id="artworkReview" class="artwork-review hidden"></div>
+          </section>
+          <div id="identificationPressing" class="identification-pressing"></div>
+        </section>
+      </section>
+
+      <section class="publication-section" aria-labelledby="publicationHeading">
+        <div class="section-heading publication-heading">
+          <div>
+            <p class="section-label">RESTART-SAFE PUBLICATION</p>
+            <h2 id="publicationHeading">Publication plans</h2>
+          </div>
+          <span id="publicationReadiness" class="publication-readiness" role="status" aria-live="polite">Checking readiness...</span>
+        </div>
+        <p class="publication-intro">A plan binds this exact album, every side and source, selected restoration outcomes, encoder profiles, and tool builds. Creating or preflighting a plan does not export audio.</p>
+        <div class="publication-grid">
+          <form id="publicationPlanForm" class="editor-form publication-form" novalidate>
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">EXPLICIT REVIEWED ACTION</p>
+                <h3>Create an immutable plan</h3>
+              </div>
+              <span id="publicationPlanStatus" class="editor-status" role="status" aria-live="polite"></span>
+            </div>
+            <label class="wide-field">Plan filename
+              <input id="publicationPlanFilename" maxlength="255" autocomplete="off" spellcheck="false">
+            </label>
+            <p class="exact-value-preview">Exact plan filename: <code id="publicationPlanFilenamePreview" tabindex="0" title=""></code></p>
+            <fieldset class="publication-fieldset">
+              <legend>Output profiles</legend>
+              <div id="publicationProfiles" class="publication-options"></div>
+            </fieldset>
+            <fieldset class="publication-fieldset">
+              <legend>Restoration input</legend>
+              <div id="publicationRestorationModes" class="publication-options"></div>
+            </fieldset>
+            <details class="publication-settings">
+              <summary>Encoding settings</summary>
+              <div class="field-grid compact-fields">
+                <label>FLAC compression<input id="publicationFlacCompression" type="number" min="0" max="12" step="1" value="8"></label>
+                <label>AAC bitrate (kbps)<input id="publicationAacBitrate" type="number" min="64" max="512" step="1" value="256"></label>
+              </div>
+            </details>
+            <label class="review-check publication-review-check">
+              <input id="publicationReviewed" type="checkbox">
+              <span>I reviewed the exact album state, profiles, restoration choice, filename, and encoder settings shown here.</span>
+            </label>
+            <button id="createPublicationPlanButton" class="primary-button" type="submit" disabled>Create reviewed plan</button>
+            <p class="form-note">Plans are immutable and never replace an existing or portable-equivalent filename. Creating a plan never starts publication.</p>
+          </form>
+
+          <div class="publication-catalog" aria-labelledby="publicationCatalogHeading">
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">REOPENED FROM DISK</p>
+                <h3 id="publicationCatalogHeading">Plan catalog</h3>
+              </div>
+              <span id="publicationCatalogSummary" class="editor-status"></span>
+            </div>
+            <div id="publicationCatalog" class="publication-plan-list" aria-live="polite"></div>
+            <p class="form-note">Only a current plan can be preflighted. Stale and invalid plans remain visible evidence and are never repaired automatically.</p>
+          </div>
+        </div>
+
+        <div class="publication-operation-shell" aria-labelledby="publicationOperationHeading">
+          <div class="editor-heading operation-heading">
+            <div>
+              <p class="section-label">OWNER-CONTROLLED EXECUTION</p>
+              <h3 id="publicationOperationHeading">Publish, verify, replay, and recover</h3>
+            </div>
+            <span id="publicationOperationSummary" class="editor-status"></span>
+          </div>
+          <p class="publication-intro">Every write targets a new directory directly beside this album. The server preflights the exact current plan again, never overwrites, and reports success only after strict receipt verification and disk rediscovery.</p>
+          <div class="publication-operation-grid">
+            <form id="publicationExecutionForm" class="operation-panel execution-panel" novalidate>
+              <div>
+                <p class="section-label">NEW PUBLICATION</p>
+                <h4>Execute a current plan</h4>
+              </div>
+              <label>Selected current plan
+                <output id="publicationExecutionPlan" class="bounded-output">Choose Execute on a current plan card.</output>
+              </label>
+              <label>New destination directory
+                <input id="publicationDestinationName" maxlength="180" autocomplete="off" spellcheck="false">
+              </label>
+              <p class="exact-value-preview">Exact name: <code id="publicationDestinationPreview" tabindex="0" title=""></code></p>
+              <p class="operation-warning">Archival-source writes one byte-identical full-capture object per unique exact source identity. Multiple sides bind that object through the publication receipt; no range is mislabeled as the full capture.</p>
+              <label>Type <strong id="publicationExecutionPhrase">PUBLISH destination</strong> to continue
+                <input id="publicationExecutionConfirmation" maxlength="512" autocomplete="off" spellcheck="false">
+              </label>
+              <label class="review-check publication-review-check">
+                <input id="publicationExecutionConfirmed" type="checkbox">
+                <span>I own this destination choice and authorize one execution of the exact selected immutable plan.</span>
+              </label>
+              <button id="executePublicationButton" class="primary-button" type="submit" disabled>Execute and verify</button>
+              <p id="publicationExecutionStatus" class="editor-status" role="status" aria-live="polite"></p>
+              <ol id="publicationProgress" class="publication-progress" aria-label="Publication progress receipt"></ol>
+            </form>
+
+            <section class="operation-panel receipt-panel" aria-labelledby="publicationReceiptHeading">
+              <div class="editor-heading">
+                <div>
+                  <p class="section-label">REOPENED RECEIPTS</p>
+                  <h4 id="publicationReceiptHeading">Final publications</h4>
+                </div>
+              </div>
+              <div id="publicationReceipts" class="publication-receipt-list" aria-live="polite"></div>
+              <form id="publicationReplayForm" class="replay-form hidden" novalidate>
+                <p class="section-label">DELIBERATE REPLAY</p>
+                <label>Verified source publication
+                  <output id="publicationReplaySource" class="bounded-output"></output>
+                </label>
+                <label>New replay destination
+                  <input id="publicationReplayDestination" maxlength="180" autocomplete="off" spellcheck="false">
+                </label>
+                <p class="exact-value-preview">Exact name: <code id="publicationReplayPreview" tabindex="0" title=""></code></p>
+                <label>Type <strong id="publicationReplayPhrase">REPLAY source TO destination</strong> to continue
+                  <input id="publicationReplayConfirmation" maxlength="512" autocomplete="off" spellcheck="false">
+                </label>
+                <label class="review-check publication-review-check">
+                  <input id="publicationReplayConfirmed" type="checkbox">
+                  <span>I authorize a new replay directory. The verified original remains untouched.</span>
+                </label>
+                <div class="operation-actions">
+                  <button id="cancelPublicationReplay" class="quiet-button" type="button">Cancel replay</button>
+                  <button id="replayPublicationButton" class="primary-button" type="submit" disabled>Replay and compare</button>
+                </div>
+                <p id="publicationReplayStatus" class="editor-status" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+          </div>
+
+          <section class="publication-recovery-panel" aria-labelledby="publicationRecoveryHeading">
+            <div class="editor-heading">
+              <div>
+                <p class="section-label">CRASH-SAFE INVENTORY</p>
+                <h4 id="publicationRecoveryHeading">Incomplete and quarantined operations</h4>
+              </div>
+              <span id="publicationRecoveryStatus" class="editor-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="form-note">There is no automatic resume. Quarantine is the preferred action. Removal is available only for an exact recognized owned orphan and requires its full journal identity.</p>
+            <div id="publicationOrphans" class="publication-orphan-list" aria-live="polite"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="review-shell" aria-label="Album exception review">
+        <aside class="attention-rail" aria-labelledby="attentionHeading">
+          <div class="attention-header">
+            <div>
+              <p class="section-label">EXCEPTION QUEUE</p>
+              <h2 id="attentionHeading" tabindex="-1">Needs Attention</h2>
+            </div>
+            <span id="attentionTotal" class="count-total" aria-label="Loading exception count">—</span>
+          </div>
+          <div class="count-row" aria-label="Exception severity counts">
+            <span><i class="count-dot blocker-dot" aria-hidden="true"></i><strong id="blockerCount">—</strong> blockers</span>
+            <span><i class="count-dot review-dot" aria-hidden="true"></i><strong id="reviewCount">—</strong> reviews</span>
+          </div>
+          <p id="queueHelp" class="queue-help">Choose an exception to see the exact evidence and available action.</p>
+          <nav id="exceptionQueue" class="exception-queue" aria-label="Album exceptions"></nav>
+        </aside>
+
+        <article id="exceptionDetail" class="exception-detail" aria-labelledby="detailHeading">
+          <div id="detailEmpty" class="detail-empty">
+            <span class="empty-orbit" aria-hidden="true"><i></i></span>
+            <h2 id="detailEmptyHeading">Loading review details…</h2>
+            <p id="detailEmptyCopy">Every unresolved decision will appear here with its exact evidence.</p>
+          </div>
+
+          <div id="detailContent" class="hidden">
+            <div class="detail-heading-row">
+              <div>
+                <p id="detailContext" class="section-label">ALBUM REVIEW</p>
+                <h2 id="detailHeading" tabindex="-1">Review exception</h2>
+              </div>
+              <span id="detailSeverity" class="severity-badge">Review</span>
+            </div>
+            <p id="detailMessage" class="detail-message"></p>
+
+            <dl id="detailFacts" class="detail-facts"></dl>
+
+            <section class="evidence-section" aria-labelledby="evidenceHeading">
+              <div class="subheading-row">
+                <div>
+                  <p class="section-label">EXACT VALUES</p>
+                  <h3 id="evidenceHeading">Decision evidence</h3>
+                </div>
+                <span class="evidence-note">Values are shown in full</span>
+              </div>
+              <div id="evidenceGrid" class="evidence-grid"></div>
+            </section>
+
+            <section id="repinPanel" class="repin-panel hidden" aria-labelledby="repinHeading">
+              <div class="repin-copy">
+                <p class="section-label">EXPLICIT APPROVAL</p>
+                <h3 id="repinHeading">Pin this side to its current identity</h3>
+                <p>Repinning records the exact project, editable state, source, revision, and reviewed speed identities now shown above. It does not modify audio.</p>
+              </div>
+              <form id="repinForm">
+                <label class="review-check">
+                  <input id="reviewedCheckbox" type="checkbox">
+                  <span>I reviewed this side and its exact current identity.</span>
+                </label>
+                <button id="repinButton" class="primary-button" type="submit" disabled>Repin reviewed side</button>
+              </form>
+              <p id="repinStatus" class="repin-status" role="status" aria-live="polite"></p>
+            </section>
+
+            <section id="manualActionPanel" class="manual-action-panel" aria-labelledby="manualActionHeading">
+              <p class="section-label">NEXT REVIEW STEP</p>
+              <h3 id="manualActionHeading">Review outside this surface</h3>
+              <p id="manualActionCopy"></p>
+            </section>
+          </div>
+        </article>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="removeSideDialog" class="confirm-dialog" aria-labelledby="removeSideHeading">
+    <form id="removeSideForm" novalidate>
+      <p class="section-label">DELIBERATE REMOVAL</p>
+      <h2 id="removeSideHeading">Remove side</h2>
+      <p id="removeSideCopy">This removes the side from the album project only. It does not delete its project or audio.</p>
+      <label for="removeSideConfirmation"><span>Type <strong id="removeSidePhrase">REMOVE A</strong> to continue</span>
+        <input id="removeSideConfirmation" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="dialog-warning">The remaining sides will be resequenced and every side pin will be cleared.</p>
+      <p id="removeSideStatus" class="editor-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button id="cancelRemoveSide" class="quiet-button" type="button">Cancel</button>
+        <button id="confirmRemoveSide" class="danger-button" type="submit" disabled>Remove side</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="publicationRecoveryDialog" class="confirm-dialog" aria-labelledby="publicationRecoveryDialogHeading">
+    <form id="publicationRecoveryForm" novalidate>
+      <p class="section-label">EXACT OWNED ORPHAN</p>
+      <h2 id="publicationRecoveryDialogHeading">Quarantine publication orphan</h2>
+      <p id="publicationRecoveryCopy"></p>
+      <label for="publicationRecoveryConfirmation"><span>Type <strong id="publicationRecoveryPhrase"></strong> to continue</span>
+        <input id="publicationRecoveryConfirmation" maxlength="1024" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="review-check publication-review-check">
+        <input id="publicationRecoveryConfirmed" type="checkbox">
+        <span>I reviewed the exact directory identity and journal receipt shown here.</span>
+      </label>
+      <p id="publicationRecoveryDialogStatus" class="editor-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button id="cancelPublicationRecovery" class="quiet-button" type="button">Cancel</button>
+        <button id="confirmPublicationRecovery" class="primary-button" type="submit" disabled>Quarantine exact orphan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <footer>
+    <span><i class="local-light" aria-hidden="true"></i>Local session</span>
+    <span>Automatic findings remain reviewable.</span>
+  </footer>
+
+  <noscript>
+    <div class="noscript">The Album Workbench requires JavaScript to load the local review state.</div>
+  </noscript>
+  <script src="/album.js" defer></script>
+</body>
+</html>

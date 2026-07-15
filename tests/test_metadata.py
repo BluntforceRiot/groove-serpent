@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
 from groove_serpent import __user_agent__
 from groove_serpent.metadata import (
@@ -95,7 +96,7 @@ class MetadataTests(unittest.TestCase):
                     "score": 91,
                     "status": "Official",
                     "media": [
-                        {"format": '12\" Vinyl', "track-count": 4},
+                        {"format": '12" Vinyl', "track-count": 4},
                         {"format": "Vinyl", "track-count": 4},
                     ],
                     "barcode": None,
@@ -168,7 +169,7 @@ class MetadataTests(unittest.TestCase):
             "media": [
                 {
                     "position": 1,
-                    "format": '12\" Vinyl',
+                    "format": '12" Vinyl',
                     "tracks": [
                         {
                             "id": "track-a1",
@@ -363,9 +364,7 @@ class CoverArtTests(unittest.TestCase):
                     "front": True,
                     "approved": False,
                     "image": "http://coverartarchive.org/release/unapproved.jpg",
-                    "thumbnails": {
-                        "500": "http://coverartarchive.org/release/unapproved-500.jpg"
-                    },
+                    "thumbnails": {"500": "http://coverartarchive.org/release/unapproved-500.jpg"},
                 },
                 {
                     "id": 2,
@@ -408,9 +407,7 @@ class CoverArtTests(unittest.TestCase):
                     "front": True,
                     "approved": True,
                     "image": "http://coverartarchive.org/release/group-front.jpg",
-                    "thumbnails": {
-                        "500": "http://coverartarchive.org/release/group-front-500.jpg"
-                    },
+                    "thumbnails": {"500": "http://coverartarchive.org/release/group-front-500.jpg"},
                 }
             ]
         }
@@ -441,9 +438,7 @@ class CoverArtTests(unittest.TestCase):
                     "front": True,
                     "approved": True,
                     "image": "https://coverartarchive.org/release/group-original.jpg",
-                    "thumbnails": {
-                        "500": "https://coverartarchive.org/release/group-500.jpg"
-                    },
+                    "thumbnails": {"500": "https://coverartarchive.org/release/group-500.jpg"},
                 }
             ]
         }
@@ -466,9 +461,7 @@ class CoverArtTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             client = GroupDownloadClient(root)
-            result = client.download_release_group_front_art(
-                RELEASE_GROUP_ID, size="500"
-            )
+            result = client.download_release_group_front_art(RELEASE_GROUP_ID, size="500")
             saved = root / result["relative_path"]
             self.assertEqual(saved.read_bytes(), image)
 
@@ -505,9 +498,14 @@ class CoverArtTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="Groove Sérpent ") as directory:
             root = Path(directory)
-            result = DownloadClient(root).download_front_art(RELEASE_ID, size="1200")
+            client = DownloadClient(root)
+            result = client.download_front_art(RELEASE_ID, size="1200")
             saved = root / result["relative_path"]
             self.assertTrue(saved.is_file())
+            self.assertEqual(saved.read_bytes(), image)
+            self.assertEqual(list((root / "artwork").glob(".cover-*.tmp")), [])
+            with self.assertRaisesRegex(MetadataLookupError, "will not overwrite"):
+                client.download_front_art(RELEASE_ID, size="1200")
             self.assertEqual(saved.read_bytes(), image)
             self.assertEqual(list((root / "artwork").glob(".cover-*.tmp")), [])
 
@@ -527,9 +525,7 @@ class CoverArtTests(unittest.TestCase):
             def resolve_front_art(self, release_id: str) -> dict[str, Any]:
                 return {
                     "release_id": RELEASE_ID,
-                    "urls": {
-                        "original": "https://coverartarchive.org/release/original.jpg"
-                    },
+                    "urls": {"original": "https://coverartarchive.org/release/original.jpg"},
                 }
 
             def _open(self, request: Any) -> FakeResponse:
@@ -545,11 +541,118 @@ class CoverArtTests(unittest.TestCase):
                     RELEASE_ID, size="original"
                 )
             with self.assertRaisesRegex(MetadataLookupError, "download limit"):
-                BadDownloadClient(
-                    root, b"\xff\xd8\xff123456", "image/jpeg"
-                ).download_front_art(RELEASE_ID, size="original")
+                BadDownloadClient(root, b"\xff\xd8\xff123456", "image/jpeg").download_front_art(
+                    RELEASE_ID, size="original"
+                )
             artwork = root / "artwork"
             self.assertEqual(list(artwork.iterdir()) if artwork.exists() else [], [])
+
+    def test_download_rejects_unsafe_final_redirect_without_creating_file(self) -> None:
+        image = b"\xff\xd8\xff" + b"redirected-image"
+
+        class RedirectClient(CoverArtArchiveClient):
+            def resolve_front_art(self, release_id: str) -> dict[str, Any]:
+                return {
+                    "release_id": RELEASE_ID,
+                    "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
+                }
+
+            def _open(self, request: Any) -> FakeResponse:
+                return FakeResponse(
+                    image,
+                    headers={"Content-Type": "image/jpeg"},
+                    final_url="https://example.invalid/untrusted.jpg",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(MetadataLookupError, "unsafe location"):
+                RedirectClient(root).download_front_art(RELEASE_ID, size="original")
+            self.assertFalse((root / "artwork").exists())
+
+    def test_download_rejects_mismatched_signature_and_cleans_partial_file(self) -> None:
+        class SignatureClient(CoverArtArchiveClient):
+            def resolve_front_art(self, release_id: str) -> dict[str, Any]:
+                return {
+                    "release_id": RELEASE_ID,
+                    "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
+                }
+
+            def _open(self, request: Any) -> FakeResponse:
+                return FakeResponse(
+                    b"not actually a jpeg",
+                    headers={"Content-Type": "image/jpeg"},
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(MetadataLookupError, "declared image type"):
+                SignatureClient(root).download_front_art(RELEASE_ID, size="original")
+            artwork = root / "artwork"
+            self.assertEqual(list(artwork.iterdir()) if artwork.exists() else [], [])
+
+    def test_download_rejects_linked_artwork_directory_without_touching_target(
+        self,
+    ) -> None:
+        image = b"\xff\xd8\xff" + b"linked-directory-image"
+
+        class LinkedDirectoryClient(CoverArtArchiveClient):
+            def resolve_front_art(self, release_id: str) -> dict[str, Any]:
+                return {
+                    "release_id": RELEASE_ID,
+                    "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
+                }
+
+            def _open(self, request: Any) -> FakeResponse:
+                return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "redirect-target"
+            target.mkdir()
+            linked = root / "artwork"
+            try:
+                linked.symlink_to(target, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"Directory symlinks are unavailable: {exc}")
+            with self.assertRaisesRegex(MetadataLookupError, "symlink, junction, or reparse point"):
+                LinkedDirectoryClient(root).download_front_art(RELEASE_ID, size="original")
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_download_rejects_reparse_artwork_directory_without_write(self) -> None:
+        image = b"\xff\xd8\xff" + b"reparse-directory-image"
+
+        class ReparseDirectoryClient(CoverArtArchiveClient):
+            def resolve_front_art(self, release_id: str) -> dict[str, Any]:
+                return {
+                    "release_id": RELEASE_ID,
+                    "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
+                }
+
+            def _open(self, request: Any) -> FakeResponse:
+                return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artwork = root / "artwork"
+            artwork.mkdir()
+            artwork_identity = artwork.lstat()
+
+            def mark_artwork_reparse(value: Any) -> bool:
+                return (
+                    value.st_dev == artwork_identity.st_dev
+                    and value.st_ino == artwork_identity.st_ino
+                )
+
+            with mock.patch(
+                "groove_serpent.metadata._is_reparse",
+                side_effect=mark_artwork_reparse,
+            ):
+                with self.assertRaisesRegex(
+                    MetadataLookupError, "symlink, junction, or reparse point"
+                ):
+                    ReparseDirectoryClient(root).download_front_art(RELEASE_ID, size="original")
+            self.assertEqual(list(artwork.iterdir()), [])
 
     def test_resolve_rejects_unsafe_image_url(self) -> None:
         class UnsafeClient(CoverArtArchiveClient):

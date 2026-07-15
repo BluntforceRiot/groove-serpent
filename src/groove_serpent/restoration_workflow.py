@@ -18,6 +18,7 @@ from typing import Any, Generator, Mapping, Sequence
 import numpy as np
 
 from . import __version__
+from .atomic_create import rename_no_replace
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .cache_storage import ensure_free_space, resolve_cache_root
 from .errors import GrooveSerpentError, ProjectValidationError
@@ -254,20 +255,9 @@ def _atomic_json(
             os.fsync(handle.fileno())
         if overwrite:
             os.replace(temporary, path)
-        elif os.name == "nt":
-            # Windows rename is an atomic no-replace operation: unlike POSIX
-            # rename, it raises when the destination already exists.
-            try:
-                os.rename(temporary, path)
-            except FileExistsError as exc:
-                raise GrooveSerpentError(
-                    f"Refusing to replace existing restoration JSON: {path}"
-                ) from exc
         else:
-            # Same-directory hard-link commit is atomic and fails if the final
-            # pathname exists. The temporary name is removed after the link.
             try:
-                os.link(temporary, path)
+                rename_no_replace(temporary, path)
             except FileExistsError as exc:
                 raise GrooveSerpentError(
                     f"Refusing to replace existing restoration JSON: {path}"
@@ -2040,7 +2030,7 @@ def _create_click_preview(
         inputs.assert_unchanged()
         if bundle_dir.exists():
             raise GrooveSerpentError(f"Preview bundle already exists: {bundle_dir}")
-        os.rename(stage, bundle_dir)
+        rename_no_replace(stage, bundle_dir)
         committed = True
         result = dict(manifest)
         result["bundle_path"] = str(bundle_dir)
@@ -2636,7 +2626,7 @@ def _render_restored_side(
             raise GrooveSerpentError(
                 "An input or output path changed before restoration could be committed."
             )
-        os.rename(stage, bundle_dir)
+        rename_no_replace(stage, bundle_dir)
         committed = True
         result = dict(receipt)
         result["bundle_path"] = str(bundle_dir)

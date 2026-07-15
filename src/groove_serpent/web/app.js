@@ -25,12 +25,17 @@ let projectConflict = false;
 let providerOperationId = 0;
 let lookupReturnFocus = null;
 let exportReturnFocus = null;
+let expandedPanel = null;
 let evidencePayload = null;
 let evidenceAbortController = null;
 let evidenceRequestId = 0;
+let evidenceLoadQueued = false;
 let evidenceLoadTimer = null;
 let evidenceSelection = null;
 let evidenceDragAnchor = null;
+let endpointProposal = null;
+let endpointReviewedStart = false;
+let endpointReviewedEnd = false;
 let listeningOutput = "archival";
 let topologyProposalContext = null;
 let evidenceOverrideFocus = null;
@@ -38,8 +43,13 @@ let restorationScan = null;
 let restorationRecipe = null;
 let restorationPreview = null;
 let restorationSelectedCandidate = null;
+let restorationActiveRole = "before";
+let restorationEvidenceRequestId = 0;
+let restorationEvidence = { before: null, proposed: null, removed: null };
 const restorationDecisions = new Map();
 const restorationPreviewed = new Set();
+const restorationAuditioned = new Map();
+const ENDPOINT_REVIEW_INTENT = "end-at-wanted-music-remove-lead-in-and-runout";
 
 const canvas = document.getElementById("waveform");
 const context = canvas.getContext("2d");
@@ -79,6 +89,22 @@ const restorationAudio = {
   proposed: document.getElementById("restorationProposed"),
   removed: document.getElementById("restorationRemoved"),
 };
+const restorationRoleButtons = {
+  before: document.getElementById("restorationVariantBefore"),
+  proposed: document.getElementById("restorationVariantProposed"),
+  removed: document.getElementById("restorationVariantRemoved"),
+};
+const restorationCanvases = {
+  before: document.getElementById("restorationCanvasBefore"),
+  proposed: document.getElementById("restorationCanvasProposed"),
+  removed: document.getElementById("restorationCanvasRemoved"),
+};
+const restorationPlayPause = document.getElementById("restorationPlayPause");
+const restorationSeek = document.getElementById("restorationSeek");
+const restorationTime = document.getElementById("restorationTime");
+const restorationTransportStatus = document.getElementById(
+  "restorationTransportStatus",
+);
 
 const metadataInputs = {
   artist: document.getElementById("metaArtist"),
@@ -92,6 +118,12 @@ const metadataInputs = {
 function setStatus(message, kind = "") {
   statusElement.textContent = message;
   statusElement.className = `status ${kind}`.trim();
+}
+
+function preferredScrollBehavior() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ? "auto"
+    : "smooth";
 }
 
 function handleProjectConflict(error) {
@@ -123,6 +155,7 @@ function handleProjectConflict(error) {
 function markDirty() {
   editRevision += 1;
   dirty = true;
+  updateEndpointControls();
   setStatus("Unsaved changes", "busy");
   document.getElementById("saveIdentity").textContent = "STATE · unsaved changes";
 }
@@ -138,6 +171,7 @@ function setProviderBusy(busy, trackNumber = null) {
       evidenceAbortController.abort();
       evidenceAbortController = null;
     }
+    evidenceLoadQueued = false;
     evidenceRequestId += 1;
   }
   if (busy && (!audio.paused || currentPreviewEnd !== null || boundaryLoop !== null)) {
@@ -159,6 +193,7 @@ function setProviderBusy(busy, trackNumber = null) {
   for (const button of document.querySelectorAll("[data-intended-rpm]")) button.disabled = busy;
   document.getElementById("listenArchival").disabled = busy;
   document.getElementById("saveCheckpoint").disabled = busy || !project;
+  updateEndpointControls();
   if (project) {
     renderTrackTable();
     selectMarker(selectedMarker);
@@ -857,6 +892,11 @@ canvas.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && dismissExpandedPanel()) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   if (!(event.ctrlKey || event.metaKey) || providerBusy) return;
   const target = event.target;
   if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target?.isContentEditable) return;
@@ -1109,10 +1149,18 @@ function focusEvidenceAtSample(sample) {
 async function loadEvidence() {
   const bounds = evidenceBounds();
   if (!bounds || projectConflict) return;
+  if (evidenceAbortController) {
+    // WebKit cannot reliably rewind an aborted POST body while a replacement
+    // request starts. Let this bounded request finish, ignore its result, then
+    // load the newest exact bounds without overlapping POSTs.
+    evidenceRequestId += 1;
+    evidenceLoadQueued = true;
+    return;
+  }
   const requestedRevision = project.revision;
   const requestedProjectSha256 = project.project_sha256;
-  if (evidenceAbortController) evidenceAbortController.abort();
-  evidenceAbortController = new AbortController();
+  const controller = new AbortController();
+  evidenceAbortController = controller;
   const requestId = ++evidenceRequestId;
   evidenceStatus.textContent = "Decoding one exact source window and measuring both views…";
   evidenceStatus.className = "evidence-status busy";
@@ -1125,7 +1173,7 @@ async function loadEvidence() {
         end_sample: bounds.end,
         focus_sample: bounds.focus,
       },
-      { signal: evidenceAbortController.signal },
+      { signal: controller.signal },
     );
     if (requestId !== evidenceRequestId) return;
     if (
@@ -1163,9 +1211,13 @@ async function loadEvidence() {
     drawEvidence();
     handleProjectConflict(error);
   } finally {
-    if (requestId === evidenceRequestId) {
+    if (evidenceAbortController === controller) {
       evidenceAbortController = null;
       document.getElementById("refreshEvidence").disabled = providerBusy || selectedMarker === null;
+      if (evidenceLoadQueued && !providerBusy && !projectConflict) {
+        evidenceLoadQueued = false;
+        scheduleEvidenceLoad(0);
+      }
     }
   }
 }
@@ -1458,6 +1510,290 @@ document.getElementById("playEvidenceSelection").addEventListener("click", () =>
   audio.play().catch(() => setStatus("Browser could not play this source format", "error"));
 });
 
+function endpointScope() {
+  const scopes = endpointProposal?.scopes;
+  return Array.isArray(scopes) && scopes.length === 1 ? scopes[0] : null;
+}
+
+function clearEndpointProposalIfProjectChanged() {
+  const identity = endpointProposal?.project;
+  if (
+    !identity
+    || (
+      identity.revision === project?.revision
+      && identity.sha256 === project?.project_sha256
+    )
+  ) return;
+  endpointProposal = null;
+  endpointReviewedStart = false;
+  endpointReviewedEnd = false;
+  document.getElementById("endpointIntent").checked = false;
+  renderEndpointProposal();
+  setEndpointStatus(
+    "The project changed after endpoint analysis. The stale suggestion was cleared.",
+    "error",
+  );
+}
+
+function setEndpointStatus(message, kind = "") {
+  const element = document.getElementById("endpointStatus");
+  element.textContent = message;
+  element.className = `endpoint-status ${kind}`.trim();
+}
+
+function endpointCandidateText(candidate) {
+  if (!candidate) return "No independent candidate";
+  return `${candidate.start_sample.toLocaleString()} – ${candidate.end_sample_exclusive.toLocaleString()}`;
+}
+
+function updateEndpointControls() {
+  const scope = endpointScope();
+  const proposed = scope?.status === "proposed"
+    && Number.isSafeInteger(scope.proposed_music_start_sample)
+    && Number.isSafeInteger(scope.proposed_music_end_sample_exclusive);
+  document.getElementById("analyzeEndpoints").disabled =
+    !project || providerBusy || projectConflict;
+  document.getElementById("reviewEndpointStart").disabled =
+    providerBusy || !proposed;
+  document.getElementById("reviewEndpointEnd").disabled =
+    providerBusy || !proposed;
+  document.getElementById("endpointIntent").disabled =
+    providerBusy || !proposed || !endpointReviewedStart || !endpointReviewedEnd;
+  document.getElementById("rejectEndpoints").disabled =
+    providerBusy || !endpointProposal;
+  document.getElementById("acceptEndpoints").disabled =
+    providerBusy
+    || dirty
+    || !proposed
+    || !endpointReviewedStart
+    || !endpointReviewedEnd
+    || !document.getElementById("endpointIntent").checked;
+}
+
+function renderEndpointProposal() {
+  const body = document.getElementById("endpointProposalBody");
+  const metrics = document.getElementById("endpointProposalMetrics");
+  const reasons = document.getElementById("endpointProposalReasons");
+  const needle = document.getElementById("endpointNeedleEvidence");
+  metrics.replaceChildren();
+  reasons.replaceChildren();
+  needle.replaceChildren();
+  if (!endpointProposal) {
+    body.classList.add("hidden");
+    document.getElementById("endpointIntent").checked = false;
+    updateEndpointControls();
+    return;
+  }
+  const scope = endpointScope();
+  if (!scope) {
+    endpointProposal = null;
+    body.classList.add("hidden");
+    setEndpointStatus("Endpoint proposal has unsupported side-scope geometry.", "error");
+    updateEndpointControls();
+    return;
+  }
+  body.classList.remove("hidden");
+  const proposed = scope.status === "proposed";
+  const badge = document.getElementById("endpointProposalBadge");
+  badge.textContent = proposed ? "SUGGESTION · REVIEW REQUIRED" : "ABSTAINED · DO NOT APPLY";
+  badge.className = `endpoint-badge${proposed ? "" : " abstained"}`;
+  document.getElementById("endpointProposalIdentity").textContent =
+    `proposal ${endpointProposal.proposal_sha256}`;
+  addEvidenceMetric(metrics, "Scope", `${scope.label} · ${scope.scope_start_sample.toLocaleString()} – ${scope.scope_end_sample_exclusive.toLocaleString()}`);
+  addEvidenceMetric(metrics, "Current start", `${project.tracks[0].start_sample.toLocaleString()} · ${formatTime(project.tracks[0].start_seconds)}`);
+  addEvidenceMetric(metrics, "Current end", `${project.tracks.at(-1).end_sample.toLocaleString()} · ${formatTime(project.tracks.at(-1).end_seconds)}`);
+  if (proposed) {
+    addEvidenceMetric(metrics, "Proposed music start", `${scope.proposed_music_start_sample.toLocaleString()} · ${formatTime(sampleToSeconds(scope.proposed_music_start_sample))}`);
+    addEvidenceMetric(metrics, "Proposed music end", `${scope.proposed_music_end_sample_exclusive.toLocaleString()} · ${formatTime(sampleToSeconds(scope.proposed_music_end_sample_exclusive))}`);
+    addEvidenceMetric(metrics, "Cross-family confidence", `${Math.round(scope.confidence * 100)}%`);
+  }
+  const evidence = scope.evidence || {};
+  const families = evidence.family_candidates || {};
+  addEvidenceMetric(metrics, "Waveform / energy family", endpointCandidateText(families.waveform_energy));
+  addEvidenceMetric(metrics, "Spectral structure family", endpointCandidateText(families.spectral_structure));
+  const transition = evidence.transition_context || {};
+  addEvidenceMetric(metrics, "Quiet context before / after", `${Number(transition.quiet_before_start_samples || 0).toLocaleString()} / ${Number(transition.quiet_after_end_samples || 0).toLocaleString()} samples`);
+  addEvidenceMetric(metrics, "Quiet tonal context before / after", `${Number(transition.quiet_tonal_before_start_samples || 0).toLocaleString()} / ${Number(transition.quiet_tonal_after_end_samples || 0).toLocaleString()} samples`);
+  for (const reason of scope.reasons || []) {
+    const item = document.createElement("li");
+    item.textContent = String(reason).replaceAll("_", " ");
+    reasons.append(item);
+  }
+  if (!(scope.reasons || []).length) {
+    const item = document.createElement("li");
+    item.textContent = "Independent waveform and spectral families agree within policy.";
+    reasons.append(item);
+  }
+  for (const event of evidence.needle_confirmations || []) {
+    const item = document.createElement("div");
+    item.className = "transient-chip protected";
+    const label = document.createElement("span");
+    label.textContent = String(event.kind).replaceAll("_", " ");
+    const detail = document.createElement("span");
+    detail.textContent = `sample ${event.sample.toLocaleString()} · ${Math.round(event.score * 100)}% confirmation`;
+    item.append(label, detail);
+    needle.append(item);
+  }
+  if (!(evidence.needle_confirmations || []).length) {
+    const empty = document.createElement("p");
+    empty.className = "quiet";
+    empty.textContent = "No protected needle event confirmed near the structural anchors.";
+    needle.append(empty);
+  }
+  document.getElementById("endpointReviewProgress").textContent = proposed
+    ? `Start ${endpointReviewedStart ? "reviewed" : "pending"} · End ${endpointReviewedEnd ? "reviewed" : "pending"}`
+    : "The detector abstained. Keep current endpoints and inspect the stated ambiguity.";
+  setEndpointStatus(
+    proposed
+      ? "A project- and source-bound suggestion is ready. It remains unapplied until you review both ends and accept it."
+      : "Endpoint analysis abstained. No marker can be accepted from this evidence.",
+    proposed ? "" : "error",
+  );
+  updateEndpointControls();
+}
+
+async function loadEndpointProposalStatus() {
+  try {
+    const payload = await request("/api/endpoints/status");
+    requireCurrentResponseIdentity(payload, "Endpoint status");
+    endpointProposal = payload.proposal || null;
+    endpointReviewedStart = false;
+    endpointReviewedEnd = false;
+    document.getElementById("endpointIntent").checked = false;
+    if (payload.state === "stale-cleared") {
+      setEndpointStatus(
+        "A prior session proposal was stale and was cleared. Analyze again before review.",
+        "error",
+      );
+    }
+    renderEndpointProposal();
+  } catch (error) {
+    endpointProposal = null;
+    renderEndpointProposal();
+    if (!handleProjectConflict(error)) setEndpointStatus(error.message, "error");
+  }
+}
+
+async function analyzeEndpoints() {
+  const operation = await beginProviderOperation();
+  if (!operation) return;
+  setEndpointStatus(
+    "Verifying the exact capture and comparing waveform, spectral, and needle evidence…",
+    "busy",
+  );
+  try {
+    const rawSide = String(metadataValue("side") || "").trim();
+    const scopeLabel = rawSide && rawSide.length <= 59 ? `Side ${rawSide}` : "Side";
+    const payload = await postJson("/api/endpoints/propose", {
+      ...projectIdentityReceipt(),
+      scope_label: scopeLabel,
+    });
+    requireCurrentResponseIdentity(payload, "Endpoint analysis");
+    endpointProposal = payload.proposal;
+    endpointReviewedStart = false;
+    endpointReviewedEnd = false;
+    document.getElementById("endpointIntent").checked = false;
+    renderEndpointProposal();
+  } catch (error) {
+    if (!handleProjectConflict(error)) setEndpointStatus(error.message, "error");
+  } finally {
+    endProviderOperation(operation.id);
+  }
+}
+
+function reviewEndpointBoundary(kind) {
+  const scope = endpointScope();
+  if (!scope || scope.status !== "proposed" || providerBusy) return;
+  const start = kind === "start";
+  const sample = start
+    ? scope.proposed_music_start_sample
+    : scope.proposed_music_end_sample_exclusive;
+  if (!Number.isSafeInteger(sample)) return;
+  selectMarker(start ? 0 : project.tracks.length);
+  focusEvidenceAtSample(Math.max(0, Math.min(sourceSampleCount() - 1, sample)));
+  auditionRange(
+    sampleToSeconds(sample) - 3,
+    sampleToSeconds(sample) + 3,
+    `Auditioning proposed music ${kind}`,
+  );
+  if (start) endpointReviewedStart = true;
+  else endpointReviewedEnd = true;
+  renderEndpointProposal();
+  document.getElementById("evidenceHeading").scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
+}
+
+async function rejectEndpointProposal() {
+  if (!endpointProposal || providerBusy) return;
+  setProviderBusy(true);
+  try {
+    const payload = await postJson("/api/endpoints/reject", {
+      ...projectIdentityReceipt(),
+      proposal_sha256: endpointProposal.proposal_sha256,
+      decision: "reject",
+      reason: "",
+    });
+    endpointProposal = null;
+    endpointReviewedStart = false;
+    endpointReviewedEnd = false;
+    document.getElementById("endpointIntent").checked = false;
+    renderEndpointProposal();
+    setEndpointStatus(
+      `Suggestion rejected without changing the project (${payload.proposal_sha256.slice(0, 12)}…).`,
+      "success",
+    );
+  } catch (error) {
+    if (!handleProjectConflict(error)) setEndpointStatus(error.message, "error");
+  } finally {
+    setProviderBusy(false);
+  }
+}
+
+async function acceptEndpointProposal() {
+  if (!endpointProposal || providerBusy || dirty) return;
+  setProviderBusy(true);
+  setEndpointStatus("Applying only the two explicitly reviewed outer markers…", "busy");
+  try {
+    const payload = await postJson("/api/endpoints/accept", {
+      ...projectIdentityReceipt(),
+      proposal_sha256: endpointProposal.proposal_sha256,
+      decision: "accept",
+      intent: ENDPOINT_REVIEW_INTENT,
+      reviewed_start: endpointReviewedStart,
+      reviewed_end: endpointReviewedEnd,
+    });
+    project = payload.project;
+    endpointProposal = null;
+    endpointReviewedStart = false;
+    endpointReviewedEnd = false;
+    document.getElementById("endpointIntent").checked = false;
+    dirty = false;
+    initializeBoundarySession({ preserveAnalyzerBaseline: true });
+    refreshProjectView();
+    selectMarker(project.tracks.length);
+    document.getElementById("revisionIdentity").textContent = `REVISION ${project.revision}`;
+    document.getElementById("saveIdentity").textContent = "STATE · all changes saved";
+    renderEndpointProposal();
+    setEndpointStatus(
+      `Accepted exact samples ${payload.accepted_start_sample.toLocaleString()} – ${payload.accepted_end_sample_exclusive.toLocaleString()}; the reversible history transition is #${payload.history_sequence}.`,
+      "success",
+    );
+  } catch (error) {
+    if (!handleProjectConflict(error)) setEndpointStatus(error.message, "error");
+  } finally {
+    setProviderBusy(false);
+  }
+}
+
+document.getElementById("analyzeEndpoints").addEventListener("click", analyzeEndpoints);
+document.getElementById("reviewEndpointStart").addEventListener("click", () => reviewEndpointBoundary("start"));
+document.getElementById("reviewEndpointEnd").addEventListener("click", () => reviewEndpointBoundary("end"));
+document.getElementById("endpointIntent").addEventListener("change", updateEndpointControls);
+document.getElementById("rejectEndpoints").addEventListener("click", rejectEndpointProposal);
+document.getElementById("acceptEndpoints").addEventListener("click", acceptEndpointProposal);
+
 function speedValues() {
   const capture = Number(speedInputs.capture.value);
   const intended = Number(speedInputs.intended.value);
@@ -1614,9 +1950,265 @@ function setRestorationStatus(message, kind = "") {
   element.className = `status ${kind}`.trim();
 }
 
+function updateRestorationRoleView() {
+  for (const [role, button] of Object.entries(restorationRoleButtons)) {
+    const active = role === restorationActiveRole;
+    button.setAttribute("aria-checked", String(active));
+    button.tabIndex = active ? 0 : -1;
+    restorationCanvases[role].closest("figure")?.classList.toggle("active", active);
+  }
+}
+
+function restorationTransportDuration() {
+  const durations = Object.values(restorationAudio).map((player) => Number(player.duration));
+  if (!durations.every((duration) => Number.isFinite(duration) && duration > 0)) return null;
+  const tolerance = Math.max(0.01, 2 / Math.max(1, Number(project?.source?.sample_rate) || 1));
+  if (Math.max(...durations) - Math.min(...durations) > tolerance) return -1;
+  return Math.min(...durations);
+}
+
+function updateRestorationTransportTime(position = null) {
+  const duration = restorationTransportDuration();
+  const player = restorationAudio[restorationActiveRole];
+  const current = position === null ? Number(player.currentTime) : Number(position);
+  const safeCurrent = Number.isFinite(current) ? Math.max(0, current) : 0;
+  const safeDuration = duration && duration > 0 ? duration : 0;
+  restorationSeek.max = String(safeDuration || 1);
+  restorationSeek.value = String(Math.min(safeCurrent, safeDuration || 0));
+  restorationTime.textContent = `${formatTime(safeCurrent)} / ${formatTime(safeDuration)}`;
+}
+
+function updateRestorationTransportReadiness() {
+  const duration = restorationTransportDuration();
+  const audioReady = duration !== null && duration > 0;
+  const visualsReady = Object.values(restorationEvidence).every(Boolean);
+  const ready = audioReady && visualsReady;
+  restorationPlayPause.disabled = !ready;
+  restorationSeek.disabled = !ready;
+  for (const [role, button] of Object.entries(restorationRoleButtons)) {
+    button.disabled = !restorationAudio[role].getAttribute("src");
+  }
+  if (duration === -1) {
+    restorationTransportStatus.textContent =
+      "Audition files do not expose identical duration; playback is disabled.";
+    restorationPlayPause.disabled = true;
+    restorationSeek.disabled = true;
+  } else if (ready) {
+    const alignment = restorationEvidence.before.alignment;
+    const candidateId = restorationPreview?.candidates?.[0]?.id;
+    const heard = candidateId ? restorationAuditionedRoles(candidateId).size : 0;
+    restorationTransportStatus.textContent =
+      `Sample-aligned audio + visuals ready · source samples ${Number(alignment.source_start_sample).toLocaleString()}–${Number(alignment.source_end_sample_exclusive).toLocaleString()} · ${heard}/3 signals auditioned.`;
+  } else if (audioReady) {
+    restorationTransportStatus.textContent =
+      "Matched audio geometry is ready; aligned visual evidence is loading.";
+  }
+  updateRestorationTransportTime();
+}
+
+function selectRestorationRole(role, { resume = null } = {}) {
+  if (!Object.hasOwn(restorationAudio, role)) return;
+  const previous = restorationAudio[restorationActiveRole];
+  const position = Number.isFinite(Number(previous.currentTime)) ? Number(previous.currentTime) : 0;
+  const wasPlaying = resume === null ? !previous.paused : Boolean(resume);
+  for (const player of Object.values(restorationAudio)) player.pause();
+  restorationActiveRole = role;
+  const target = restorationAudio[role];
+  if (Number.isFinite(Number(target.duration)) && target.duration > 0) {
+    target.currentTime = Math.min(position, Math.max(0, target.duration - 0.001));
+  }
+  updateRestorationRoleView();
+  updateRestorationTransportTime(position);
+  restorationPlayPause.textContent = "Play";
+  if (wasPlaying && !restorationPlayPause.disabled) {
+    target.play().catch(() => {
+      restorationPlayPause.textContent = "Play";
+      restorationTransportStatus.textContent =
+        "The browser could not play this lossless preview.";
+    });
+  }
+  drawRestorationEvidence(role);
+}
+
+function drawRestorationEvidence(role) {
+  const canvasElement = restorationCanvases[role];
+  const drawing = canvasElement.getContext("2d");
+  const width = canvasElement.clientWidth;
+  const height = canvasElement.clientHeight;
+  if (!width || !height) return;
+  drawing.clearRect(0, 0, width, height);
+  drawing.fillStyle = "#090908";
+  drawing.fillRect(0, 0, width, height);
+  const payload = restorationEvidence[role];
+  if (!payload?.evidence) {
+    drawing.fillStyle = "#aaa79f";
+    drawing.font = "11px system-ui, sans-serif";
+    drawing.textAlign = "center";
+    drawing.fillText("Loading aligned evidence…", width / 2, height / 2);
+    return;
+  }
+
+  const evidence = payload.evidence;
+  const waveformBottom = Math.max(34, Math.floor(height * 0.47));
+  const spectrumTop = waveformBottom + 8;
+  const spectrumBottom = height - 4;
+  const channels = evidence.waveform?.channels || [];
+  const channelHeight = waveformBottom / Math.max(1, channels.length);
+  for (let channel = 0; channel < channels.length; channel += 1) {
+    const middle = channelHeight * (channel + 0.5);
+    drawing.strokeStyle = "rgba(255,255,255,0.1)";
+    drawing.lineWidth = 1;
+    drawing.beginPath();
+    drawing.moveTo(0, middle);
+    drawing.lineTo(width, middle);
+    drawing.stroke();
+    const minimum = channels[channel].minimum || [];
+    const maximum = channels[channel].maximum || [];
+    drawing.strokeStyle = role === "removed"
+      ? "rgba(255,191,105,0.9)"
+      : "rgba(245,241,232,0.86)";
+    drawing.beginPath();
+    for (let index = 0; index < minimum.length; index += 1) {
+      const x = (index + 0.5) / Math.max(1, minimum.length) * width;
+      const amplitude = channelHeight * 0.42;
+      drawing.moveTo(x, middle - Number(maximum[index]) * amplitude);
+      drawing.lineTo(x, middle - Number(minimum[index]) * amplitude);
+    }
+    drawing.stroke();
+  }
+
+  const rows = evidence.spectrogram?.dbfs || [];
+  const columns = rows[0]?.length || 0;
+  if (rows.length && columns) {
+    const cellWidth = width / columns;
+    const cellHeight = Math.max(1, (spectrumBottom - spectrumTop) / rows.length);
+    for (let row = 0; row < rows.length; row += 1) {
+      const y = spectrumBottom - (row + 1) * cellHeight;
+      for (let column = 0; column < columns; column += 1) {
+        drawing.fillStyle = spectrogramColor(rows[row][column]);
+        drawing.fillRect(
+          Math.floor(column * cellWidth),
+          Math.floor(y),
+          Math.ceil(cellWidth + 0.5),
+          Math.ceil(cellHeight + 0.5),
+        );
+      }
+    }
+  }
+
+  const selection = evidence.selection;
+  const span = selection.end_sample_exclusive - selection.start_sample;
+  const sourceOffset = payload.alignment.source_start_sample - selection.start_sample;
+  const sampleX = (sample) => (
+    (sample - sourceOffset - selection.start_sample) / Math.max(1, span) * width
+  );
+  const repairStart = sampleX(payload.alignment.repair_start_source_sample);
+  const repairEnd = sampleX(payload.alignment.repair_end_source_sample_exclusive);
+  drawing.fillStyle = "rgba(216,255,79,0.12)";
+  drawing.fillRect(
+    Math.max(0, repairStart),
+    0,
+    Math.max(1, Math.min(width, repairEnd) - Math.max(0, repairStart)),
+    height,
+  );
+  drawing.strokeStyle = "rgba(216,255,79,0.92)";
+  drawing.lineWidth = 1;
+  for (const x of [repairStart, repairEnd]) {
+    if (x < 0 || x > width) continue;
+    drawing.beginPath();
+    drawing.moveTo(x, 0);
+    drawing.lineTo(x, height);
+    drawing.stroke();
+  }
+  if (role === restorationActiveRole) {
+    const playheadSample = Math.round(
+      Number(restorationAudio[role].currentTime || 0) * evidence.source.sample_rate,
+    );
+    if (
+      playheadSample >= selection.start_sample
+      && playheadSample < selection.end_sample_exclusive
+    ) {
+      const x = (playheadSample - selection.start_sample) / Math.max(1, span) * width;
+      drawing.strokeStyle = "rgba(255,255,255,0.95)";
+      drawing.lineWidth = 1;
+      drawing.beginPath();
+      drawing.moveTo(x, 0);
+      drawing.lineTo(x, height);
+      drawing.stroke();
+    }
+  }
+}
+
+function resizeRestorationCanvases() {
+  const ratio = window.devicePixelRatio || 1;
+  for (const [role, canvasElement] of Object.entries(restorationCanvases)) {
+    const rect = canvasElement.getBoundingClientRect();
+    canvasElement.width = Math.max(1, Math.round(rect.width * ratio));
+    canvasElement.height = Math.max(1, Math.round(rect.height * ratio));
+    canvasElement.getContext("2d").setTransform(ratio, 0, 0, ratio, 0, 0);
+    drawRestorationEvidence(role);
+  }
+}
+
+async function loadRestorationVisualEvidence(preview) {
+  const requestId = ++restorationEvidenceRequestId;
+  const roles = ["before", "proposed", "removed"];
+  restorationEvidence = { before: null, proposed: null, removed: null };
+  resizeRestorationCanvases();
+  const responses = await Promise.all(roles.map(async (role) => {
+    const entry = preview?.audio?.[role];
+    if (!entry?.evidence_url || !entry?.token) {
+      throw new Error(`The ${role} preview has no visual-evidence binding.`);
+    }
+    const payload = await request(entry.evidence_url);
+    requireCurrentResponseIdentity(payload, "Restoration visual evidence");
+    if (
+      payload.preview_token !== preview.token
+      || payload.audio_token !== entry.token
+      || payload.audio_sha256 !== entry.sha256
+      || payload.role !== role
+    ) {
+      throw new Error(`The ${role} visual evidence does not match this preview.`);
+    }
+    return payload;
+  }));
+  if (requestId !== restorationEvidenceRequestId || restorationPreview?.token !== preview.token) {
+    return false;
+  }
+  const alignmentKeys = [
+    "source_start_sample",
+    "source_end_sample_exclusive",
+    "focus_source_sample",
+    "repair_start_source_sample",
+    "repair_end_source_sample_exclusive",
+  ];
+  const reference = responses[0].alignment;
+  for (const payload of responses) {
+    if (
+      payload.alignment?.matched_audio_geometry !== true
+      || alignmentKeys.some((key) => payload.alignment?.[key] !== reference?.[key])
+    ) {
+      throw new Error("Restoration visual evidence is not sample-aligned across variants.");
+    }
+    restorationEvidence[payload.role] = payload;
+    const gain = Number(payload.alignment.declared_linear_gain);
+    const caption = restorationCanvases[payload.role]
+      .closest("figure")
+      ?.querySelector("figcaption span");
+    if (caption && Number.isFinite(gain)) caption.textContent = `${gain.toFixed(1)}x`;
+  }
+  resizeRestorationCanvases();
+  updateRestorationTransportReadiness();
+  return true;
+}
+
 function clearRestorationPreview() {
+  restorationEvidenceRequestId += 1;
   restorationPreview = null;
   restorationSelectedCandidate = null;
+  restorationActiveRole = "before";
+  restorationEvidence = { before: null, proposed: null, removed: null };
+  restorationAuditioned.clear();
   document.getElementById("restorationPreviewTitle").textContent = "Select a candidate";
   document.getElementById("restorationPreviewProof").textContent =
     "Original and Proposed remain at identical gain. Removed Signal is a declared-gain residue.";
@@ -1626,6 +2218,19 @@ function clearRestorationPreview() {
     player.removeAttribute("src");
     player.load();
   }
+  restorationPlayPause.textContent = "Play";
+  restorationPlayPause.disabled = true;
+  restorationSeek.disabled = true;
+  restorationSeek.value = "0";
+  restorationTime.textContent = "0:00.000 / 0:00.000";
+  restorationTransportStatus.textContent =
+    "Choose a preview to load one sample-aligned transport.";
+  for (const [role, canvasElement] of Object.entries(restorationCanvases)) {
+    const caption = canvasElement.closest("figure")?.querySelector("figcaption span");
+    if (caption) caption.textContent = role === "removed" ? "declared gain" : "1.0x";
+  }
+  updateRestorationRoleView();
+  resizeRestorationCanvases();
 }
 
 function clearRestorationWorkflow() {
@@ -1633,6 +2238,7 @@ function clearRestorationWorkflow() {
   restorationRecipe = null;
   restorationDecisions.clear();
   restorationPreviewed.clear();
+  restorationAuditioned.clear();
   clearRestorationPreview();
   renderRestorationCandidates();
 }
@@ -1673,6 +2279,17 @@ function handleRestorationError(error) {
 function currentRestorationCoverage() {
   const coverage = restorationScan?.coverage;
   return coverage && typeof coverage === "object" ? coverage : null;
+}
+
+function restorationAuditionedRoles(candidateId) {
+  const roles = restorationAuditioned.get(candidateId);
+  return roles instanceof Set ? roles : new Set();
+}
+
+function restorationApprovalReady(candidateId) {
+  const heard = restorationAuditionedRoles(candidateId);
+  return restorationPreviewed.has(candidateId)
+    && ["before", "proposed", "removed"].every((role) => heard.has(role));
 }
 
 function restorationReviewNeedsNoDerivative() {
@@ -1732,6 +2349,9 @@ function updateRestorationControls() {
   document.getElementById("renderRestoredSide").title = completeCoverage
     ? "Render the full reviewed music range"
     : "A full untruncated scan of the music range is required before using the Restored label";
+  if (candidates.length > 0) {
+    window.requestAnimationFrame(resizeRestorationCanvases);
+  }
 }
 
 function renderRestorationSummary() {
@@ -1764,8 +2384,11 @@ function renderRestorationSummary() {
 
 function setRestorationDecision(candidate, decision) {
   restorationRecipe = null;
-  if (decision === "approved" && !restorationPreviewed.has(candidate.id)) {
-    setRestorationStatus("Create and inspect Original / Proposed / Removed Signal before approval", "error");
+  if (decision === "approved" && !restorationApprovalReady(candidate.id)) {
+    setRestorationStatus(
+      "Load the aligned proof and audition Original, Proposed, and Removed Signal before approval",
+      "error",
+    );
     return;
   }
   restorationDecisions.set(candidate.id, {
@@ -1818,10 +2441,14 @@ function renderRestorationCandidates() {
       button.type = "button";
       button.textContent = label;
       button.className = `${value === "protected" ? "protected " : ""}${current?.decision === value ? "active" : ""}`.trim();
-      button.disabled = providerBusy || (value === "approved" && (!candidate.repairable || !restorationPreviewed.has(candidate.id)));
+      const approvalReady = restorationApprovalReady(candidate.id);
+      button.disabled = providerBusy
+        || (value === "approved" && (!candidate.repairable || !approvalReady));
       button.title = value === "approved" && !restorationPreviewed.has(candidate.id)
-        ? "Create the lossless audition preview first"
-        : "";
+        ? "Create and load the aligned lossless proof first"
+        : value === "approved" && !approvalReady
+          ? "Play Original, Proposed, and Removed Signal before approval"
+          : "";
       button.addEventListener("click", () => setRestorationDecision(candidate, value));
       decisions.append(button);
     }
@@ -1868,15 +2495,18 @@ function renderRestorationCandidates() {
   updateRestorationControls();
 }
 
-function showRestorationPreview(preview) {
+async function showRestorationPreview(preview) {
   restorationPreview = preview;
+  for (const candidate of preview?.candidates || []) {
+    restorationAuditioned.set(candidate.id, new Set());
+  }
   const candidate = preview?.candidates?.[0];
   document.getElementById("restorationPreviewTitle").textContent = candidate
     ? `${candidate.type} at ${formatTime(candidate.peak_frame / project.source.sample_rate)}`
     : "Lossless candidate audition";
   const audition = preview?.audition || {};
   document.getElementById("restorationPreviewProof").textContent =
-    `Original gain ${Number(audition.before_linear_gain ?? 1).toFixed(1)}× · Proposed gain ${Number(audition.proposed_linear_gain ?? 1).toFixed(1)}× · Removed Signal ${Number(audition.removed_linear_gain ?? 1).toFixed(1)}× declared residue gain.`;
+    `Original gain ${Number(audition.before_linear_gain ?? 1).toFixed(1)}× · Proposed gain ${Number(audition.proposed_linear_gain ?? 1).toFixed(1)}× · Removed Signal ${Number(audition.removed_linear_gain ?? 1).toFixed(1)}× declared residue gain. Audition all three signals before Apply Proposed becomes available.`;
   for (const [role, player] of Object.entries(restorationAudio)) {
     const entry = preview?.audio?.[role];
     if (entry?.url) {
@@ -1889,6 +2519,9 @@ function showRestorationPreview(preview) {
       player.load();
     }
   }
+  restorationActiveRole = "before";
+  updateRestorationRoleView();
+  updateRestorationTransportReadiness();
   const metrics = document.getElementById("restorationPreviewMetrics");
   metrics.replaceChildren();
   const proofItems = [
@@ -1906,6 +2539,7 @@ function showRestorationPreview(preview) {
     item.textContent = text;
     metrics.append(item);
   }
+  return loadRestorationVisualEvidence(preview);
 }
 
 async function loadRestorationStatus() {
@@ -1922,15 +2556,18 @@ async function loadRestorationStatus() {
     restorationPreview = payload.current_preview?.stale ? null : payload.current_preview;
     restorationDecisions.clear();
     restorationPreviewed.clear();
+    restorationAuditioned.clear();
     restorationSelectedCandidate = null;
     for (const decision of restorationRecipe?.decisions || []) {
       restorationDecisions.set(decision.candidate_id, { ...decision });
     }
     if (restorationPreview) {
-      for (const candidate of restorationPreview.candidates || []) {
-        restorationPreviewed.add(candidate.id);
+      const visualsReady = await showRestorationPreview(restorationPreview);
+      if (visualsReady) {
+        for (const candidate of restorationPreview.candidates || []) {
+          restorationPreviewed.add(candidate.id);
+        }
       }
-      showRestorationPreview(restorationPreview);
     } else {
       clearRestorationPreview();
     }
@@ -2020,10 +2657,14 @@ async function previewRestorationCandidate(candidate) {
     });
     if (operation.id !== providerOperationId) return;
     project.source_receipt = payload.source_receipt;
+    const visualsReady = await showRestorationPreview(payload.preview);
+    if (!visualsReady || operation.id !== providerOperationId) return;
     restorationPreviewed.add(candidate.id);
-    showRestorationPreview(payload.preview);
     renderRestorationCandidates();
-    setRestorationStatus("Preview ready at matched Original / Proposed gain", "success");
+    setRestorationStatus(
+      "Preview ready with matched audio and sample-aligned visual evidence",
+      "success",
+    );
   } catch (error) {
     if (!handleRestorationError(error)) setRestorationStatus(error.message, "error");
   } finally {
@@ -2083,12 +2724,92 @@ document.getElementById("renderRestoredSide").addEventListener("click", async ()
   }
 });
 
-for (const player of Object.values(restorationAudio)) {
+for (const [role, player] of Object.entries(restorationAudio)) {
+  player.addEventListener("loadedmetadata", updateRestorationTransportReadiness);
+  player.addEventListener("durationchange", updateRestorationTransportReadiness);
   player.addEventListener("play", () => {
     audio.pause();
+    restorationActiveRole = role;
     for (const other of Object.values(restorationAudio)) {
       if (other !== player) other.pause();
     }
+    restorationPlayPause.textContent = "Pause";
+    updateRestorationRoleView();
+  });
+  player.addEventListener("playing", () => {
+    const candidateId = restorationPreview?.candidates?.[0]?.id;
+    if (!candidateId || !restorationPreviewed.has(candidateId)) return;
+    const heard = restorationAuditionedRoles(candidateId);
+    heard.add(role);
+    restorationAuditioned.set(candidateId, heard);
+    updateRestorationTransportReadiness();
+    renderRestorationCandidates();
+  });
+  player.addEventListener("pause", () => {
+    if (role === restorationActiveRole) restorationPlayPause.textContent = "Play";
+  });
+  player.addEventListener("timeupdate", () => {
+    if (role !== restorationActiveRole) return;
+    updateRestorationTransportTime();
+    drawRestorationEvidence(role);
+  });
+  player.addEventListener("ended", () => {
+    if (role !== restorationActiveRole) return;
+    restorationPlayPause.textContent = "Play";
+    updateRestorationTransportTime(player.duration);
+  });
+  player.addEventListener("error", () => {
+    if (!player.getAttribute("src")) return;
+    restorationTransportStatus.textContent =
+      `The browser could not decode the ${role} lossless preview.`;
+    restorationPlayPause.disabled = true;
+  });
+}
+
+restorationPlayPause.addEventListener("click", () => {
+  const player = restorationAudio[restorationActiveRole];
+  if (player.paused) {
+    audio.pause();
+    player.play().catch(() => {
+      restorationTransportStatus.textContent =
+        "The browser could not play this lossless preview.";
+    });
+  } else {
+    player.pause();
+  }
+});
+
+restorationSeek.addEventListener("input", () => {
+  const requested = Number(restorationSeek.value);
+  if (!Number.isFinite(requested)) return;
+  for (const player of Object.values(restorationAudio)) {
+    if (Number.isFinite(Number(player.duration)) && player.duration > 0) {
+      player.currentTime = Math.min(requested, Math.max(0, player.duration - 0.001));
+    }
+  }
+  updateRestorationTransportTime(requested);
+  drawRestorationEvidence(restorationActiveRole);
+});
+
+for (const [role, button] of Object.entries(restorationRoleButtons)) {
+  button.addEventListener("click", () => selectRestorationRole(role));
+  button.addEventListener("keydown", (event) => {
+    const roles = ["before", "proposed", "removed"];
+    const current = roles.indexOf(role);
+    let next = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      next = roles[(current + 1) % roles.length];
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      next = roles[(current + roles.length - 1) % roles.length];
+    } else if (event.key === "Home") {
+      next = roles[0];
+    } else if (event.key === "End") {
+      next = roles.at(-1);
+    }
+    if (next === null) return;
+    event.preventDefault();
+    selectRestorationRole(next);
+    restorationRoleButtons[next].focus();
   });
 }
 
@@ -2139,6 +2860,7 @@ function updateExportIdentityNote() {
 }
 
 function refreshProjectView() {
+  clearEndpointProposalIfProjectChanged();
   for (const [key, input] of Object.entries(metadataInputs)) input.value = metadataValue(key);
   document.getElementById("lookupArtist").value = metadataValue("artist");
   document.getElementById("lookupAlbum").value = metadataValue("album");
@@ -2306,14 +3028,48 @@ function openLookup() {
     setStatus("The project has not loaded; lookup is unavailable", "error");
     return;
   }
+  closeExport({ restoreFocus: false });
   const panel = document.getElementById("lookupPanel");
   lookupReturnFocus = document.activeElement;
+  expandedPanel = "lookup";
   panel.classList.remove("hidden");
   document.getElementById("findReleaseButton").setAttribute("aria-expanded", "true");
   document.getElementById("lookupArtist").value = metadataInputs.artist.value;
   document.getElementById("lookupAlbum").value = metadataInputs.album.value;
-  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  panel.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
   panel.focus({ preventScroll: true });
+}
+
+function closeLookup({ restoreFocus = true } = {}) {
+  const panel = document.getElementById("lookupPanel");
+  if (panel.classList.contains("hidden")) return false;
+  panel.classList.add("hidden");
+  document.getElementById("findReleaseButton").setAttribute("aria-expanded", "false");
+  if (expandedPanel === "lookup") expandedPanel = null;
+  if (restoreFocus && lookupReturnFocus instanceof HTMLElement) {
+    lookupReturnFocus.focus();
+  }
+  lookupReturnFocus = null;
+  return true;
+}
+
+function closeExport({ restoreFocus = true } = {}) {
+  const panel = document.getElementById("exportPanel");
+  if (panel.classList.contains("hidden")) return false;
+  panel.classList.add("hidden");
+  document.getElementById("exportButton").setAttribute("aria-expanded", "false");
+  if (expandedPanel === "export") expandedPanel = null;
+  if (restoreFocus && exportReturnFocus instanceof HTMLElement) {
+    exportReturnFocus.focus();
+  }
+  exportReturnFocus = null;
+  return true;
+}
+
+function dismissExpandedPanel() {
+  if (expandedPanel === "export") return closeExport();
+  if (expandedPanel === "lookup") return closeLookup();
+  return closeExport() || closeLookup();
 }
 
 async function loadRecognitionReadiness() {
@@ -2795,6 +3551,8 @@ async function saveProject() {
         project.default_output_dir = saved.project.default_output_dir;
       }
       dirty = false;
+      clearEndpointProposalIfProjectChanged();
+      updateEndpointControls();
       document.getElementById("saveIdentity").textContent = "STATE · all changes saved";
       renderPersistentHistory();
       setStatus("Project saved", "success");
@@ -2817,11 +3575,7 @@ async function saveProject() {
 document.getElementById("saveButton").addEventListener("click", saveProject);
 
 document.getElementById("findReleaseButton").addEventListener("click", openLookup);
-document.getElementById("closeLookup").addEventListener("click", () => {
-  document.getElementById("lookupPanel").classList.add("hidden");
-  document.getElementById("findReleaseButton").setAttribute("aria-expanded", "false");
-  if (lookupReturnFocus instanceof HTMLElement) lookupReturnFocus.focus();
-});
+document.getElementById("closeLookup").addEventListener("click", () => closeLookup());
 document.getElementById("runReleaseSearch").addEventListener("click", searchReleases);
 for (const input of [document.getElementById("lookupArtist"), document.getElementById("lookupAlbum")]) {
   input.addEventListener("keydown", (event) => {
@@ -2831,19 +3585,17 @@ for (const input of [document.getElementById("lookupArtist"), document.getElemen
 
 document.getElementById("exportButton").addEventListener("click", () => {
   if (!project) return;
+  closeLookup({ restoreFocus: false });
   const panel = document.getElementById("exportPanel");
   exportReturnFocus = document.activeElement;
+  expandedPanel = "export";
   panel.classList.remove("hidden");
   document.getElementById("exportButton").setAttribute("aria-expanded", "true");
-  panel.scrollIntoView({ behavior: "smooth", block: "center" });
+  panel.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
   panel.focus({ preventScroll: true });
 });
 
-document.getElementById("closeExport").addEventListener("click", () => {
-  document.getElementById("exportPanel").classList.add("hidden");
-  document.getElementById("exportButton").setAttribute("aria-expanded", "false");
-  if (exportReturnFocus instanceof HTMLElement) exportReturnFocus.focus();
-});
+document.getElementById("closeExport").addEventListener("click", () => closeExport());
 
 document.getElementById("runExport").addEventListener("click", async () => {
   if (!project) {
@@ -2894,6 +3646,7 @@ window.addEventListener("beforeunload", (event) => {
 window.addEventListener("resize", () => {
   resizeCanvas();
   resizeEvidenceCanvas();
+  resizeRestorationCanvases();
 });
 coverArt.addEventListener("error", () => {
   coverArt.classList.add("hidden");
@@ -2927,9 +3680,11 @@ async function load() {
     document.getElementById("restorationScanEnd").value = project.tracks.at(-1).end_seconds.toFixed(6);
     refreshProjectView();
     resizeEvidenceCanvas();
+    resizeRestorationCanvases();
     await loadRecognitionReadiness();
     setProviderBusy(false);
     selectMarker(project.tracks.length > 1 ? 1 : 0);
+    await loadEndpointProposalStatus();
     await loadRestorationStatus();
     setStatus("Ready");
   } catch (error) {

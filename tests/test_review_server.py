@@ -8,10 +8,12 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from groove_serpent.audio_snapshot import VerifiedAudioSnapshot
 from groove_serpent.evidence import EvidenceRequestSuperseded
@@ -109,7 +111,12 @@ class ReviewServerTests(unittest.TestCase):
         )
         self.thread.start()
         self.port = self.server.server_address[1]
-        self.base = f"http://127.0.0.1:{self.port}"
+        self.authority = f"{self.server.session_auth.public_host}:{self.port}"
+        self.base = self.server.session_auth.origin(port=self.port)
+        self.authenticated_opener = urllib.request.build_opener()
+        self.authenticated_opener.addheaders = [
+            ("Authorization", self.server.session_auth.authorization_header)
+        ]
 
     def tearDown(self) -> None:
         snapshot_path = self.server.source_snapshot.path
@@ -127,6 +134,7 @@ class ReviewServerTests(unittest.TestCase):
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
         add_state_receipt: bool = True,
+        authenticate: bool = True,
     ) -> tuple[int, http.client.HTTPMessage, bytes, bool]:
         state_bound_paths = {
             "/api/save",
@@ -143,7 +151,7 @@ class ReviewServerTests(unittest.TestCase):
             if path in {"/api/export", "/api/recognition/identify"}:
                 required_identity.add("expected_source_receipt")
             if isinstance(payload, dict) and not required_identity.issubset(payload):
-                state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+                state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
                 payload.setdefault("expected_revision", state["revision"])
                 payload.setdefault("expected_project_sha256", state["project_sha256"])
                 if path in {"/api/export", "/api/recognition/identify"}:
@@ -156,16 +164,303 @@ class ReviewServerTests(unittest.TestCase):
                 payload.setdefault("formats", ["flac", "m4a"])
             if isinstance(payload, dict):
                 body = json.dumps(payload).encode("utf-8")
+        request_headers = dict(headers or {})
+        request_headers.setdefault("Host", self.authority)
+        if authenticate:
+            request_headers.setdefault(
+                "Authorization", self.server.session_auth.authorization_header
+            )
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
-        connection.request(method, path, body=body, headers=headers or {})
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         response_body = response.read()
         result = (response.status, response.headers, response_body, response.will_close)
         connection.close()
         return result
 
+    def test_normalized_request_targets_are_rejected_before_bootstrap(self) -> None:
+        bootstrap = self.server.session_auth.bootstrap_path
+        for target in (f"/{bootstrap}", f"///{bootstrap.lstrip('/')}", "//app.js"):
+            with self.subTest(target=target):
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", self.port, timeout=2
+                )
+                connection.putrequest("GET", target, skip_host=True)
+                connection.putheader("Host", self.authority)
+                connection.endheaders()
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 400, body)
+                self.assertIsNone(response.headers.get("Set-Cookie"))
+                self.assertTrue(response.will_close)
+                self.assertNotIn(bootstrap.encode("ascii"), body)
+                connection.close()
+
+        status, headers, body, _will_close = self.request(
+            "GET", bootstrap, authenticate=False
+        )
+        self.assertEqual(status, 303, body)
+        self.assertIsNotNone(headers.get("Set-Cookie"))
+
+    def test_session_auth_bootstrap_bearer_cookie_and_native_mutation(self) -> None:
+        authorization = self.server.session_auth.authorization_header
+        token = authorization.removeprefix("Bearer ")
+        self.assertGreaterEqual(len(token), 43)
+        self.assertRegex(
+            self.server.session_auth.public_host,
+            r"^groove-serpent-[0-9a-f]{32}\.localhost$",
+        )
+        bootstrap_nonce = self.server.session_auth.bootstrap_path.rsplit("/", 1)[-1]
+        self.assertNotEqual(token, bootstrap_nonce)
+
+        for path in ("/", "/app.js", "/styles.css"):
+            status, _headers, _body, _will_close = self.request(
+                "GET", path, authenticate=False
+            )
+            self.assertEqual(status, 200)
+
+        status, _headers, _body, _will_close = self.request(
+            "GET", "/api/project", authenticate=False
+        )
+        self.assertEqual(status, 401)
+        status, _headers, _body, _will_close = self.request(
+            "GET", "/audio", authenticate=False
+        )
+        self.assertEqual(status, 401)
+        status, _headers, _body, _will_close = self.request(
+            "POST",
+            "/api/save",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+            authenticate=False,
+        )
+        self.assertEqual(status, 401)
+
+        status, headers, body, _will_close = self.request(
+            "GET",
+            self.server.session_auth.bootstrap_path,
+            authenticate=False,
+        )
+        self.assertEqual(status, 303, body)
+        self.assertEqual(headers["Location"], "/")
+        cookie_header = headers["Set-Cookie"]
+        self.assertIn("; Path=/; HttpOnly; SameSite=Strict", cookie_header)
+        cookie = cookie_header.split(";", 1)[0]
+        self.assertEqual(cookie.split("=", 1)[1], token)
+
+        status, _headers, _body, _will_close = self.request(
+            "GET",
+            self.server.session_auth.bootstrap_path,
+            authenticate=False,
+        )
+        self.assertEqual(status, 401)
+
+        status, replay_headers, replay_body, _will_close = self.request(
+            "GET",
+            self.server.session_auth.bootstrap_path,
+            headers={"Cookie": cookie},
+            authenticate=False,
+        )
+        self.assertEqual(status, 303, replay_body)
+        self.assertEqual(replay_headers["Location"], "/")
+        self.assertIsNone(replay_headers.get("Set-Cookie"))
+
+        status, _headers, body, _will_close = self.request(
+            "GET",
+            "/api/project",
+            headers={"Cookie": cookie},
+            authenticate=False,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertNotIn(token.encode("ascii"), body)
+        state = json.loads(body)
+
+        state["tracks"][0]["title"] = "Authenticated cookie edit"
+        mutation = {
+            "metadata": state["metadata"],
+            "tracks": state["tracks"],
+            "expected_revision": state["revision"],
+            "expected_project_sha256": state["project_sha256"],
+        }
+        status, _headers, body, _will_close = self.request(
+            "POST",
+            "/api/save",
+            body=json.dumps(mutation).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+            },
+            authenticate=False,
+        )
+        self.assertEqual(status, 403, body)
+        status, _headers, body, _will_close = self.request(
+            "POST",
+            "/api/save",
+            body=json.dumps(mutation).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+                "Origin": self.base,
+            },
+            authenticate=False,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            load_project(self.project_path).tracks[0].title,
+            mutation["tracks"][0]["title"],
+        )
+
+        status, _headers, body, _will_close = self.request(
+            "GET",
+            "/api/project",
+            headers={"Cookie": cookie},
+            authenticate=False,
+        )
+        self.assertEqual(status, 200, body)
+        state = json.loads(body)
+        state["tracks"][0]["title"] = "Authenticated native edit"
+        mutation = {
+            "metadata": state["metadata"],
+            "tracks": state["tracks"],
+            "expected_revision": state["revision"],
+            "expected_project_sha256": state["project_sha256"],
+        }
+        status, _headers, body, _will_close = self.request(
+            "POST",
+            "/api/save",
+            body=json.dumps(mutation).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            load_project(self.project_path).tracks[0].title,
+            mutation["tracks"][0]["title"],
+        )
+
+        for alias in (f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
+            with self.subTest(alias=alias):
+                status, _headers, _body, _will_close = self.request(
+                    "GET",
+                    "/api/project",
+                    headers={"Host": alias},
+                )
+                self.assertEqual(status, 400)
+
+    def test_session_auth_rejects_wrong_malformed_and_duplicate_credentials(self) -> None:
+        for headers in (
+            {"Authorization": "Bearer wrong"},
+            {"Authorization": self.server.session_auth.authorization_header, "Cookie": "broken"},
+        ):
+            with self.subTest(headers=tuple(headers)):
+                status, _response_headers, _body, _will_close = self.request(
+                    "GET", "/api/project", headers=headers, authenticate=False
+                )
+                self.assertEqual(status, 401)
+
+        status, bootstrap_headers, _body, _will_close = self.request(
+            "GET", self.server.session_auth.bootstrap_path, authenticate=False
+        )
+        self.assertEqual(status, 303)
+        status, _headers, _body, _will_close = self.request(
+            "GET",
+            f"{self.server.session_auth.bootstrap_path}?unexpected=1",
+            authenticate=False,
+        )
+        self.assertEqual(status, 401)
+        cookie = bootstrap_headers["Set-Cookie"].split(";", 1)[0]
+        status, _headers, _body, _will_close = self.request(
+            "GET",
+            "/api/project",
+            headers={"Cookie": f"{cookie}; {cookie}"},
+            authenticate=False,
+        )
+        self.assertEqual(status, 401)
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        connection.putrequest("GET", "/api/project", skip_host=True)
+        connection.putheader("Host", self.authority)
+        connection.putheader("Authorization", self.server.session_auth.authorization_header)
+        connection.putheader("Authorization", self.server.session_auth.authorization_header)
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 401)
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        connection.putrequest("GET", "/api/project", skip_host=True)
+        connection.putheader("Host", self.authority)
+        connection.putheader("Cookie", cookie)
+        connection.putheader("Cookie", cookie)
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 401)
+        connection.close()
+
+    def test_bootstrap_nonce_is_consumed_once_under_concurrency(self) -> None:
+        secondary = ReviewServer(("127.0.0.1", 0), self.project_path)
+        secondary_thread = threading.Thread(
+            target=secondary.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        secondary_thread.start()
+        barrier = threading.Barrier(8)
+
+        def attempt_bootstrap() -> tuple[int, str | None]:
+            barrier.wait(timeout=3)
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", secondary.server_port, timeout=3
+            )
+            connection.request(
+                "GET",
+                secondary.session_auth.bootstrap_path,
+                headers={
+                    "Host": (
+                        f"{secondary.session_auth.public_host}:"
+                        f"{secondary.server_port}"
+                    )
+                },
+            )
+            response = connection.getresponse()
+            response.read()
+            result = response.status, response.headers.get("Set-Cookie")
+            connection.close()
+            return result
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(lambda _index: attempt_bootstrap(), range(8)))
+            successes = [item for item in results if item[0] == 303]
+            self.assertEqual(len(successes), 1, results)
+            self.assertEqual(sum(item[0] == 401 for item in results), 7, results)
+            self.assertIsNotNone(successes[0][1])
+
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", secondary.server_port, timeout=3
+            )
+            connection.request(
+                "GET",
+                secondary.session_auth.bootstrap_path,
+                headers={
+                    "Host": (
+                        f"{secondary.session_auth.public_host}:"
+                        f"{secondary.server_port}"
+                    )
+                },
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401)
+            connection.close()
+        finally:
+            secondary.shutdown()
+            secondary.server_close()
+            secondary_thread.join(timeout=2)
+
     def test_project_audio_range_and_save(self) -> None:
-        payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         self.assertEqual(payload["tracks"][0]["title"], "First")
         self.assertNotIn("project_path", payload)
         self.assertEqual(payload["revision"], 1)
@@ -177,7 +472,7 @@ class ReviewServerTests(unittest.TestCase):
         range_request = urllib.request.Request(
             self.base + "/audio", headers={"Range": "bytes=10-29"}
         )
-        with urllib.request.urlopen(range_request) as response:
+        with self.authenticated_opener.open(range_request) as response:
             self.assertEqual(response.status, 206)
             self.assertEqual(len(response.read()), 20)
 
@@ -195,7 +490,7 @@ class ReviewServerTests(unittest.TestCase):
                 }
             ).encode("utf-8"),
         )
-        saved = json.load(urllib.request.urlopen(save_request))
+        saved = json.load(self.authenticated_opener.open(save_request))
         self.assertTrue(saved["ok"])
         self.assertEqual(saved["revision"], 2)
         self.assertNotEqual(saved["project_sha256"], payload["project_sha256"])
@@ -205,8 +500,42 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(persisted.tracks[0].title, "Edited First")
         self.assertEqual(persisted.edit_history[-1].after_sha256, persisted.state_sha256)
 
+    def test_continuous_context_route_accepts_distinct_crackle_kind(self) -> None:
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
+        expected_context = {
+            "kind": "crackle",
+            "method_contract": {
+                "proposal_schema": "groove-serpent.continuous-crackle-proposal/1"
+            },
+        }
+        request_payload = {
+            "action": "read-exact-continuous-preview-context",
+            "expected_revision": state["revision"],
+            "expected_project_sha256": state["project_sha256"],
+            "expected_source_receipt": state["source_receipt"]["receipt"],
+            "kind": "crackle",
+        }
+        with patch(
+            "groove_serpent.review_server.current_continuous_preview_context",
+            return_value=expected_context,
+        ) as current:
+            status, _headers, body, _will_close = self.request(
+                "POST",
+                "/api/restoration/continuous/context",
+                body=json.dumps(request_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+
+        self.assertEqual(status, 200, body)
+        response = json.loads(body)
+        self.assertEqual(response["context"], expected_context)
+        current.assert_called_once()
+        called_project, called_kind = current.call_args.args
+        self.assertTrue(Path(called_project).samefile(self.project_path))
+        self.assertEqual(called_kind, "crackle")
+
     def test_checkpoint_endpoint_persists_exact_named_state(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         status, _headers, body, _will_close = self.request(
             "POST",
             "/api/checkpoint",
@@ -245,7 +574,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(self.project_path.read_bytes(), original)
 
     def test_topology_proposal_and_apply_are_revision_bound_and_reversible(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         release_tracks = [
             {"position": 1, "number": "1", "title": "One"},
             {"position": 2, "number": "2", "title": "Two"},
@@ -339,7 +668,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(len(original_tracks), 2)
 
     def test_save_rejects_boolean_and_fractional_sample_markers(self) -> None:
-        project_payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        project_payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_bytes = self.project_path.read_bytes()
         for value in (True, 999.9, "1000"):
             with self.subTest(value=value):
@@ -359,7 +688,7 @@ class ReviewServerTests(unittest.TestCase):
                 self.assertEqual(self.project_path.read_bytes(), original_bytes)
 
     def test_stale_tab_save_returns_conflict_without_writing(self) -> None:
-        first_tab = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        first_tab = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         first_tracks = [dict(item) for item in first_tab["tracks"]]
         first_tracks[0]["title"] = "First tab"
         first_request = {
@@ -397,7 +726,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(load_project(self.project_path).tracks[0].title, "First tab")
 
     def test_mutations_require_strict_project_state_receipts(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_bytes = self.project_path.read_bytes()
         cases = [
             (None, None),
@@ -428,7 +757,7 @@ class ReviewServerTests(unittest.TestCase):
                 self.assertEqual(self.project_path.read_bytes(), original_bytes)
 
     def test_same_size_source_swap_disables_payload_playback_and_save(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_project = self.project_path.read_bytes()
         old_stat = self.source_path.stat()
         self.source_path.write_bytes(b"x" * old_stat.st_size)
@@ -460,20 +789,20 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(self.project_path.read_bytes(), original_project)
 
     def test_source_verification_cache_rehashes_only_after_file_state_changes(self) -> None:
-        first = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        first = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         from groove_serpent.review_server import _sha256_handle
 
         with patch(
             "groove_serpent.review_server._sha256_handle", wraps=_sha256_handle
         ) as hasher:
-            second = json.load(urllib.request.urlopen(self.base + "/api/project"))
+            second = json.load(self.authenticated_opener.open(self.base + "/api/project"))
             self.assertEqual(hasher.call_count, 0)
             stat = self.source_path.stat()
             os.utime(
                 self.source_path,
                 ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
             )
-            third = json.load(urllib.request.urlopen(self.base + "/api/project"))
+            third = json.load(self.authenticated_opener.open(self.base + "/api/project"))
             self.assertEqual(hasher.call_count, 1)
         self.assertEqual(
             first["source_receipt"]["receipt"],
@@ -603,7 +932,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertIn("source audio changed", json.loads(body)["error"].lower())
 
     def test_project_mutation_retains_full_source_revalidation(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         from groove_serpent.review_server import _sha256_handle
 
         with patch(
@@ -641,7 +970,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(identity[-2:], (None, None))
 
     def test_source_cache_refuses_same_size_replacement_with_restored_mtime(self) -> None:
-        initial = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        initial = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         old_stat = self.source_path.stat()
         replacement = bytes(reversed(self.source_path.read_bytes()))
         self.assertEqual(len(replacement), old_stat.st_size)
@@ -657,7 +986,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertNotEqual(sha256_file(self.source_path), initial["source_receipt"]["sha256"])
 
     def test_save_can_split_a_track_and_keeps_submitted_metadata_with_it(self) -> None:
-        payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         first, second = payload["tracks"]
         split_tracks = [
             {
@@ -716,7 +1045,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(saved.tracks[2].musicbrainz_track_id, TRACK_IDS[1])
 
     def test_save_can_merge_tracks_and_renumbers_the_submission(self) -> None:
-        payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         merged = {
             **payload["tracks"][0],
             "number": 42,
@@ -744,7 +1073,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(saved.tracks[0].musicbrainz_track_id, TRACK_IDS[1])
 
     def test_invalid_structural_saves_leave_the_project_byte_unchanged(self) -> None:
-        payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_bytes = self.project_path.read_bytes()
         first, second = payload["tracks"]
         cases = {
@@ -767,7 +1096,7 @@ class ReviewServerTests(unittest.TestCase):
                 self.assertEqual(self.project_path.read_bytes(), original_bytes)
 
     def test_save_strictly_validates_submitted_track_values(self) -> None:
-        payload = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        payload = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_bytes = self.project_path.read_bytes()
         cases = {
             "confidence text": ("confidence", "0.5"),
@@ -796,7 +1125,7 @@ class ReviewServerTests(unittest.TestCase):
                 self.assertEqual(self.project_path.read_bytes(), original_bytes)
 
     def test_save_requires_exact_top_level_and_per_track_keys(self) -> None:
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         original_bytes = self.project_path.read_bytes()
         base = {
             "metadata": state["metadata"],
@@ -855,6 +1184,62 @@ class ReviewServerTests(unittest.TestCase):
             ):
                 serve_project(self.project_path, port=invalid, open_browser=False)
 
+    def test_serve_opens_secret_bootstrap_without_printing_the_capability(self) -> None:
+        def timer(_delay: float, callback: object) -> SimpleNamespace:
+            self.assertTrue(callable(callback))
+            return SimpleNamespace(start=callback)
+
+        with patch.object(
+            ReviewServer,
+            "serve_forever",
+            side_effect=KeyboardInterrupt,
+        ), patch(
+            "groove_serpent.review_server.threading.Timer",
+            side_effect=timer,
+        ), patch(
+            "groove_serpent.review_server.webbrowser.open"
+        ) as browser_open, patch("builtins.print") as printed:
+            result = serve_project(self.project_path, open_browser=True)
+
+        self.assertEqual(result, 0)
+        browser_open.assert_called_once()
+        browser_url = browser_open.call_args.args[0]
+        parsed = urlsplit(browser_url)
+        self.assertTrue(parsed.path.startswith("/__groove_serpent_session__/"))
+        capability = parsed.path.rsplit("/", 1)[-1]
+        rendered_output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in printed.call_args_list
+        )
+        self.assertNotIn(capability, rendered_output)
+
+    def test_no_browser_prints_one_time_bootstrap_credential_once(self) -> None:
+        with patch.object(
+            ReviewServer,
+            "serve_forever",
+            side_effect=KeyboardInterrupt,
+        ), patch(
+            "groove_serpent.review_server.webbrowser.open"
+        ) as browser_open, patch("builtins.print") as printed:
+            result = serve_project(self.project_path, open_browser=False)
+
+        self.assertEqual(result, 0)
+        browser_open.assert_not_called()
+        rendered_output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in printed.call_args_list
+        )
+        credential_line = next(
+            line
+            for line in rendered_output.splitlines()
+            if line.startswith("One-time session bootstrap URL")
+        )
+        bootstrap_url = credential_line.rsplit(" ", 1)[-1]
+        parsed = urlsplit(bootstrap_url)
+        self.assertTrue(parsed.path.startswith("/__groove_serpent_session__/"))
+        capability = parsed.path.rsplit("/", 1)[-1]
+        self.assertEqual(rendered_output.count(capability), 1)
+
     def test_rejects_host_that_is_not_loopback_on_the_actual_port(self) -> None:
         hostile_hosts = [
             f"example.com:{self.port}",
@@ -903,7 +1288,7 @@ class ReviewServerTests(unittest.TestCase):
             body=b"{}",
             headers={
                 "Content-Type": "application/json; charset=utf-8",
-                "Origin": f"http://127.0.0.1:{self.port}",
+                "Origin": self.base,
             },
         )
         self.assertEqual(status, 400)
@@ -981,7 +1366,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(exporter.call_args.kwargs["source_speed_factor"], 0.425930658)
 
     def test_export_requires_exact_identity_and_refuses_stale_clean_tab(self) -> None:
-        stale = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        stale = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         output_dir = self.directory / "stale-must-not-publish"
         missing_identity = {
             "output_dir": str(output_dir),
@@ -1574,7 +1959,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertIn("artwork changed", json.loads(body)["error"].lower())
 
     def test_stale_metadata_apply_returns_conflict_before_artwork_write(self) -> None:
-        stale = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        stale = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         changed_tracks = [dict(item) for item in stale["tracks"]]
         changed_tracks[0]["title"] = "Concurrent edit"
         status, _headers, body, _will_close = self.request(
@@ -1747,7 +2132,10 @@ class ReviewServerTests(unittest.TestCase):
                     provider="fake", enabled=True, ready=True, message="Ready for tests."
                 )
 
-            def identify_track(self, source, start, end, rate):
+            def identify_track(
+                self, source, start, end, rate, *, source_speed_factor=1.0
+            ):
+                self.speed_factor = source_speed_factor
                 self.call = (source, start, end, rate)
                 return [
                     RecognitionMatch(
@@ -1765,7 +2153,7 @@ class ReviewServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["ready"])
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         recognition_request = {
             "track_number": 1,
             "expected_revision": state["revision"],
@@ -1791,15 +2179,20 @@ class ReviewServerTests(unittest.TestCase):
             self.source_path.read_bytes(),
         )
         recognition_response = json.loads(body)
+        track_region = recognition_response["track_region"]
+        self.assertEqual(track_region["track_number"], 1)
+        self.assertEqual(track_region["start_sample"], 1_000)
+        self.assertEqual(track_region["end_sample_exclusive"], 5_000)
+        self.assertEqual(track_region["sample_rate"], 1_000)
+        self.assertEqual(track_region["requested_speed_factor"], 1.0)
+        self.assertEqual(track_region["fingerprint_asetrate_hz"], 1_000)
+        self.assertEqual(track_region["fingerprint_effective_speed_factor"], 1.0)
         self.assertEqual(
-            recognition_response["track_region"],
-            {
-                "track_number": 1,
-                "start_sample": 1_000,
-                "end_sample_exclusive": 5_000,
-                "sample_rate": 1_000,
-            },
+            track_region["fingerprint_speed_transform"],
+            "integer-asetrate-pitch-and-tempo/1",
         )
+        self.assertEqual(len(track_region["speed_state_sha256"]), 64)
+        self.assertEqual(provider.speed_factor, 1.0)
         self.assertEqual(recognition_response["project_sha256"], state["project_sha256"])
 
         self.source_path.write_bytes(b"x" * self.source_path.stat().st_size)
@@ -1816,8 +2209,10 @@ class ReviewServerTests(unittest.TestCase):
         original = self.source_path.read_bytes()
 
         class SwappingProvider:
-            def identify_track(self, source, start, end, rate):
-                del start, end, rate
+            def identify_track(
+                self, source, start, end, rate, *, source_speed_factor=1.0
+            ):
+                del start, end, rate, source_speed_factor
                 self.received = source
                 self_live = self_outer.source_path
                 self_live.write_bytes(b"x" * len(original))
@@ -1830,7 +2225,7 @@ class ReviewServerTests(unittest.TestCase):
         self_outer = self
         provider = SwappingProvider()
         self.server.recognition_provider = provider
-        state = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         status, _headers, body, _will_close = self.request(
             "POST",
             "/api/recognition/identify",
@@ -1851,7 +2246,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(self.source_path.read_bytes(), original)
 
     def test_recognition_refuses_a_stale_track_region_before_provider_call(self) -> None:
-        stale = json.load(urllib.request.urlopen(self.base + "/api/project"))
+        stale = json.load(self.authenticated_opener.open(self.base + "/api/project"))
         changed_tracks = [dict(item) for item in stale["tracks"]]
         changed_tracks[0]["end_sample"] = 4_500
         changed_tracks[1]["start_sample"] = 4_500
@@ -1967,7 +2362,10 @@ class ReviewServerTests(unittest.TestCase):
 
     def test_recognition_rejects_overlapping_work(self) -> None:
         class UnexpectedProvider:
-            def identify_track(self, source, start, end, rate):
+            def identify_track(
+                self, source, start, end, rate, *, source_speed_factor=1.0
+            ):
+                del source_speed_factor
                 raise AssertionError("provider must not run while the lock is held")
 
         self.server.recognition_provider = UnexpectedProvider()

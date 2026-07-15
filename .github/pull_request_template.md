@@ -4,11 +4,14 @@ Describe the user-visible problem and the focused solution.
 
 ## Preservation and privacy
 
-Explain any effect on source immutability, project/source identity, restoration scope, publication receipts, network access, storage, or performance.
+Explain any effect on source immutability, project/source identity, restoration scope, publication
+receipts, network access, storage, or performance.
 
 ## Synthetic verification
 
-List the deterministic synthetic reproduction and the checks you ran. Do not attach copyrighted recordings or artwork, API keys, credentials, private project files, collection metadata, hashes, or private local paths.
+List the deterministic synthetic reproduction and the checks you ran. Do not attach copyrighted
+recordings or artwork, API keys, credentials, private project files, collection metadata, hashes,
+or private local paths.
 
 ## Checklist
 
@@ -22,4 +25,3 @@ List the deterministic synthetic reproduction and the checks you ran. Do not att
 - [ ] Python compilation and relevant FFmpeg/browser checks pass.
 - [ ] I included no copyrighted media, credentials, private project files, or private local paths.
 - [ ] I reviewed dependency, license, security, and compatibility consequences.
-

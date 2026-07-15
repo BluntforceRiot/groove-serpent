@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from . import __version__
+from .atomic_create import rename_no_replace
 from .cache_storage import ensure_free_space
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
 from .media import find_tool, probe_audio, run_ffmpeg, tool_version
@@ -606,6 +607,139 @@ def _probe_exact_audio_stream(path: Path) -> dict[str, Any]:
     }
 
 
+def _probe_track_numbering_tags(path: Path) -> dict[str, str]:
+    """Read only the track-position tags needed for publication verification.
+
+    FFmpeg exposes the standard MP4/M4A ``trkn`` atom as one ``track=N/T``
+    value.  It does not necessarily expose a second ``tracktotal`` tag.  FLAC,
+    by contrast, has a separate Vorbis-comment field for the total.  Keeping
+    those representations distinct avoids opting M4A files into FFmpeg's
+    generic ``mdta`` tag mode just to manufacture a redundant custom key.
+    """
+
+    completed = subprocess.run(
+        [
+            find_tool("ffprobe"),
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags:stream_tags",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise ExportError(
+            f"FFprobe could not verify track numbering for '{path.name}': "
+            f"{completed.stderr.strip() or 'no diagnostic was returned'}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ExportError(
+            f"FFprobe returned invalid track metadata for '{path.name}'."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ExportError(
+            f"FFprobe returned invalid track metadata for '{path.name}'."
+        )
+
+    scopes: list[object] = []
+    format_value = payload.get("format")
+    if format_value is not None:
+        if not isinstance(format_value, dict):
+            raise ExportError(
+                f"FFprobe returned invalid format metadata for '{path.name}'."
+            )
+        scopes.append(format_value.get("tags"))
+    streams = payload.get("streams", [])
+    if not isinstance(streams, list):
+        raise ExportError(
+            f"FFprobe returned invalid stream metadata for '{path.name}'."
+        )
+    for stream in streams:
+        if not isinstance(stream, dict):
+            raise ExportError(
+                f"FFprobe returned invalid stream metadata for '{path.name}'."
+            )
+        scopes.append(stream.get("tags"))
+
+    observed: dict[str, str] = {}
+    for raw_tags in scopes:
+        if raw_tags is None:
+            continue
+        if not isinstance(raw_tags, dict):
+            raise ExportError(f"Audio tags are invalid for '{path.name}'.")
+        for raw_key, raw_value in raw_tags.items():
+            if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+                raise ExportError(f"Audio tags are invalid for '{path.name}'.")
+            key = raw_key.casefold()
+            if key not in {"track", "tracktotal"}:
+                continue
+            previous = observed.get(key)
+            if previous is not None and previous != raw_value:
+                raise ExportError(
+                    f"Audio tag {key!r} conflicts between container scopes."
+                )
+            observed[key] = raw_value
+    return observed
+
+
+def _verify_track_numbering_tags(
+    tags: Mapping[str, str],
+    *,
+    expected_track_number: int,
+    expected_total_tracks: int,
+    output_format: str,
+) -> None:
+    """Verify a format's native representation of track number and total."""
+
+    track_value = tags.get("track")
+    if track_value is None:
+        raise ExportError("Staged audio is missing its track-number tag.")
+    match = re.fullmatch(r"([1-9][0-9]*)(?:/([1-9][0-9]*))?", track_value)
+    if match is None:
+        raise ExportError(f"Staged audio has invalid track numbering {track_value!r}.")
+    observed_number = int(match.group(1))
+    embedded_total = int(match.group(2)) if match.group(2) is not None else None
+
+    separate_total_value = tags.get("tracktotal")
+    separate_total: int | None = None
+    if separate_total_value is not None:
+        if re.fullmatch(r"[1-9][0-9]*", separate_total_value) is None:
+            raise ExportError(
+                f"Staged audio has invalid track total {separate_total_value!r}."
+            )
+        separate_total = int(separate_total_value)
+
+    if output_format == "flac" and separate_total is None:
+        raise ExportError("Staged FLAC is missing its separate TRACKTOTAL tag.")
+    if embedded_total is None and separate_total is None:
+        raise ExportError("Staged audio track numbering does not include a total.")
+    if (
+        embedded_total is not None
+        and separate_total is not None
+        and embedded_total != separate_total
+    ):
+        raise ExportError("Staged audio has conflicting embedded and separate totals.")
+    observed_total = embedded_total if embedded_total is not None else separate_total
+    if (
+        observed_number != expected_track_number
+        or observed_total != expected_total_tracks
+    ):
+        raise ExportError(
+            "Staged audio track numbering differs from the export plan: "
+            f"observed {observed_number}/{observed_total}, expected "
+            f"{expected_track_number}/{expected_total_tracks}."
+        )
+
+
 def _complete_decode(path: Path) -> None:
     try:
         run_ffmpeg(
@@ -725,6 +859,7 @@ def _verify_staged_output(
     source_channels: int,
     source_bits: int | None,
     source_speed_factor: float | None,
+    total_tracks: int,
 ) -> _StagedAudioVerification:
     details = _probe_exact_audio_stream(staged_path)
     expected_codec = "flac" if output_format == "flac" else "aac"
@@ -748,6 +883,14 @@ def _verify_staged_output(
             f"Staged output '{staged_path.name}' has {details['exact_sample_count']} "
             f"samples; expected exactly {expected_sample_count}."
         )
+
+    track_tags = _probe_track_numbering_tags(staged_path)
+    _verify_track_numbering_tags(
+        track_tags,
+        expected_track_number=track.number,
+        expected_total_tracks=total_tracks,
+        output_format=output_format,
+    )
 
     presentation_sample_count: int | None = None
     decoded_pcm_sha256: str | None = None
@@ -947,7 +1090,7 @@ def _build_command(
                 "-b:a",
                 aac_bitrate,
                 "-movflags",
-                "+faststart+use_metadata_tags",
+                "+faststart",
                 "-movie_timescale",
                 str(source_sample_rate),
                 "-f",
@@ -971,6 +1114,65 @@ def _build_command(
         )
     command.append(str(output_path))
     return command
+
+
+def render_verified_track(
+    *,
+    source_snapshot: Path,
+    staged_path: Path,
+    track: Track,
+    total_tracks: int,
+    output_format: str,
+    expected_sample_count: int,
+    source_sample_rate: int,
+    source_channels: int,
+    source_bits: int | None,
+    flac_compression: int,
+    aac_bitrate: str,
+    artwork_path: Path | None = None,
+    project_metadata: Mapping[str, str] | None = None,
+    source_speed_factor: float | None = None,
+) -> _StagedAudioVerification:
+    """Render and fully verify one track inside a caller-owned private stage.
+
+    The caller owns atomic publication and source-snapshot identity.  This
+    helper deliberately accepts no command fragments: it always uses Groove
+    Serpent's fixed FFmpeg construction and the same codec, geometry, exact
+    length, complete-decode, and lossless PCM checks as ``export_project``.
+    """
+
+    command = _build_command(
+        source_path=source_snapshot,
+        output_path=staged_path,
+        track=track,
+        total_tracks=total_tracks,
+        output_format=output_format,
+        source_sample_rate=source_sample_rate,
+        source_bits=source_bits,
+        overwrite=False,
+        flac_compression=flac_compression,
+        aac_bitrate=aac_bitrate,
+        artwork_path=artwork_path,
+        project_metadata=project_metadata,
+        source_speed_factor=source_speed_factor,
+    )
+    run_ffmpeg(command)
+    if not staged_path.is_file():
+        raise ExportError(
+            f"FFmpeg did not create the expected staged file: {staged_path.name}"
+        )
+    return _verify_staged_output(
+        staged_path=staged_path,
+        source_snapshot=source_snapshot,
+        track=track,
+        output_format=output_format,
+        expected_sample_count=expected_sample_count,
+        source_sample_rate=source_sample_rate,
+        source_channels=source_channels,
+        source_bits=source_bits,
+        source_speed_factor=source_speed_factor,
+        total_tracks=total_tracks,
+    )
 
 
 def export_project(
@@ -1313,35 +1515,20 @@ def export_project(
                     f"Exporting track {track.number}/{total_tracks} as "
                     f"{output_format.upper()}: {track.title}"
                 )
-            command = _build_command(
-                source_path=source_snapshot,
-                output_path=staged_path,
+            verification = render_verified_track(
+                source_snapshot=source_snapshot,
+                staged_path=staged_path,
                 track=track,
                 total_tracks=total_tracks,
-                output_format=output_format,
-                source_sample_rate=operation_project.source.sample_rate,
-                source_bits=operation_project.source.bits_per_raw_sample,
-                overwrite=True,
-                flac_compression=flac_compression,
-                aac_bitrate=aac_bitrate,
-                artwork_path=artwork_snapshot,
-                project_metadata=operation_project.metadata,
-                source_speed_factor=source_speed_factor,
-            )
-            run_ffmpeg(command)
-            if not staged_path.is_file():
-                raise ExportError(
-                    f"FFmpeg did not create the expected staged file: {filename}"
-                )
-            verification = _verify_staged_output(
-                staged_path=staged_path,
-                source_snapshot=source_snapshot,
-                track=track,
                 output_format=output_format,
                 expected_sample_count=expected_sample_count,
                 source_sample_rate=operation_project.source.sample_rate,
                 source_channels=operation_project.source.channels,
                 source_bits=operation_project.source.bits_per_raw_sample,
+                flac_compression=flac_compression,
+                aac_bitrate=aac_bitrate,
+                artwork_path=artwork_snapshot,
+                project_metadata=operation_project.metadata,
                 source_speed_factor=source_speed_factor,
             )
             exported.append(
@@ -1393,15 +1580,15 @@ def export_project(
                 "revision": operation_project.revision,
                 "editable_state_sha256": editable_state_sha256,
                 **(
-                    {"file_identity": project_file_receipt.identity_dict()}
+                    {"size_bytes": project_file_receipt.size_bytes}
                     if project_file_receipt is not None
                     else {}
                 ),
             },
             "source_identity": {
-                "path": operation_project.source.path,
-                "captured_at": operation_started_at,
-                **source_receipt.manifest_dict(),
+                "filename": operation_project.source.filename,
+                "sha256": source_receipt.sha256,
+                "size_bytes": source_receipt.size_bytes,
             },
             "verification": {
                 "all_outputs_fully_probed": True,
@@ -1466,8 +1653,8 @@ def export_project(
         ):
             manifest["artwork"] = {
                 "path": artwork_relative_path,
-                "captured_at": operation_started_at,
-                **artwork_receipt.manifest_dict(),
+                "sha256": artwork_receipt.sha256,
+                "size_bytes": artwork_receipt.size_bytes,
             }
         staged_manifest = stage_dir / _MANIFEST_NAME
         with staged_manifest.open("x", encoding="utf-8", newline="\n") as handle:
@@ -1516,7 +1703,7 @@ def export_project(
                 "The output directory was created while this batch was staging; "
                 "nothing was replaced."
             )
-        os.rename(stage_dir, output_dir)
+        rename_no_replace(stage_dir, output_dir)
         stage_created = False
     except BaseException as exc:
         cleanup_error: Exception | None = None

@@ -1,0 +1,36 @@
+{
+  "schema": "groove-serpent.album/2",
+  "created_at": "2026-07-12T01:00:00+00:00",
+  "updated_at": "2026-07-12T01:30:00+00:00",
+  "metadata": {
+    "album": "Sanitized Pinned Album",
+    "artist": "Fixture Artist"
+  },
+  "artwork": null,
+  "sides": [
+    {
+      "label": "A",
+      "order": 1,
+      "project": "side.groove.json",
+      "speed": {
+        "mode": "override",
+        "state": {
+          "capture_rpm": 45.0,
+          "intended_rpm": 33.333333333333336,
+          "fine_factor": 0.99,
+          "schema": "groove-serpent.speed-state/1"
+        },
+        "state_sha256": "770a50e6cfc8e402120091d1443309bfb48f04be063ba50129ad1cc69d3751a5",
+        "project_speed_state_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "pin": {
+        "project_revision": 7,
+        "project_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "editable_state_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "speed_state_sha256": "770a50e6cfc8e402120091d1443309bfb48f04be063ba50129ad1cc69d3751a5",
+        "project_speed_state_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ]
+}

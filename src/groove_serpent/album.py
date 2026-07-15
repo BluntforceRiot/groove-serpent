@@ -7,13 +7,16 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
+from .atomic_create import rename_no_replace
 from .cache_storage import ensure_free_space
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
 from .exporter import (
@@ -27,13 +30,14 @@ from .exporter import (
     sanitize_filename,
 )
 from .media import run_ffmpeg, sha256_file, tool_version
+from .migration_fence import assert_no_pending_migration
 from .models import Project, Track, resolve_source_path, utc_now_iso
 from .portable_names import (
     portable_name_key,
     portable_path_entry_exists,
     portable_relative_path_key,
 )
-from .project_io import load_project_with_sha256
+from .project_io import decode_project_json, load_project_with_sha256
 from .publication import (
     FileReceipt,
     assert_file_receipt,
@@ -41,10 +45,16 @@ from .publication import (
     capture_file_receipt,
     stage_verified_copy,
 )
+from .transaction_lock import (
+    TargetWriteLease,
+    canonical_target_path,
+    exclusive_target_write_lease,
+)
 from .validation import strict_finite_number
 
 
-ALBUM_SCHEMA = "groove-serpent.album/2"
+ALBUM_SCHEMA = "groove-serpent.album/3"
+ALBUM_SCHEMA_V2 = "groove-serpent.album/2"
 LEGACY_ALBUM_SCHEMA = "groove-serpent.album/1"
 ALBUM_EXPORT_SCHEMA = "groove-serpent.album-export/2"
 ALBUM_CHAPTERS_SCHEMA = "groove-serpent.album-chapters/1"
@@ -54,6 +64,14 @@ ALBUM_CHAPTERS_NAME = "album.chapters.json"
 _STAGE_PREFIX = ".groove-serpent-album-"
 _STAGE_SUFFIX = ".partial"
 _MAX_ARTWORK_BYTES = 25 * 1024 * 1024
+MAX_ALBUM_FILE_BYTES = 16 * 1024 * 1024
+MAX_ALBUM_REVISION = (1 << 63) - 1
+MAX_ALBUM_SIDES = 64
+MAX_ALBUM_METADATA_ITEMS = 128
+MAX_ALBUM_METADATA_KEY_LENGTH = 128
+MAX_ALBUM_METADATA_VALUE_LENGTH = 4096
+MAX_ALBUM_REFERENCE_LENGTH = 4096
+MAX_ALBUM_TIMESTAMP_LENGTH = 64
 _ARTWORK_SIGNATURES = {
     ".jpg": b"\xff\xd8\xff",
     ".jpeg": b"\xff\xd8\xff",
@@ -67,8 +85,104 @@ _RESERVED_METADATA = {
 }
 
 
+class _AutomaticExpectedAlbumState:
+    pass
+
+
+_AUTOMATIC_EXPECTED_ALBUM_STATE = _AutomaticExpectedAlbumState()
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON number: {value}")
+
+
+@dataclass(frozen=True, slots=True)
+class _AlbumFileIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+
+    @classmethod
+    def capture(cls, value: os.stat_result) -> "_AlbumFileIdentity":
+        return cls(
+            device=value.st_dev,
+            inode=value.st_ino,
+            mode=value.st_mode,
+            size=value.st_size,
+            modified_ns=value.st_mtime_ns,
+        )
+
+
+def _is_reparse(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_flag)
+
+
+def _plain_album_file_identity(path: Path) -> _AlbumFileIdentity:
+    value = path.lstat()
+    if (
+        path.is_symlink()
+        or _is_reparse(value)
+        or not stat.S_ISREG(value.st_mode)
+        or int(value.st_nlink) != 1
+    ):
+        raise ProjectValidationError(
+            "Album-project path must be a single-link regular, non-reparse file: "
+            f"{path.name}"
+        )
+    return _AlbumFileIdentity.capture(value)
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def canonical_album_path(path: Path) -> Path:
+    """Canonicalize ancestors without ever following the final path component."""
+
+    return canonical_target_path(path)
+
+
+def _read_stable_album_bytes(
+    path: Path, *, maximum: int | None = None
+) -> tuple[bytes, _AlbumFileIdentity]:
+    if maximum is None:
+        maximum = MAX_ALBUM_FILE_BYTES
+    before = _plain_album_file_identity(path)
+    with path.open("rb") as handle:
+        opened = _AlbumFileIdentity.capture(os.fstat(handle.fileno()))
+        raw = handle.read(maximum + 1)
+    after = _plain_album_file_identity(path)
+    if before != opened or opened != after:
+        raise ProjectValidationError(
+            "Album-project file identity changed while it was being read."
+        )
+    if len(raw) > maximum:
+        raise ProjectValidationError(
+            f"Album project exceeds the {maximum}-byte file limit."
+        )
+    return raw, after
+
+
+def _validate_album_timestamp(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_ALBUM_TIMESTAMP_LENGTH
+    ):
+        raise ProjectValidationError(
+            f"{label} must be bounded non-empty ISO-8601 text."
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ProjectValidationError(f"{label} must be valid ISO-8601 text.") from exc
+    if parsed.tzinfo is None:
+        raise ProjectValidationError(f"{label} must include a timezone.")
+    return value
 
 
 def _sha256(path: Path) -> str:
@@ -126,8 +240,17 @@ def _canonical_json_sha256(payload: dict[str, Any]) -> str:
 
 
 def _relative_reference(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ProjectValidationError(f"{label} must be non-empty trimmed text.")
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > MAX_ALBUM_REFERENCE_LENGTH
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ProjectValidationError(
+            f"{label} must be 1-{MAX_ALBUM_REFERENCE_LENGTH} characters of "
+            "trimmed printable text."
+        )
     candidate = Path(value)
     if (
         candidate.is_absolute()
@@ -511,6 +634,7 @@ class AlbumProject:
     metadata: dict[str, str]
     sides: list[AlbumSide]
     artwork: AlbumArtwork | None = None
+    revision: int = 1
     schema: str = ALBUM_SCHEMA
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
@@ -520,29 +644,44 @@ class AlbumProject:
             raise ProjectValidationError(
                 f"Unsupported album schema {self.schema!r}; expected {ALBUM_SCHEMA!r}."
             )
-        if not isinstance(self.created_at, str) or not self.created_at:
-            raise ProjectValidationError("Album created_at must be non-empty text.")
-        if not isinstance(self.updated_at, str) or not self.updated_at:
-            raise ProjectValidationError("Album updated_at must be non-empty text.")
+        if (
+            type(self.revision) is not int
+            or not 1 <= self.revision <= MAX_ALBUM_REVISION
+        ):
+            raise ProjectValidationError(
+                "Album revision must be a bounded positive integer."
+            )
+        _validate_album_timestamp(self.created_at, "Album created_at")
+        _validate_album_timestamp(self.updated_at, "Album updated_at")
         if not isinstance(self.metadata, dict):
             raise ProjectValidationError("Album metadata must be a JSON object.")
+        if len(self.metadata) > MAX_ALBUM_METADATA_ITEMS:
+            raise ProjectValidationError(
+                f"Album metadata cannot exceed {MAX_ALBUM_METADATA_ITEMS} entries."
+            )
         for key, value in self.metadata.items():
             if (
                 not isinstance(key, str)
                 or not key
                 or key != key.strip()
+                or len(key) > MAX_ALBUM_METADATA_KEY_LENGTH
                 or not isinstance(value, str)
+                or len(value) > MAX_ALBUM_METADATA_VALUE_LENGTH
             ):
                 raise ProjectValidationError(
-                    "Album metadata keys must be non-empty trimmed text and values must be text."
+                    "Album metadata keys and values must be bounded text, and keys "
+                    "must be non-empty and trimmed."
                 )
             if key in _RESERVED_METADATA:
                 raise ProjectValidationError(
                     f"Album metadata field {key!r} is reserved by the exporter."
                 )
-        if not isinstance(self.sides, list) or not self.sides:
+        if (
+            not isinstance(self.sides, list)
+            or not 1 <= len(self.sides) <= MAX_ALBUM_SIDES
+        ):
             raise ProjectValidationError(
-                "An album project must contain at least one side."
+                f"An album project must contain 1-{MAX_ALBUM_SIDES} sides."
             )
         labels: set[str] = set()
         projects: set[str] = set()
@@ -584,27 +723,38 @@ class AlbumProject:
             raise ProjectValidationError(
                 "The album-project root must be a JSON object."
             )
+        schema = data.get("schema")
+        if schema in {LEGACY_ALBUM_SCHEMA, ALBUM_SCHEMA_V2}:
+            raise ProjectValidationError(
+                f"Album schema {schema!r} is legacy. Run "
+                "'groove-serpent album migrate ALBUM' before opening it."
+            )
+        if schema != ALBUM_SCHEMA:
+            raise ProjectValidationError(
+                f"Unsupported album schema {schema!r}; expected {ALBUM_SCHEMA!r}."
+            )
         _strict_keys(
             data,
-            {"schema", "created_at", "updated_at", "metadata", "artwork", "sides"},
+            {
+                "schema",
+                "revision",
+                "created_at",
+                "updated_at",
+                "metadata",
+                "artwork",
+                "sides",
+            },
             "Album project",
         )
         metadata = data["metadata"]
         if not isinstance(metadata, dict):
             raise ProjectValidationError("Album metadata must be a JSON object.")
-        schema = data["schema"]
-        if schema not in {ALBUM_SCHEMA, LEGACY_ALBUM_SCHEMA}:
-            raise ProjectValidationError(
-                f"Unsupported album schema {schema!r}; expected {ALBUM_SCHEMA!r} "
-                f"or migratable {LEGACY_ALBUM_SCHEMA!r}."
-            )
         raw_sides = data["sides"]
         if not isinstance(raw_sides, list):
             raise ProjectValidationError("Album sides must be a JSON array.")
         album = cls(
-            # Legacy /1 albums load as /2 with explicit overrides and no pins.
-            # Inspect reports that state, and export fails until `album repin`.
             schema=ALBUM_SCHEMA,
+            revision=data["revision"],
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             metadata=dict(metadata),
@@ -613,14 +763,7 @@ class AlbumProject:
                 if data["artwork"] is not None
                 else None
             ),
-            sides=[
-                (
-                    AlbumSide.from_dict(item)
-                    if schema == ALBUM_SCHEMA
-                    else AlbumSide.from_legacy_dict(item)
-                )
-                for item in raw_sides
-            ],
+            sides=[AlbumSide.from_dict(item) for item in raw_sides],
         )
         album.validate()
         return album
@@ -640,26 +783,152 @@ def save_album_project(
     path: Path,
     *,
     overwrite: bool = False,
+    expected_existing_sha256: (
+        str | None | _AutomaticExpectedAlbumState
+    ) = _AUTOMATIC_EXPECTED_ALBUM_STATE,
 ) -> None:
+    """Save one album under an OS-backed compare-and-swap write lease.
+
+    ``None`` means the caller observed no exact or portable-equivalent entry.
+    A digest binds replacement to the exact bytes the caller loaded. Omitting
+    the argument retains the legacy function-entry snapshot for internal and
+    test compatibility.
+    """
+
+    path = _absolute_without_resolving(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = canonical_album_path(path)
+    automatic_expectation = (
+        expected_existing_sha256 is _AUTOMATIC_EXPECTED_ALBUM_STATE
+    )
+    if not automatic_expectation and expected_existing_sha256 is not None:
+        if (
+            not isinstance(expected_existing_sha256, str)
+            or len(expected_existing_sha256) != 64
+            or expected_existing_sha256.lower() != expected_existing_sha256
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_existing_sha256
+            )
+        ):
+            raise ProjectValidationError(
+                "Expected album SHA-256 must be a lowercase 64-character digest."
+            )
+    exact_before_lease = os.path.lexists(path)
+    portable_before_lease = _entry_exists(path)
+    identity_before_lease: _AlbumFileIdentity | None = None
+    sha256_before_lease: str | None = None
+    if exact_before_lease:
+        identity_before_lease = _plain_album_file_identity(path)
+        raw_before_lease, repeated_identity = _read_stable_album_bytes(path)
+        if repeated_identity != identity_before_lease:
+            raise ProjectValidationError(
+                "Album-project identity changed before the write lease was acquired."
+            )
+        sha256_before_lease = hashlib.sha256(raw_before_lease).hexdigest()
+    if not automatic_expectation:
+        expected_exists = expected_existing_sha256 is not None
+        if expected_exists != exact_before_lease:
+            raise ProjectValidationError(
+                "Album-project path no longer matches the caller's expected "
+                "existence state."
+            )
+        if not expected_exists and portable_before_lease:
+            raise ProjectValidationError(
+                "An NFC/case-equivalent album-project destination already exists."
+            )
+        if (
+            expected_exists
+            and sha256_before_lease != expected_existing_sha256
+        ):
+            raise ProjectValidationError(
+                "Album project changed after the caller loaded it; reload before saving."
+            )
+    with exclusive_target_write_lease(path) as write_lease:
+        _save_album_project_locked(
+            album,
+            path,
+            overwrite=overwrite,
+            write_lease=write_lease,
+            exact_before_lease=exact_before_lease,
+            portable_before_lease=portable_before_lease,
+            identity_before_lease=identity_before_lease,
+            sha256_before_lease=sha256_before_lease,
+        )
+
+
+def _save_album_project_locked(
+    album: AlbumProject,
+    path: Path,
+    *,
+    overwrite: bool,
+    write_lease: TargetWriteLease,
+    exact_before_lease: bool,
+    portable_before_lease: bool,
+    identity_before_lease: _AlbumFileIdentity | None,
+    sha256_before_lease: str | None,
+) -> None:
+    write_lease.assert_current()
+    assert_no_pending_migration(path, "album")
     album.validate()
-    path = path.expanduser().resolve()
-    existed = _entry_exists(path)
-    if existed and not overwrite:
+    path = _absolute_without_resolving(path)
+    if path.parent.exists():
+        path = canonical_album_path(path)
+    exact_exists = os.path.lexists(path)
+    portable_exists = _entry_exists(path)
+    if (
+        exact_exists != exact_before_lease
+        or portable_exists != portable_before_lease
+    ):
+        raise ProjectValidationError(
+            "Album-project path existence changed while waiting for the write lease."
+        )
+    original_identity: _AlbumFileIdentity | None = None
+    original_sha256: str | None = None
+    if exact_exists:
+        original_identity = _plain_album_file_identity(path)
+    elif portable_exists:
+        raise ProjectValidationError(
+            "An NFC/case-equivalent album-project destination already exists."
+        )
+    if exact_exists and not overwrite:
         raise ProjectValidationError(
             f"Album project already exists: {path}. Use --overwrite to replace it."
         )
-    if existed and not path.is_file():
-        raise ProjectValidationError("Album-project destination is not a regular file.")
-    if not existed:
-        for side in album.sides:
-            if side.pin is None:
-                pin_album_side(side, path)
-        album.validate()
+    if exact_exists:
+        original_raw, read_identity = _read_stable_album_bytes(path)
+        if read_identity != original_identity:
+            raise ProjectValidationError(
+                "Album-project identity changed before overwrite preparation."
+            )
+        if (
+            read_identity != identity_before_lease
+            or hashlib.sha256(original_raw).hexdigest() != sha256_before_lease
+        ):
+            raise ProjectValidationError(
+                "Album project changed while waiting for the write lease."
+            )
+        existing = AlbumProject.from_dict(decode_project_json(original_raw))
+        if existing.revision != album.revision:
+            raise ProjectValidationError(
+                "Album-project revision changed; reload before saving."
+            )
+        if existing.revision >= MAX_ALBUM_REVISION:
+            raise ProjectValidationError(
+                "Album-project revision is exhausted and cannot be incremented."
+            )
+        original_sha256 = hashlib.sha256(original_raw).hexdigest()
     path.parent.mkdir(parents=True, exist_ok=True)
     next_updated_at = utc_now_iso()
+    next_revision = album.revision + 1 if exact_exists else album.revision
     payload = album.to_dict()
     payload["updated_at"] = next_updated_at
+    payload["revision"] = next_revision
     text = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    if len(text.encode("utf-8")) > MAX_ALBUM_FILE_BYTES:
+        raise ProjectValidationError(
+            f"Album project exceeds the {MAX_ALBUM_FILE_BYTES}-byte file limit."
+        )
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -671,18 +940,42 @@ def save_album_project(
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if original_identity is None:
+            if os.path.lexists(path) or _entry_exists(path):
+                raise ProjectValidationError(
+                    "Album-project destination appeared before atomic save."
+                )
+        else:
+            repeated_raw, repeated_identity = _read_stable_album_bytes(path)
+            if (
+                repeated_identity != original_identity
+                or hashlib.sha256(repeated_raw).hexdigest() != original_sha256
+            ):
+                raise ProjectValidationError(
+                    "Album-project identity changed before atomic save."
+                )
+        write_lease.assert_current()
+        if original_identity is None:
+            try:
+                rename_no_replace(temporary, path)
+            except FileExistsError as exc:
+                raise ProjectValidationError(
+                    "Album-project destination appeared before atomic creation."
+                ) from exc
+        else:
+            os.replace(temporary, path)
         album.updated_at = next_updated_at
+        album.revision = next_revision
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
 
 
 def load_album_project_with_sha256(path: Path) -> tuple[AlbumProject, str]:
-    path = path.expanduser().resolve()
+    path = canonical_album_path(path)
     try:
-        raw = path.read_bytes()
-        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        raw, _ = _read_stable_album_bytes(path)
+        data = decode_project_json(raw)
         return AlbumProject.from_dict(data), hashlib.sha256(raw).hexdigest()
     except ProjectValidationError:
         raise
@@ -703,17 +996,31 @@ def load_album_project(path: Path) -> AlbumProject:
     return load_album_project_with_sha256(path)[0]
 
 
-def resolve_album_reference(album_path: Path, reference: str, label: str) -> Path:
-    normalized = _relative_reference(reference, label)
-    root = album_path.expanduser().resolve().parent
+def _resolve_contained_final(
+    root: Path, candidate: Path, label: str
+) -> Path:
+    root = root.resolve()
     try:
-        resolved = (root / normalized).resolve()
-        resolved.relative_to(root)
+        parent = candidate.parent.resolve()
+        parent.relative_to(root)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectValidationError(
             f"{label} must remain inside the album-project folder."
         ) from exc
+    resolved = parent / candidate.name
+    if os.path.lexists(resolved):
+        value = resolved.lstat()
+        if resolved.is_symlink() or _is_reparse(value):
+            raise ProjectValidationError(
+                f"{label} must not be a symlink, junction, or reparse point."
+            )
     return resolved
+
+
+def resolve_album_reference(album_path: Path, reference: str, label: str) -> Path:
+    normalized = _relative_reference(reference, label)
+    root = canonical_album_path(album_path).parent
+    return _resolve_contained_final(root, root / normalized, label)
 
 
 def _current_side_identity(
@@ -875,18 +1182,19 @@ def _side_identity_status(
 
 
 def artwork_for_album_path(album_path: Path, supplied_path: Path) -> AlbumArtwork:
-    album_path = album_path.expanduser().resolve()
+    album_path = canonical_album_path(album_path)
     root = album_path.parent
     supplied_path = supplied_path.expanduser()
     if supplied_path.drive and not supplied_path.is_absolute():
         raise ProjectValidationError(
             "Album artwork must be an absolute path or relative to the album-project folder."
         )
-    supplied_path = (
-        supplied_path.resolve()
+    candidate = (
+        _absolute_without_resolving(supplied_path)
         if supplied_path.is_absolute()
-        else (root / supplied_path).resolve()
+        else root / supplied_path
     )
+    supplied_path = _resolve_contained_final(root, candidate, "Album artwork")
     try:
         relative = supplied_path.relative_to(root).as_posix()
     except ValueError as exc:
@@ -926,16 +1234,19 @@ def parse_album_side_spec(value: str, order: int, album_path: Path) -> AlbumSide
             "LABEL|PROJECT|CAPTURE_RPM|INTENDED_RPM|FINE_FACTOR."
         )
     label, supplied_project = parts[0], parts[1]
-    root = album_path.expanduser().resolve().parent
+    root = canonical_album_path(album_path).parent
     project_path = Path(supplied_project).expanduser()
     if project_path.drive and not project_path.is_absolute():
         raise ProjectValidationError(
             "Album side projects must be absolute paths or relative to the album-project folder."
         )
-    project_path = (
-        project_path.resolve()
+    candidate = (
+        _absolute_without_resolving(project_path)
         if project_path.is_absolute()
-        else (root / project_path).resolve()
+        else root / project_path
+    )
+    project_path = _resolve_contained_final(
+        root, candidate, "Album side project"
     )
     if not project_path.is_file():
         raise ProjectValidationError(
@@ -976,7 +1287,7 @@ def parse_album_side_spec(value: str, order: int, album_path: Path) -> AlbumSide
 
 def inspect_album_project(album: AlbumProject, album_path: Path) -> dict[str, Any]:
     album.validate()
-    album_path = album_path.expanduser().resolve()
+    album_path = canonical_album_path(album_path)
     result: dict[str, Any] = {
         "schema": album.schema,
         "album_project": str(album_path),
@@ -1283,6 +1594,7 @@ def _write_continuous_side(
         source_channels=project.source.channels,
         source_bits=project.source.bits_per_raw_sample,
         source_speed_factor=correction_factor,
+        total_tracks=total_tracks,
     )
     return {
         "path": destination.as_posix(),
@@ -2078,7 +2390,7 @@ def export_album(
             raise ExportError(
                 "The album output directory was created while staging; nothing was replaced."
             )
-        os.rename(stage, output_dir)
+        rename_no_replace(stage, output_dir)
         created = False
     except BaseException as exc:
         cleanup_error: Exception | None = None

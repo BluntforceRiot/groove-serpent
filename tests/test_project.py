@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import groove_serpent.project_io as project_io_module
 
 from groove_serpent.models import (
     EDIT_ACTION_KINDS,
@@ -23,7 +24,9 @@ from groove_serpent.models import (
     Project,
     ProjectState,
     Track,
+    _source_path_kind,
     project_state_sha256,
+    resolve_source_path,
 )
 from groove_serpent.project_io import load_project, save_project
 from groove_serpent.errors import ProjectValidationError
@@ -56,6 +59,65 @@ def make_history_project() -> Project:
 
 
 class ProjectTests(unittest.TestCase):
+    def test_source_path_syntax_rejects_windows_network_device_and_drive_relative(self) -> None:
+        project = make_history_project()
+        invalid = (
+            r"\\server\share\capture.flac",
+            "//server/share/capture.flac",
+            r"\\?\N:\capture.flac",
+            r"\\?\UNC\server\share\capture.flac",
+            r"\\.\PhysicalDrive0",
+            r"\??\N:\capture.flac",
+            r"\Device\HarddiskVolume1\capture.flac",
+            r"N:capture.flac",
+            "N:",
+            "NUL.flac",
+            r"captures\COM1.wav",
+            "capture.flac:$DATA",
+            r"N:\capture.flac:stream",
+        )
+        for stored in invalid:
+            with self.subTest(stored=stored):
+                project.source.path = stored
+                with patch("pathlib.Path.resolve") as resolve, patch(
+                    "pathlib.Path.is_file"
+                ) as is_file, self.assertRaises(ProjectValidationError):
+                    resolve_source_path(project, Path("project.groove.json"))
+                resolve.assert_not_called()
+                is_file.assert_not_called()
+
+        project.source.path = "missing.flac"
+        project.source.filename = "NUL.flac"
+        with patch("pathlib.Path.resolve") as resolve, patch(
+            "pathlib.Path.is_file"
+        ) as is_file, self.assertRaisesRegex(
+            ProjectValidationError, "device-name"
+        ):
+            resolve_source_path(project, Path("project.groove.json"))
+        resolve.assert_not_called()
+        is_file.assert_not_called()
+
+    def test_source_path_syntax_preserves_mapped_drives_and_relative_paths(self) -> None:
+        self.assertEqual(
+            _source_path_kind(r"N:\Vinyl\capture.flac"), "windows-absolute"
+        )
+        self.assertEqual(
+            _source_path_kind("N:/Vinyl/capture.flac"), "windows-absolute"
+        )
+        self.assertEqual(_source_path_kind("captures/side.flac"), "relative")
+
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            source = directory / "capture.flac"
+            source.write_bytes(b"audio")
+            project = make_history_project()
+            project.source.path = str(source)
+            project.source.filename = source.name
+            self.assertEqual(
+                resolve_source_path(project, directory / "side.groove.json"),
+                source,
+            )
+
     def test_round_trip(self) -> None:
         source = AudioSource(
             path="side-a.flac",
@@ -107,7 +169,7 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(loaded.tracks[1].title, "Second")
             self.assertEqual(loaded.tracks[0].end_sample, loaded.tracks[1].start_sample)
 
-    def test_schema_one_project_migrates_on_load(self) -> None:
+    def test_schema_one_project_requires_explicit_migration_without_writes(self) -> None:
         source = AudioSource(
             path="side.flac",
             filename="side.flac",
@@ -129,9 +191,11 @@ class ProjectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_value:
             path = Path(directory_value) / "old.groove.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
-            loaded = load_project(path)
-        self.assertEqual(loaded.schema_version, 3)
-        self.assertEqual(loaded.revision, 1)
+            original = path.read_bytes()
+            with self.assertRaisesRegex(ProjectValidationError, "project migrate PROJECT"):
+                load_project(path)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_successful_overwrites_increment_revision_even_in_the_same_second(self) -> None:
         source = AudioSource(
@@ -150,8 +214,11 @@ class ProjectTests(unittest.TestCase):
             analysis=AnalysisSummary(0.0, 1.0, -50.0, -44.0, -32.0, 0.05),
             tracks=[Track(1, "One", 0, 1_000, 0.0, 1.0)],
         )
-        with tempfile.TemporaryDirectory() as directory_value, patch(
-            "groove_serpent.project_io.utc_now_iso", return_value="2026-07-11T12:00:00+00:00"
+        with (
+            tempfile.TemporaryDirectory() as directory_value,
+            patch(
+                "groove_serpent.project_io.utc_now_iso", return_value="2026-07-11T12:00:00+00:00"
+            ),
         ):
             path = Path(directory_value) / "revision.groove.json"
             save_project(project, path)
@@ -233,19 +300,13 @@ class ProjectTests(unittest.TestCase):
     def test_finite_huge_values_fail_stably_in_models_and_project_files(self) -> None:
         mutations = (
             lambda project: setattr(project.source, "duration_seconds", 1e308),
-            lambda project: setattr(
-                project.analysis, "music_end_seconds", 1e308
-            ),
-            lambda project: setattr(
-                project.analysis, "envelope_window_seconds", 1e308
-            ),
+            lambda project: setattr(project.analysis, "music_end_seconds", 1e308),
+            lambda project: setattr(project.analysis, "envelope_window_seconds", 1e308),
             lambda project: setattr(project.settings, "active_run_seconds", 1e308),
             lambda project: setattr(project.settings, "threshold_margin_db", 1e308),
             lambda project: setattr(project.analysis, "noise_floor_db", 1e308),
             lambda project: setattr(project.analysis, "waveform", [1e308]),
-            lambda project: setattr(
-                project.tracks[0], "expected_duration_seconds", 1e308
-            ),
+            lambda project: setattr(project.tracks[0], "expected_duration_seconds", 1e308),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
@@ -275,9 +336,7 @@ class ProjectTests(unittest.TestCase):
                 project = make_history_project()
                 project.analysis.music_start_seconds = start
                 project.analysis.music_end_seconds = end
-                with self.assertRaisesRegex(
-                    ProjectValidationError, "music bounds"
-                ):
+                with self.assertRaisesRegex(ProjectValidationError, "music bounds"):
                     project.validate()
 
         project = make_history_project()
@@ -364,22 +423,22 @@ class ProjectTests(unittest.TestCase):
                 0.8,
             )
             setattr(candidate, field_name, 1e308)
-            with self.subTest(field=field_name), self.assertRaisesRegex(
-                ProjectValidationError, "supported dB range"
+            with (
+                self.subTest(field=field_name),
+                self.assertRaisesRegex(ProjectValidationError, "supported dB range"),
             ):
                 candidate.validate()
 
-        candidate = BoundaryCandidate(
-            4.0, 5.0, 4.5, 4_500, 1.0, -60.0, -55.0, -0.001, 0.8
-        )
+        candidate = BoundaryCandidate(4.0, 5.0, 4.5, 4_500, 1.0, -60.0, -55.0, -0.001, 0.8)
         with self.assertRaisesRegex(ProjectValidationError, "contrast"):
             candidate.validate()
 
         for waveform in ([-0.001], [1.001], [1e308]):
             project = make_history_project()
             project.analysis.waveform = waveform
-            with self.subTest(waveform=waveform), self.assertRaisesRegex(
-                ProjectValidationError, "between 0 and 1"
+            with (
+                self.subTest(waveform=waveform),
+                self.assertRaisesRegex(ProjectValidationError, "between 0 and 1"),
             ):
                 project.validate()
 
@@ -503,18 +562,12 @@ class ProjectTests(unittest.TestCase):
                 with self.subTest(field=field_name, invalid=invalid):
                     settings = AnalysisSettings()
                     setattr(settings, field_name, invalid)
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         settings.validate()
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         AnalysisSettings.from_dict({field_name: invalid})
 
-        accepted = AnalysisSettings.from_dict(
-            {"threshold_margin_db": 6, "min_gap_seconds": 1.25}
-        )
+        accepted = AnalysisSettings.from_dict({"threshold_margin_db": 6, "min_gap_seconds": 1.25})
         accepted.validate()
 
     def test_analysis_summary_rejects_coercive_numbers_in_json_and_models(self) -> None:
@@ -541,31 +594,23 @@ class ProjectTests(unittest.TestCase):
                 with self.subTest(field=field_name, invalid=invalid):
                     payload = deepcopy(valid)
                     payload[field_name] = invalid
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         AnalysisSummary.from_dict(payload)
 
                     summary = AnalysisSummary.from_dict(valid)
                     setattr(summary, field_name, invalid)
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         summary.validate()
 
         for invalid in (True, "1.0", None):
             with self.subTest(waveform=invalid):
                 payload = deepcopy(valid)
                 payload["waveform"] = [invalid]
-                with self.assertRaisesRegex(
-                    ProjectValidationError, "finite JSON number"
-                ):
+                with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                     AnalysisSummary.from_dict(payload)
                 summary = AnalysisSummary.from_dict(valid)
                 summary.waveform = [invalid]
-                with self.assertRaisesRegex(
-                    ProjectValidationError, "finite JSON number"
-                ):
+                with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                     summary.validate()
 
         accepted = deepcopy(valid)
@@ -601,16 +646,12 @@ class ProjectTests(unittest.TestCase):
                 with self.subTest(field=field_name, invalid=invalid):
                     payload = deepcopy(valid)
                     payload[field_name] = invalid
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         BoundaryCandidate.from_dict(payload)
 
                     candidate = BoundaryCandidate.from_dict(valid)
                     setattr(candidate, field_name, invalid)
-                    with self.assertRaisesRegex(
-                        ProjectValidationError, "finite JSON number"
-                    ):
+                    with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
                         candidate.validate()
 
         for invalid in (True, "4500", None, 4_500.0):
@@ -693,24 +734,65 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectValidationError, "finite JSON number"):
             candidate.validate()
 
+    def test_load_and_save_refuse_final_symlink_or_reparse_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            target = directory / "target.groove.json"
+            link = directory / "link.groove.json"
+            save_project(make_history_project(), target)
+            original = target.read_bytes()
+            try:
+                link.symlink_to(target)
+            except OSError as exc:
+                self.skipTest(f"This host cannot create a test symlink: {exc}")
+            with self.assertRaisesRegex(ProjectValidationError, "non-reparse"):
+                load_project(link)
+            with self.assertRaisesRegex(ProjectValidationError, "non-reparse"):
+                save_project(make_history_project(), link)
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_save_detects_identity_change_before_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            path = Path(directory_value) / "race.groove.json"
+            project = make_history_project()
+            save_project(project, path)
+            original_revision = project.revision
+            real_identity = project_io_module._plain_file_identity
+            calls = 0
+
+            def racing_identity(target: Path) -> project_io_module._FileIdentity:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    target.write_bytes(b"external replacement")
+                return real_identity(target)
+
+            with (
+                patch.object(
+                    project_io_module,
+                    "_plain_file_identity",
+                    side_effect=racing_identity,
+                ),
+                patch.object(project_io_module.os, "replace") as replace_mock,
+            ):
+                with self.assertRaisesRegex(ProjectValidationError, "identity changed"):
+                    save_project(project, path)
+                replace_mock.assert_not_called()
+            self.assertEqual(path.read_bytes(), b"external replacement")
+            self.assertEqual(project.revision, original_revision)
+
 
 class PersistedEditStateTests(unittest.TestCase):
     def test_state_hash_is_deterministic_and_covers_tracks_and_metadata(self) -> None:
         project = make_history_project()
-        first = project_state_sha256(
-            project.tracks, {"artist": "Artist", "album": "Album"}
-        )
-        reordered = project_state_sha256(
-            project.tracks, {"album": "Album", "artist": "Artist"}
-        )
+        first = project_state_sha256(project.tracks, {"artist": "Artist", "album": "Album"})
+        reordered = project_state_sha256(project.tracks, {"album": "Album", "artist": "Artist"})
         self.assertEqual(first, reordered)
         self.assertEqual(first, project.state_sha256)
 
         changed_tracks = ProjectState.capture(project.tracks, project.metadata).tracks
         changed_tracks[0].title = "Changed"
-        self.assertNotEqual(
-            first, project_state_sha256(changed_tracks, project.metadata)
-        )
+        self.assertNotEqual(first, project_state_sha256(changed_tracks, project.metadata))
         self.assertNotEqual(
             first,
             project_state_sha256(project.tracks, {**project.metadata, "year": "2026"}),
@@ -756,7 +838,7 @@ class PersistedEditStateTests(unittest.TestCase):
         self.assertEqual(loaded.tracks[0].title, "One")
         self.assertNotIn("genre", loaded.metadata)
 
-    def test_legacy_and_existing_schema_three_without_fields_migrate(self) -> None:
+    def test_legacy_schemas_require_explicit_migration(self) -> None:
         project = make_history_project()
         payload = project.to_dict()
         for schema_version in (1, 2, 3):
@@ -766,16 +848,8 @@ class PersistedEditStateTests(unittest.TestCase):
                 legacy.pop("analyzer_baseline", None)
                 legacy.pop("edit_history", None)
                 legacy.pop("checkpoints", None)
-                loaded = Project.from_dict(legacy)
-                self.assertEqual(loaded.schema_version, 3)
-                self.assertEqual(loaded.edit_history, [])
-                self.assertEqual(loaded.checkpoints, [])
-                self.assertEqual(
-                    loaded.analyzer_baseline.state_sha256, loaded.state_sha256
-                )
-                self.assertIsNot(
-                    loaded.analyzer_baseline.tracks[0], loaded.tracks[0]
-                )
+                with self.assertRaisesRegex(ProjectValidationError, "project migrate PROJECT"):
+                    Project.from_dict(legacy)
 
     def test_analyze_audio_explicitly_captures_independent_baseline(self) -> None:
         from groove_serpent.analysis import analyze_audio
@@ -786,20 +860,22 @@ class PersistedEditStateTests(unittest.TestCase):
             size_bytes=100,
             modified_ns=1,
             duration_seconds=10.0,
-            sample_rate=1_000,
+            sample_rate=44_100,
             channels=2,
             codec_name="flac",
-            sample_count=10_000,
+            bits_per_raw_sample=16,
+            sample_count=441_000,
             sha256="b" * 64,
         )
         with tempfile.TemporaryDirectory() as directory_value:
             source_path = Path(directory_value) / "side.flac"
             source_path.write_bytes(b"x" * 100)
-            with patch(
-                "groove_serpent.analysis.probe_audio", return_value=source
-            ), patch(
-                "groove_serpent.analysis.decode_rms_envelope",
-                return_value=(np.full(20, -180.0), 0.5),
+            with (
+                patch("groove_serpent.analysis.probe_audio", return_value=source),
+                patch(
+                    "groove_serpent.analysis.decode_rms_envelope",
+                    return_value=(np.full(20, -180.0), 0.5),
+                ),
             ):
                 project = analyze_audio(
                     source_path,
@@ -852,9 +928,7 @@ class PersistedEditStateTests(unittest.TestCase):
         project = make_history_project()
         before = project.capture_state()
         project.tracks[0].title = "Edited"
-        project.append_history(
-            action="edit_track", summary="Edited title", before=before
-        )
+        project.append_history(action="edit_track", summary="Edited title", before=before)
         project.set_checkpoint("Edited")
         payload = project.to_dict()
 
@@ -884,15 +958,11 @@ class PersistedEditStateTests(unittest.TestCase):
                 "sample bounds",
             ),
             (
-                lambda data: data["checkpoints"][0]["state"]["metadata"].__setitem__(
-                    "year", 2026
-                ),
+                lambda data: data["checkpoints"][0]["state"]["metadata"].__setitem__("year", 2026),
                 "text",
             ),
             (
-                lambda data: data["analyzer_baseline"].__setitem__(
-                    "state_sha256", "0" * 64
-                ),
+                lambda data: data["analyzer_baseline"].__setitem__("state_sha256", "0" * 64),
                 "hash does not match",
             ),
             (
@@ -911,29 +981,23 @@ class PersistedEditStateTests(unittest.TestCase):
         project = make_history_project()
         before = project.capture_state()
         project.metadata["one"] = "1"
-        project.append_history(
-            action="edit_metadata", summary="First", before=before
-        )
+        project.append_history(action="edit_metadata", summary="First", before=before)
         before = project.capture_state()
         project.metadata["two"] = "2"
-        project.append_history(
-            action="edit_metadata", summary="Second", before=before
-        )
+        project.append_history(action="edit_metadata", summary="Second", before=before)
         project.set_checkpoint("Current")
         payload = project.to_dict()
 
         too_much_history = deepcopy(payload)
         too_much_history["edit_history"] = [
-            deepcopy(payload["edit_history"][0])
-            for _ in range(MAX_EDIT_HISTORY + 1)
+            deepcopy(payload["edit_history"][0]) for _ in range(MAX_EDIT_HISTORY + 1)
         ]
         with self.assertRaisesRegex(ProjectValidationError, "cannot exceed"):
             Project.from_dict(too_much_history)
 
         too_many_checkpoints = deepcopy(payload)
         too_many_checkpoints["checkpoints"] = [
-            deepcopy(payload["checkpoints"][0])
-            for _ in range(MAX_CHECKPOINTS + 1)
+            deepcopy(payload["checkpoints"][0]) for _ in range(MAX_CHECKPOINTS + 1)
         ]
         with self.assertRaisesRegex(ProjectValidationError, "more than"):
             Project.from_dict(too_many_checkpoints)
@@ -942,9 +1006,9 @@ class PersistedEditStateTests(unittest.TestCase):
         broken_chain["edit_history"][1]["before"] = deepcopy(
             broken_chain["edit_history"][0]["before"]
         )
-        broken_chain["edit_history"][1]["before_sha256"] = broken_chain[
-            "edit_history"
-        ][0]["before_sha256"]
+        broken_chain["edit_history"][1]["before_sha256"] = broken_chain["edit_history"][0][
+            "before_sha256"
+        ]
         with self.assertRaisesRegex(ProjectValidationError, "unbroken hash chain"):
             Project.from_dict(broken_chain)
 

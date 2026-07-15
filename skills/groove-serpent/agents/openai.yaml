@@ -1,4 +1,4 @@
 interface:
   display_name: "Groove Serpent"
-  short_description: "Receipt-bound vinyl review and publication"
-  default_prompt: "Use $groove-serpent to inspect this capture and produce receipt-bound, reviewable derivatives without modifying the master."
+  short_description: "Local, receipt-bound vinyl workflow"
+  default_prompt: "Use $groove-serpent to inspect this local capture, generate sealed evidence, and leave consequential approvals to the owner."

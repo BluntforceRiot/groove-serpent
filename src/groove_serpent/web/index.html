@@ -8,13 +8,14 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#sideReviewMain" tabindex="0">Skip to side review</a>
   <header class="topbar">
     <div>
       <div class="eyebrow">LOCAL-FIRST VINYL DIGITIZATION</div>
       <h1>Groove Serpent <small>0.5</small></h1>
       <p id="sourceSummary">Loading project…</p>
     </div>
-    <div class="integrity-strip" aria-label="Project integrity status">
+    <div class="integrity-strip" role="status" aria-label="Project integrity status" aria-live="polite">
       <span id="sourceIntegrity" class="integrity-badge pending">VERIFYING SOURCE</span>
       <span id="revisionIdentity" class="integrity-detail">REVISION —</span>
       <span id="saveIdentity" class="integrity-detail">STATE · loading</span>
@@ -25,14 +26,14 @@
     </div>
   </header>
 
-  <main>
+  <main id="sideReviewMain" tabindex="-1" aria-label="Side review workspace">
     <section class="panel metadata-panel">
       <div class="section-heading">
         <div>
           <span class="kicker">RELEASE</span>
           <h2>Album details</h2>
         </div>
-        <span id="status" class="status" role="status" aria-live="polite">Loading</span>
+        <span id="status" class="status" role="status" aria-label="Project status" aria-live="polite">Loading</span>
       </div>
       <div class="release-layout">
         <div class="cover-card">
@@ -60,11 +61,11 @@
       </div>
     </section>
 
-    <section id="lookupPanel" class="panel lookup-panel hidden" aria-label="Release lookup" tabindex="-1">
+    <section id="lookupPanel" class="panel lookup-panel hidden" role="dialog" aria-modal="false" aria-labelledby="lookupHeading" tabindex="-1">
       <div class="section-heading">
         <div>
           <span class="kicker">OPTIONAL ONLINE LOOKUP</span>
-          <h2>Match this record</h2>
+          <h2 id="lookupHeading">Match this record</h2>
         </div>
         <button id="closeLookup" class="text-button">Close</button>
       </div>
@@ -184,6 +185,54 @@
       </div>
     </section>
 
+    <section class="panel endpoint-panel" aria-labelledby="endpointHeading">
+      <div class="section-heading">
+        <div>
+          <span class="kicker">MUSIC ENDPOINT REVIEW</span>
+          <h2 id="endpointHeading">End where the wanted music ends</h2>
+        </div>
+        <button id="analyzeEndpoints" type="button" disabled>Analyze full-side endpoints</button>
+      </div>
+      <p class="endpoint-explainer">
+        This compares waveform energy, spectral structure, and needle-event morphology over the
+        exact full-side capture. Analysis creates evidence only; it never moves a marker.
+      </p>
+      <div id="endpointStatus" class="endpoint-status" role="status" aria-live="polite">
+        No endpoint proposal in this review session.
+      </div>
+      <div id="endpointProposalBody" class="endpoint-proposal hidden" aria-live="polite">
+        <div class="endpoint-proposal-heading">
+          <span id="endpointProposalBadge" class="endpoint-badge">PENDING REVIEW</span>
+          <code id="endpointProposalIdentity"></code>
+        </div>
+        <div class="endpoint-review-grid">
+          <div>
+            <dl id="endpointProposalMetrics" class="evidence-metrics"></dl>
+            <ul id="endpointProposalReasons" class="evidence-observations"></ul>
+          </div>
+          <aside>
+            <span class="kicker">CONFIRMATION-ONLY NEEDLE EVIDENCE</span>
+            <div id="endpointNeedleEvidence" class="transient-evidence"></div>
+            <p class="evidence-policy">Needle drop and pickup candidates are protected context, never automatic cut points.</p>
+          </aside>
+        </div>
+        <div class="endpoint-audition" role="group" aria-label="Endpoint evidence audition">
+          <button id="reviewEndpointStart" type="button" disabled>Audition + inspect proposed start</button>
+          <button id="reviewEndpointEnd" type="button" disabled>Audition + inspect proposed end</button>
+          <span id="endpointReviewProgress" class="quiet">Review both endpoints before acceptance.</span>
+        </div>
+        <label class="endpoint-intent">
+          <input id="endpointIntent" type="checkbox" disabled>
+          I inspected and auditioned both suggestions. End at the final wanted music, remove lead-in
+          and runout, and preserve quiet intros, fades, and musical tails.
+        </label>
+        <div class="endpoint-decisions">
+          <button id="rejectEndpoints" type="button" disabled>Reject suggestion</button>
+          <button id="acceptEndpoints" class="primary" type="button" disabled>Accept reviewed no-runout endpoints</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel speed-panel" aria-labelledby="speedHeading">
       <div class="section-heading">
         <div>
@@ -228,7 +277,7 @@
           <span class="kicker">CONSERVATIVE RESTORATION</span>
           <h2 id="restorationHeading">Candidate triage + removed-signal proof</h2>
         </div>
-        <span id="restorationStatus" class="status">No click scan in this session</span>
+        <span id="restorationStatus" class="status" role="status" aria-label="Restoration status" aria-live="polite">No click scan in this session</span>
       </div>
       <div class="restoration-scan-controls">
         <label>Scan start (seconds)<input id="restorationScanStart" type="number" min="0" step="0.001" inputmode="decimal"></label>
@@ -249,10 +298,38 @@
           <span class="kicker">MATCHED-LEVEL AUDITION</span>
           <h3 id="restorationPreviewTitle">Select a candidate</h3>
           <p id="restorationPreviewProof" class="quiet">Original and Proposed remain at identical gain. Removed Signal is a declared-gain residue.</p>
-          <div class="audition-stack">
-            <label>ORIGINAL<audio id="restorationOriginal" controls preload="metadata"></audio></label>
-            <label>PROPOSED<audio id="restorationProposed" controls preload="metadata"></audio></label>
-            <label>REMOVED SIGNAL<audio id="restorationRemoved" controls preload="metadata"></audio></label>
+          <div class="restoration-transport" role="group" aria-label="Synchronized restoration audition">
+            <div class="restoration-variant-selector" role="radiogroup" aria-label="Audition signal">
+              <button id="restorationVariantBefore" type="button" role="radio" aria-checked="true" data-restoration-role="before" disabled>Original</button>
+              <button id="restorationVariantProposed" type="button" role="radio" aria-checked="false" data-restoration-role="proposed" disabled>Proposed</button>
+              <button id="restorationVariantRemoved" type="button" role="radio" aria-checked="false" data-restoration-role="removed" disabled>Removed Signal</button>
+            </div>
+            <div class="restoration-transport-controls">
+              <button id="restorationPlayPause" type="button" disabled>Play</button>
+              <label for="restorationSeek">Shared position</label>
+              <input id="restorationSeek" type="range" min="0" max="1" step="0.001" value="0" disabled>
+              <output id="restorationTime" for="restorationSeek">00:00.000 / 00:00.000</output>
+            </div>
+            <p id="restorationTransportStatus" class="quiet" aria-live="polite">Choose a preview to load one sample-aligned transport.</p>
+            <div id="restorationVisuals" class="restoration-visual-grid" role="group" aria-label="Aligned waveform and spectrogram comparison">
+              <figure data-restoration-visual="before">
+                <figcaption>Original <span>1.0x</span></figcaption>
+                <canvas id="restorationCanvasBefore" aria-label="Original waveform and spectrogram"></canvas>
+              </figure>
+              <figure data-restoration-visual="proposed">
+                <figcaption>Proposed <span>1.0x</span></figcaption>
+                <canvas id="restorationCanvasProposed" aria-label="Proposed waveform and spectrogram"></canvas>
+              </figure>
+              <figure data-restoration-visual="removed">
+                <figcaption>Removed Signal <span>declared gain</span></figcaption>
+                <canvas id="restorationCanvasRemoved" aria-label="Removed Signal waveform and spectrogram"></canvas>
+              </figure>
+            </div>
+            <div class="restoration-audio-sources" aria-hidden="true">
+              <audio id="restorationOriginal" preload="metadata"></audio>
+              <audio id="restorationProposed" preload="metadata"></audio>
+              <audio id="restorationRemoved" preload="metadata"></audio>
+            </div>
           </div>
           <div id="restorationPreviewMetrics" class="preview-proof-grid"></div>
         </aside>
@@ -315,11 +392,11 @@
       </div>
     </section>
 
-    <section id="exportPanel" class="panel export-panel hidden" aria-label="Export tracks" tabindex="-1">
+    <section id="exportPanel" class="panel export-panel hidden" role="dialog" aria-modal="false" aria-labelledby="exportHeading" tabindex="-1">
       <div class="section-heading">
         <div>
           <span class="kicker">OUTPUT</span>
-          <h2>Export tracks</h2>
+          <h2 id="exportHeading">Export tracks</h2>
         </div>
         <button id="closeExport" class="text-button">Close</button>
       </div>

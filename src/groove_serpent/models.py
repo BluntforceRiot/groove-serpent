@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +15,7 @@ from .errors import ProjectValidationError
 from .portable_names import portable_name_key
 from .validation import strict_finite_number as _strict_finite_number
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PROJECT_STATE_SCHEMA = "groove-serpent.project-state/1"
 ANALYZER_BASELINE_SCHEMA = "groove-serpent.analyzer-baseline/1"
@@ -37,6 +39,7 @@ MAX_ANALYSIS_WINDOW_MS = 10_000
 MAX_SMOOTHING_WINDOWS = 100_000
 MAX_WAVEFORM_POINTS = 1_000_000
 MAX_PROJECT_REVISION = (1 << 63) - 1
+MAX_APP_VERSION_LENGTH = 128
 MAX_SOURCE_SAMPLE_RATE = 768_000
 MAX_SOURCE_CHANNELS = 64
 MAX_SOURCE_SIZE_BYTES = (1 << 63) - 1
@@ -203,7 +206,14 @@ class AudioSource:
     sha256: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AudioSource":
+    def from_dict(cls, data: Any) -> "AudioSource":
+        data = _require_mapping(data, "Audio source")
+        _require_exact_keys(
+            data,
+            required=set(cls.__dataclass_fields__),
+            optional=set(),
+            label="Audio source",
+        )
         return cls(**data)
 
 
@@ -429,9 +439,15 @@ class Track:
         return max(0.0, self.end_seconds - self.start_seconds)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Track":
-        allowed = {field_name for field_name in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+    def from_dict(cls, data: Any) -> "Track":
+        data = _require_mapping(data, "Track")
+        _require_exact_keys(
+            data,
+            required=set(cls.__dataclass_fields__),
+            optional=set(),
+            label="Track",
+        )
+        return cls(**data)
 
 
 _TRACK_REQUIRED_FIELDS = {
@@ -1109,34 +1125,83 @@ class Project:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
         data = _require_mapping(data, "Project")
-        schema_value = data.get("schema_version", 0)
+        schema_value = data.get("schema_version")
         if type(schema_value) is not int:
             raise ProjectValidationError("The project schema version must be an integer.")
-        schema_version = schema_value
-        if schema_version not in {1, 2, SCHEMA_VERSION}:
+        if schema_value != SCHEMA_VERSION:
+            if schema_value in {1, 2, 3}:
+                raise ProjectValidationError(
+                    f"Project schema {schema_value} is legacy. Run "
+                    "'groove-serpent project migrate PROJECT' before opening it."
+                )
             raise ProjectValidationError(
-                f"Unsupported project schema {schema_version}; expected 1, 2, or {SCHEMA_VERSION}."
+                f"Unsupported project schema {schema_value}; expected {SCHEMA_VERSION}."
             )
-        revision_value = data.get("revision", 1) if schema_version >= 3 else 1
+        required_fields = {
+            "source",
+            "settings",
+            "analysis",
+            "tracks",
+            "metadata",
+            "analyzer_baseline",
+            "edit_history",
+            "checkpoints",
+            "revision",
+            "schema_version",
+            "app_version",
+            "created_at",
+            "updated_at",
+        }
+        _require_exact_keys(
+            data,
+            required=required_fields,
+            optional=set(),
+            label="Project",
+        )
+        settings_data = _require_mapping(data["settings"], "Analysis settings")
+        _require_exact_keys(
+            settings_data,
+            required=set(AnalysisSettings.__dataclass_fields__),
+            optional=set(),
+            label="Analysis settings",
+        )
+        analysis_data = _require_mapping(data["analysis"], "Analysis summary")
+        _require_exact_keys(
+            analysis_data,
+            required=set(AnalysisSummary.__dataclass_fields__),
+            optional=set(),
+            label="Analysis summary",
+        )
+        raw_candidates = analysis_data["candidates"]
+        if not isinstance(raw_candidates, list):
+            raise ProjectValidationError(
+                "Analysis summary candidates must be a JSON array."
+            )
+        for index, item in enumerate(raw_candidates, start=1):
+            candidate_data = _require_mapping(
+                item, f"Boundary candidate {index}"
+            )
+            _require_exact_keys(
+                candidate_data,
+                required=set(BoundaryCandidate.__dataclass_fields__),
+                optional=set(),
+                label=f"Boundary candidate {index}",
+            )
+        revision_value = data["revision"]
         if type(revision_value) is not int or revision_value <= 0:
             raise ProjectValidationError("The project revision must be a positive integer.")
         source = AudioSource.from_dict(data["source"])
-        raw_tracks = data.get("tracks", [])
+        raw_tracks = data["tracks"]
         if not isinstance(raw_tracks, list):
             raise ProjectValidationError("Project tracks must be a JSON array.")
-        tracks = [Track.from_dict(item) for item in raw_tracks]
-        metadata = _validated_metadata(data.get("metadata", {}))
+        tracks = [
+            _strict_track_from_dict(item, f"Project track {index}")
+            for index, item in enumerate(raw_tracks, start=1)
+        ]
+        metadata = _validated_metadata(data["metadata"])
+        analyzer_baseline = AnalyzerBaseline.from_dict(data["analyzer_baseline"])
 
-        missing = object()
-        raw_baseline = data.get("analyzer_baseline", missing) if schema_version >= 3 else missing
-        if raw_baseline is missing or raw_baseline is None:
-            analyzer_baseline = AnalyzerBaseline.capture(
-                tracks, metadata, source.sha256
-            )
-        else:
-            analyzer_baseline = AnalyzerBaseline.from_dict(raw_baseline)
-
-        raw_history = data.get("edit_history", []) if schema_version >= 3 else []
+        raw_history = data["edit_history"]
         if not isinstance(raw_history, list):
             raise ProjectValidationError("Project edit history must be a JSON array.")
         if len(raw_history) > MAX_EDIT_HISTORY:
@@ -1148,7 +1213,7 @@ class Project:
             for index, item in enumerate(raw_history, start=1)
         ]
 
-        raw_checkpoints = data.get("checkpoints", []) if schema_version >= 3 else []
+        raw_checkpoints = data["checkpoints"]
         if not isinstance(raw_checkpoints, list):
             raise ProjectValidationError("Project checkpoints must be a JSON array.")
         if len(raw_checkpoints) > MAX_CHECKPOINTS:
@@ -1160,13 +1225,9 @@ class Project:
             for index, item in enumerate(raw_checkpoints, start=1)
         ]
 
-        app_version = data.get("app_version", "unknown")
-        created_at = data.get("created_at", utc_now_iso())
-        updated_at = data.get("updated_at", utc_now_iso())
-        if not isinstance(app_version, str):
-            raise ProjectValidationError("The project app version must be text.")
-        if not isinstance(created_at, str) or not isinstance(updated_at, str):
-            raise ProjectValidationError("Project timestamps must be text.")
+        app_version = data["app_version"]
+        created_at = data["created_at"]
+        updated_at = data["updated_at"]
         project = cls(
             source=source,
             settings=AnalysisSettings.from_dict(data["settings"]),
@@ -1186,6 +1247,21 @@ class Project:
         return project
 
     def validate(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ProjectValidationError(
+                f"The project schema version must be {SCHEMA_VERSION}."
+            )
+        if (
+            not isinstance(self.app_version, str)
+            or not self.app_version
+            or len(self.app_version) > MAX_APP_VERSION_LENGTH
+            or any(ord(character) < 32 for character in self.app_version)
+        ):
+            raise ProjectValidationError(
+                "The project app version must be non-empty bounded printable text."
+            )
+        _validate_timestamp(self.created_at, "Project creation time")
+        _validate_timestamp(self.updated_at, "Project update time")
         if (
             type(self.revision) is not int
             or not 1 <= self.revision <= MAX_PROJECT_REVISION
@@ -1523,11 +1599,86 @@ class Project:
         self.updated_at = utc_now_iso()
 
 
+def _source_path_kind(value: str) -> str:
+    """Classify a stored source path without touching the filesystem."""
+
+    if "\x00" in value:
+        raise ProjectValidationError("The source path contains a null byte.")
+    windows = value.replace("/", "\\")
+    folded = windows.casefold()
+    if windows.startswith("\\\\"):
+        raise ProjectValidationError(
+            "UNC and Windows device-namespace source paths are not supported."
+        )
+    if folded.startswith(("\\??\\", "\\device\\", "\\global??\\")):
+        raise ProjectValidationError(
+            "Windows device-namespace source paths are not supported."
+        )
+    drive, tail = ntpath.splitdrive(value)
+    if drive:
+        if (
+            len(drive) != 2
+            or drive[1] != ":"
+            or not drive[0].isalpha()
+        ):
+            raise ProjectValidationError(
+                "UNC and Windows device-namespace source paths are not supported."
+            )
+        if not tail.startswith(("\\", "/")):
+            raise ProjectValidationError(
+                "Drive-relative source paths are not supported; use an absolute "
+                "drive path or a project-relative path."
+            )
+        _reject_windows_device_components(tail)
+        return "windows-absolute"
+    if value.startswith("/") and os.name != "nt":
+        return "native-absolute"
+    if windows.startswith("\\"):
+        raise ProjectValidationError(
+            "Rooted Windows source paths require an explicit local drive."
+        )
+    _reject_windows_device_components(value)
+    return "relative"
+
+
+def _reject_windows_device_components(value: str) -> None:
+    """Reject DOS devices and alternate streams in Windows-shaped paths."""
+
+    reserved = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "clock$",
+        "conin$",
+        "conout$",
+    }
+    reserved.update(f"com{suffix}" for suffix in "123456789¹²³")
+    reserved.update(f"lpt{suffix}" for suffix in "123456789¹²³")
+    for component in value.replace("/", "\\").split("\\"):
+        if not component or component in {".", ".."}:
+            continue
+        normalized = component.rstrip(" .")
+        stem = normalized.split(".", 1)[0].rstrip(" .").casefold()
+        if stem in reserved:
+            raise ProjectValidationError(
+                "Windows device-name source paths are not supported."
+            )
+        if ":" in component:
+            raise ProjectValidationError(
+                "Windows alternate-stream source paths are not supported."
+            )
+
+
 def resolve_source_path(project: Project, project_path: Path) -> Path:
-    stored = Path(project.source.path)
+    source_path = project.source.path
+    kind = _source_path_kind(source_path)
+    _reject_windows_device_components(project.source.filename)
+    stored = Path(source_path)
     candidates: list[Path] = []
-    if stored.is_absolute():
-        candidates.append(stored)
+    if kind in {"windows-absolute", "native-absolute"}:
+        if kind != "windows-absolute" or os.name == "nt":
+            candidates.append(stored)
     else:
         candidates.append((project_path.parent / stored).resolve())
     candidates.append((project_path.parent / project.source.filename).resolve())

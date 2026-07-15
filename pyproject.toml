@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "groove-serpent"
-version = "0.5.0a1"
+version = "1.0.0"
 description = "A local-first digitization and conservative restoration tool for vinyl collections."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [
   { name = "Groove Serpent contributors" }
 ]
@@ -15,9 +15,12 @@ keywords = ["audio", "vinyl", "flac", "aac", "splitter", "ffmpeg"]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = ["numpy>=1.26"]

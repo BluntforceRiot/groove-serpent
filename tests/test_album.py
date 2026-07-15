@@ -118,6 +118,13 @@ class AlbumTests(unittest.TestCase):
         return project_path
 
     @staticmethod
+    def _approve_and_save_album(album: AlbumProject, album_path: Path) -> None:
+        """Model the explicit human approval required by publication tests."""
+
+        repin_album_sides(album, album_path)
+        save_album_project(album, album_path)
+
+    @staticmethod
     def _fake_side_export(
         project: Project,
         project_path: Path,
@@ -282,9 +289,10 @@ class AlbumTests(unittest.TestCase):
                 metadata={"artist": "Artist", "album": "Record"},
                 sides=[AlbumSide("A", 1, "side-a.groove.json")],
             )
-            save_album_project(album, path)
+            self._approve_and_save_album(album, path)
             loaded = load_album_project(path)
-            self.assertEqual(loaded.schema, "groove-serpent.album/2")
+            self.assertEqual(loaded.schema, "groove-serpent.album/3")
+            self.assertEqual(loaded.revision, 1)
             self.assertEqual(loaded.sides[0].effective_speed_factor, 1.0)
             self.assertIsNotNone(loaded.sides[0].pin)
             first = suggest_album_output_directory(loaded, path)
@@ -382,7 +390,7 @@ class AlbumTests(unittest.TestCase):
                     metadata={},
                     sides=[AlbumSide("A", 1, "side-a.groove.json")],
                 )
-                save_album_project(album, album_path)
+                self._approve_and_save_album(album, album_path)
                 existing_parent = root / existing_name
                 existing_parent.mkdir()
                 output = root / requested_name / "new-batch"
@@ -482,7 +490,7 @@ class AlbumTests(unittest.TestCase):
                 metadata={},
                 sides=[AlbumSide("A", 1, "side-a.groove.json")],
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "publication"
 
             with (
@@ -696,7 +704,7 @@ class AlbumTests(unittest.TestCase):
             self._write_project(root, "side", ["One"])
             album_path = root / "album.json"
             album = AlbumProject({}, [AlbumSide("A", 1, "side.groove.json")])
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             source_path = root / "side.flac"
             source_path.write_bytes(b"X" * source_path.stat().st_size)
             status = inspect_album_project(load_album_project(album_path), album_path)
@@ -705,7 +713,7 @@ class AlbumTests(unittest.TestCase):
             with self.assertRaisesRegex(ProjectValidationError, "cannot be pinned"):
                 repin_album_sides(load_album_project(album_path), album_path, ["A"])
 
-    def test_legacy_schema_loads_unpinned_and_requires_repin(self) -> None:
+    def test_legacy_schema_requires_explicit_migration_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             root = Path(directory_value)
             self._write_project(root, "side", ["One"])
@@ -732,22 +740,14 @@ class AlbumTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            album = load_album_project(album_path)
-            self.assertEqual(album.schema, "groove-serpent.album/2")
-            self.assertIsNone(album.sides[0].pin)
-            self.assertEqual(album.sides[0].speed.mode, "override")
-            self.assertFalse(
-                inspect_album_project(album, album_path)["ready_for_export"]
-            )
-            with self.assertRaisesRegex(ExportError, "unpinned"):
-                export_album(album, album_path, root / "blocked", formats=["flac"])
-            repin_album_sides(album, album_path, ["A"])
-            save_album_project(album, album_path, overwrite=True)
-            self.assertTrue(
-                inspect_album_project(load_album_project(album_path), album_path)[
-                    "ready_for_export"
-                ]
-            )
+            original = album_path.read_bytes()
+            before = tuple(root.iterdir())
+            with self.assertRaisesRegex(
+                ProjectValidationError, "album migrate ALBUM"
+            ):
+                load_album_project(album_path)
+            self.assertEqual(album_path.read_bytes(), original)
+            self.assertEqual(tuple(root.iterdir()), before)
 
     def test_78_rpm_transfer_inherits_and_exports_verified_sub_half_factor(
         self,
@@ -830,7 +830,7 @@ class AlbumTests(unittest.TestCase):
             )
             album_path = root / "album.json"
             album = AlbumProject({}, [AlbumSide("A", 1, "long-side.groove.json")])
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             with self.assertRaisesRegex(ExportError, "more than 99 tracks"):
                 export_album(album, album_path, root / "blocked", formats=["flac"])
             self.assertFalse((root / "blocked").exists())
@@ -864,7 +864,7 @@ class AlbumTests(unittest.TestCase):
                     ),
                 ],
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "published"
             seen_offsets: list[int] = []
             seen_factors: list[float | None] = []
@@ -959,7 +959,7 @@ class AlbumTests(unittest.TestCase):
                     hashlib.sha256(artwork_bytes).hexdigest(),
                 ),
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             labels: list[str] = []
 
             def observed_copy(*args: object, **kwargs: object):
@@ -1018,7 +1018,7 @@ class AlbumTests(unittest.TestCase):
                         hashlib.sha256(artwork_bytes).hexdigest(),
                     ),
                 )
-                save_album_project(album, album_path)
+                self._approve_and_save_album(album, album_path)
 
                 def corrupt_copy(*args: object, **kwargs: object):
                     receipt = real_stage_verified_copy(*args, **kwargs)
@@ -1057,7 +1057,7 @@ class AlbumTests(unittest.TestCase):
             self._write_project(root, "side", ["One"])
             album_path = root / "album.json"
             album = AlbumProject({}, [AlbumSide("A", 1, "side.groove.json")])
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "exists"
             output.mkdir()
             marker = output / "mine.txt"
@@ -1079,7 +1079,7 @@ class AlbumTests(unittest.TestCase):
                     AlbumSide("B", 2, "side-b.groove.json"),
                 ],
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "failed"
             calls = 0
 
@@ -1252,7 +1252,7 @@ class AlbumTests(unittest.TestCase):
                 {"artist": "Test Artist", "album": "Test Album"},
                 [AlbumSide("A", 1, project_path.name)],
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "exported"
             report = export_album(album, album_path, output, formats=["flac"])
 
@@ -1340,7 +1340,7 @@ class AlbumTests(unittest.TestCase):
                 {"artist": "Test Artist", "album": "Test Album"},
                 [AlbumSide("A", 1, project_path.name)],
             )
-            save_album_project(album, album_path)
+            self._approve_and_save_album(album, album_path)
             output = root / "exported"
             replaced = False
 

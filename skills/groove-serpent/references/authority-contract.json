@@ -1,0 +1,170 @@
+{
+  "schema": "groove-serpent.agent-authority/1",
+  "runtime": {
+    "root_from_skill_directory": "../..",
+    "selection_order": [
+      "windows-portable",
+      "source-checkout"
+    ],
+    "windows_portable": {
+      "required_files": [
+        "groove-serpent.cmd",
+        "PORTABLE-MANIFEST.json",
+        "runtime/python.exe",
+        "verify-portable.cmd",
+        "verify-portable.py"
+      ],
+      "verification": {
+        "before_application_execution": true,
+        "expected_manifest_sha256_source": "separately-trusted-release-receipt-or-explicit-owner-value",
+        "derive_expected_hash_from_bundle": "forbidden",
+        "without_external_expected_hash": "consistency-only-not-authenticity",
+        "required_authenticity": "anchored-to-expected-manifest-sha256",
+        "required_result": "strict-json-zero-exit-and-ok-true",
+        "required_fingerprint_backend": "ffmpeg-chromaprint"
+      },
+      "version_probe": [
+        "groove-serpent.cmd",
+        "--version"
+      ],
+      "system_python": "forbidden",
+      "uv": "not-required"
+    },
+    "source_checkout": {
+      "required_files": [
+        "pyproject.toml",
+        "uv.lock",
+        "src/groove_serpent/__init__.py"
+      ],
+      "version_source": "src/groove_serpent/__init__.py",
+      "version_probe": [
+        "uv",
+        "run",
+        "--frozen",
+        "python",
+        "-m",
+        "groove_serpent",
+        "--version"
+      ],
+      "fingerprint_backend": "ffmpeg-chromaprint-or-fpcalc-after-confirmed-muxer-absence"
+    },
+    "missing_or_ambiguous": "stop"
+  },
+  "privacy": {
+    "audio_upload": "forbidden",
+    "audio_excerpt_upload": "forbidden",
+    "review_server_binding": "loopback-only",
+    "metadata_and_artwork_network": "explicit-owner-action-only"
+  },
+  "identity": {
+    "stale_or_mismatched_state": "stop",
+    "automatic_retry": false,
+    "automatic_overwrite": false,
+    "next_step": "reload-current-state-create-new-artifact-require-new-review"
+  },
+  "json": {
+    "completed_handler_stdout": "one-strict-json-document",
+    "domain_negative_result": "json-report-with-authoritative-nonzero-exit",
+    "usage_or_validation_exception": "nonzero-exit-with-stderr-diagnostic-not-success",
+    "parse": "json-parser-only",
+    "allow_nan": false,
+    "coerce_values": false,
+    "strict_input_unknown_fields": "reject"
+  },
+  "agent_actions": {
+    "unlisted": "forbidden",
+    "allowed": [
+      "inspect-current-state",
+      "analyze-to-new-path",
+      "create-sealed-endpoint-proposal",
+      "inspect-sealed-endpoint-proposal",
+      "create-sealed-speed-proposal",
+      "create-continuous-preview-context",
+      "create-continuous-preview-proposal",
+      "inspect-continuous-preview-catalog",
+      "open-current-continuous-preview-artifact",
+      "create-restoration-scan",
+      "create-restoration-preview",
+      "create-immutable-publication-plan",
+      "preflight-immutable-publication-plan",
+      "verify-publication"
+    ],
+    "conditional": {
+      "execute-immutable-publication-plan": {
+        "explicit_owner_request_for_exact_plan": true,
+        "plan_already_owner_reviewed": true,
+        "fresh_preflight_required": true,
+        "destination_must_not_exist": true
+      },
+      "replay-publication-to-new-path": {
+        "explicit_owner_request_for_exact_publication_and_plan": true,
+        "publication_and_plan_already_owner_reviewed": true,
+        "fresh_preflight_required": true,
+        "destination_must_not_exist": true,
+        "original_publication_must_be_retained": true
+      }
+    },
+    "owner_only": [
+      "attest-audition",
+      "accept-or-reject-endpoint-proposal",
+      "approve-reject-or-protect-restoration-candidate",
+      "apply-metadata-or-topology",
+      "save-reviewed-markers",
+      "repin-album-side",
+      "render-reviewed-restoration",
+      "recover-publication",
+      "reject-continuous-preview-proposal",
+      "render-continuous-preview-audition"
+    ],
+    "forbidden_claims": [
+      "owner-audition-without-current-owner-statement",
+      "fabricated-human-review",
+      "fabricated-checkbox-or-gesture",
+      "approval-inferred-from-score"
+    ],
+    "forbidden_agent_commands": [
+      [
+        "album",
+        "repin"
+      ],
+      [
+        "click-recipe"
+      ],
+      [
+        "click-render"
+      ],
+      [
+        "continuous-preview",
+        "attest"
+      ],
+      [
+        "continuous-preview",
+        "render"
+      ],
+      [
+        "continuous-preview",
+        "reject"
+      ]
+    ],
+    "forbidden_http_post_routes": [
+      "/api/save",
+      "/api/export",
+      "/api/checkpoint",
+      "/api/metadata/apply",
+      "/api/topology/apply",
+      "/api/endpoints/reject",
+      "/api/endpoints/accept",
+      "/api/restoration/recipe",
+      "/api/restoration/render",
+      "/api/album/repin",
+      "/api/album/add-side",
+      "/api/album/remove-side",
+      "/api/album/reorder-sides",
+      "/api/album/update-details",
+      "/api/album/publication/create-plan",
+      "/api/album/publication/execute",
+      "/api/album/publication/replay",
+      "/api/album/publication/recover"
+    ]
+  }
+}

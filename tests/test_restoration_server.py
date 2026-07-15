@@ -3,16 +3,20 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
-import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 from groove_serpent.audio_snapshot import VerifiedAudioSnapshot
 from groove_serpent.errors import ProjectValidationError
-from groove_serpent.media import sha256_file
+from groove_serpent.media import probe_audio, sha256_file
 from groove_serpent.models import (
     AnalysisSettings,
     AnalysisSummary,
@@ -33,6 +37,7 @@ from groove_serpent.review_server import ReviewServer, _compact_restoration_cand
 class RestorationServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self._fake_scan_sequence = 0
         self.directory = Path(self.temporary_directory.name)
         self.source_path = self.directory / "side.flac"
         self.source_path.write_bytes(bytes(range(256)) * 16)
@@ -83,6 +88,9 @@ class RestorationServerTests(unittest.TestCase):
         )
         self.project_path = self.directory / "side.groove.json"
         save_project(project, self.project_path)
+        self._start_server()
+
+    def _start_server(self) -> None:
         self.server = ReviewServer(("127.0.0.1", 0), self.project_path)
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -91,16 +99,32 @@ class RestorationServerTests(unittest.TestCase):
         )
         self.thread.start()
         self.port = self.server.server_address[1]
-        self.base = f"http://127.0.0.1:{self.port}"
+        self.authority = f"{self.server.session_auth.public_host}:{self.port}"
+        self.base = self.server.session_auth.origin(port=self.port)
+        self._server_running = True
 
-    def tearDown(self) -> None:
+    def _stop_server(self) -> None:
+        if not getattr(self, "_server_running", False):
+            return
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self._server_running = False
+
+    def _restart_server(self) -> None:
+        self._stop_server()
+        self._start_server()
+
+    def tearDown(self) -> None:
+        self._stop_server()
         self.temporary_directory.cleanup()
 
     def _state(self) -> dict[str, object]:
-        return json.load(urllib.request.urlopen(self.base + "/api/project"))
+        status, _headers, body = self._request("GET", "/api/project")
+        self.assertEqual(status, 200, body)
+        value = json.loads(body)
+        self.assertIsInstance(value, dict)
+        return value
 
     def _receipt(self, state: dict[str, object] | None = None) -> dict[str, object]:
         state = state or self._state()
@@ -120,9 +144,13 @@ class RestorationServerTests(unittest.TestCase):
         *,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, http.client.HTTPMessage, bytes]:
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request_headers = dict(headers or {})
+        request_headers.setdefault("Host", self.authority)
+        request_headers.setdefault(
+            "Authorization", self.server.session_auth.authorization_header
+        )
         if payload is not None:
             request_headers.setdefault("Content-Type", "application/json")
         connection.request(method, path, body=body, headers=request_headers)
@@ -130,6 +158,33 @@ class RestorationServerTests(unittest.TestCase):
         response_body = response.read()
         result = response.status, response.headers, response_body
         connection.close()
+        return result
+
+    @staticmethod
+    def _wait_for_next_utc_second() -> None:
+        current = int(time.time())
+        deadline = time.monotonic() + 1.2
+        while int(time.time()) == current and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    @staticmethod
+    def _workspace_snapshot(
+        workspace: Path,
+    ) -> dict[str, tuple[str, int, str]]:
+        result: dict[str, tuple[str, int, str]] = {}
+        if not workspace.exists():
+            return result
+        for path in sorted(workspace.rglob("*")):
+            relative = path.relative_to(workspace).as_posix()
+            metadata = path.stat()
+            if path.is_file():
+                result[relative] = (
+                    "file",
+                    metadata.st_mtime_ns,
+                    sha256_file(path),
+                )
+            else:
+                result[relative] = ("directory", metadata.st_mtime_ns, "")
         return result
 
     @staticmethod
@@ -206,9 +261,10 @@ class RestorationServerTests(unittest.TestCase):
         self.assertEqual(source_snapshot.live_path, self.source_path.resolve())
         self.assertNotEqual(source_snapshot.path, self.source_path.resolve())
         self.assertEqual(source_snapshot.sha256, sha256_file(self.source_path))
+        self._fake_scan_sequence += 1
         report = {
             "schema": SCAN_SCHEMA,
-            "created_at": "2026-07-11T12:00:00Z",
+            "created_at": (f"2026-07-11T12:00:{self._fake_scan_sequence:02d}Z"),
             "project": {
                 "path": self.project_path.name,
                 "sha256": sha256_file(self.project_path),
@@ -261,7 +317,14 @@ class RestorationServerTests(unittest.TestCase):
             "schema": PREVIEW_SCHEMA,
             "created_at": "2026-07-11T12:01:00Z",
             "candidates": candidate_ids,
-            "context": {"seconds": context_seconds},
+            "context": {
+                "start_frame": 4_000,
+                "end_frame_exclusive": 6_000,
+                "repair_start_in_preview": 900,
+                "repair_end_in_preview_exclusive": 1_100,
+                "repair_windows": [],
+                "seconds": context_seconds,
+            },
             "files": files,
             "audition": {
                 "before_linear_gain": 1.0,
@@ -325,9 +388,7 @@ class RestorationServerTests(unittest.TestCase):
                 "sample_count": 8_000,
             },
             "repairs": [{"candidate_id": "clk-one"}],
-            "protected": [
-                {"candidate_id": "clk-two", "classification": "needle-pickup"}
-            ],
+            "protected": [{"candidate_id": "clk-two", "classification": "needle-pickup"}],
             "files": {
                 "restored": {
                     "path": restored.name,
@@ -338,9 +399,7 @@ class RestorationServerTests(unittest.TestCase):
                     "bits_per_raw_sample": 16,
                 }
             },
-            "pcm_proof": {
-                "outside_approved_windows_and_channels_identical": True
-            },
+            "pcm_proof": {"outside_approved_windows_and_channels_identical": True},
             "proof": {"source_unchanged": True, "project_unchanged": True},
         }
         (bundle / "render.json").write_text(json.dumps(receipt), encoding="utf-8")
@@ -415,6 +474,8 @@ class RestorationServerTests(unittest.TestCase):
             self.assertEqual(status, 200, body)
             preview_response = json.loads(body)["preview"]
             self.assertEqual(set(preview_response["audio"]), {"before", "proposed", "removed"})
+            for binding in preview_response["audio"].values():
+                self.assertIn("evidence_url", binding)
 
             decisions = [
                 {"candidate_id": "clk-one", "decision": "approved"},
@@ -449,9 +510,7 @@ class RestorationServerTests(unittest.TestCase):
             render_response = json.loads(body)["render"]
             self.assertNotIn("path", render_response["restored"])
             self.assertTrue(
-                render_response["pcm_proof"][
-                    "outside_approved_windows_and_channels_identical"
-                ]
+                render_response["pcm_proof"]["outside_approved_windows_and_channels_identical"]
             )
 
         self.assertEqual(set(workflow_calls), {"scan", "preview", "recipe", "render"})
@@ -495,20 +554,13 @@ class RestorationServerTests(unittest.TestCase):
         )
         for call in workflow_calls.values():
             for value in call[:-1]:
-                if (
-                    isinstance(value, Path)
-                    and value.resolve() != self.project_path.resolve()
-                ):
+                if isinstance(value, Path) and value.resolve() != self.project_path.resolve():
                     self.assertTrue(
-                        value.resolve().is_relative_to(
-                            self.server.restoration_workspace
-                        )
+                        value.resolve().is_relative_to(self.server.restoration_workspace)
                     )
 
         before_url = preview_response["audio"]["before"]["url"]
-        status, headers, ranged = self._request(
-            "GET", before_url, headers={"Range": "bytes=1-4"}
-        )
+        status, headers, ranged = self._request("GET", before_url, headers={"Range": "bytes=1-4"})
         self.assertEqual(status, 206)
         self.assertEqual(headers["Content-Type"], "audio/flac")
         self.assertEqual(ranged, b"RIGI")
@@ -517,20 +569,324 @@ class RestorationServerTests(unittest.TestCase):
             "GET", f"/api/restoration/audio/{scan_response['token']}"
         )
         self.assertEqual(status, 404)
+        status, _headers, _body = self._request("GET", "/api/restoration/audio/../../side.flac")
+        self.assertEqual(status, 404)
+        evidence_url = preview_response["audio"]["before"]["evidence_url"]
+        status, _headers, _body = self._request("GET", evidence_url + "?start=0")
+        self.assertEqual(status, 400)
         status, _headers, _body = self._request(
-            "GET", "/api/restoration/audio/../../side.flac"
+            "GET", "/api/restoration/evidence/../../side.flac"
         )
         self.assertEqual(status, 404)
 
         status, _headers, body = self._request("GET", "/api/restoration/status")
         self.assertEqual(status, 200, body)
         status_payload = json.loads(body)
-        self.assertEqual(status_payload["persistence_scope"], "current-server-session")
+        self.assertEqual(status_payload["persistence_scope"], "verified-project-workspace")
         self.assertEqual(status_payload["current_scan"]["token"], scan_response["token"])
         self.assertEqual(status_payload["current_recipe"]["token"], recipe_response["token"])
         self.assertEqual(status_payload["current_render"]["token"], render_response["token"])
         self.assertEqual(self.project_path.read_bytes(), original_project)
         self.assertEqual(self.source_path.read_bytes(), original_source)
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"),
+        "FFmpeg is required for restart fidelity coverage",
+    )
+    def test_verified_restoration_catalog_survives_restart_and_excludes_drift(
+        self,
+    ) -> None:
+        workspace = self.server.restoration_workspace
+        self._stop_server()
+        if workspace.exists():
+            shutil.rmtree(workspace)
+
+        sample_rate = 22_050
+        frame_count = 22_050
+        click_start = 11_000
+        time_axis = np.arange(frame_count, dtype=np.float64) / sample_rate
+        left = 0.20 * np.sin(2.0 * np.pi * 233.0 * time_axis)
+        right = 0.18 * np.sin(2.0 * np.pi * 311.0 * time_axis + 0.2)
+        pcm = np.rint(np.column_stack((left, right)) * 32_767.0).astype("<i2")
+        pcm[click_start : click_start + 24, 0] = np.iinfo(np.int16).min
+        completed = subprocess.run(
+            [
+                shutil.which("ffmpeg") or "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "2",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "8",
+                "-sample_fmt",
+                "s16",
+                str(self.source_path),
+            ],
+            input=pcm.tobytes(),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.fail(completed.stderr.decode("utf-8", errors="replace"))
+        audio = probe_audio(self.source_path, stored_path=self.source_path.name)
+        assert audio.sample_count is not None
+        project = Project(
+            source=audio,
+            settings=AnalysisSettings(min_track_seconds=0.1),
+            analysis=AnalysisSummary(
+                music_start_seconds=0.0,
+                music_end_seconds=audio.duration_seconds,
+                noise_floor_db=-60.0,
+                silence_threshold_db=-54.0,
+                active_threshold_db=-42.0,
+                envelope_window_seconds=0.05,
+            ),
+            tracks=[
+                Track(
+                    number=1,
+                    title="Restart fidelity",
+                    start_sample=0,
+                    end_sample=audio.sample_count,
+                    start_seconds=0.0,
+                    end_seconds=audio.sample_count / audio.sample_rate,
+                )
+            ],
+        )
+        save_project(project, self.project_path)
+        self._start_server()
+
+        receipt = self._receipt()
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/scan",
+            {**receipt, "max_candidates": 100},
+        )
+        self.assertEqual(status, 200, body)
+        scan = json.loads(body)["scan"]
+        repairable = [
+            candidate
+            for candidate in scan["candidates"]
+            if candidate["repairable"] and candidate["type"] == "clipped"
+        ]
+        self.assertTrue(repairable, scan)
+        approved_id = repairable[0]["id"]
+
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/preview",
+            {
+                **receipt,
+                "scan_token": scan["token"],
+                "candidate_ids": [approved_id],
+                "context_seconds": 0.1,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)["preview"]
+        decisions = [
+            {
+                "candidate_id": candidate["id"],
+                "decision": ("approved" if candidate["id"] == approved_id else "rejected"),
+            }
+            for candidate in scan["candidates"]
+        ]
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/recipe",
+            {
+                **receipt,
+                "scan_token": scan["token"],
+                "decisions": decisions,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        recipe = json.loads(body)["recipe"]
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/render",
+            {
+                **receipt,
+                "scan_token": scan["token"],
+                "recipe_token": recipe["token"],
+            },
+        )
+        self.assertEqual(status, 200, body)
+        render = json.loads(body)["render"]
+
+        restoration_before = self._workspace_snapshot(workspace)
+        project_before = (
+            self.project_path.read_bytes(),
+            self.project_path.stat().st_mtime_ns,
+        )
+        source_before = (
+            self.source_path.read_bytes(),
+            self.source_path.stat().st_mtime_ns,
+        )
+        self._restart_server()
+        self.assertEqual(self._workspace_snapshot(workspace), restoration_before)
+        self.assertEqual(
+            (
+                self.project_path.read_bytes(),
+                self.project_path.stat().st_mtime_ns,
+            ),
+            project_before,
+        )
+        self.assertEqual(
+            (
+                self.source_path.read_bytes(),
+                self.source_path.stat().st_mtime_ns,
+            ),
+            source_before,
+        )
+
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        self.assertEqual(status, 200, body)
+        restarted = json.loads(body)
+        self.assertEqual(restarted["current_scan"]["token"], scan["token"])
+        self.assertEqual(restarted["current_recipe"]["token"], recipe["token"])
+        self.assertEqual(restarted["current_preview"]["token"], preview["token"])
+        self.assertEqual(restarted["current_render"]["token"], render["token"])
+        self.assertEqual(
+            restarted["current_preview"]["audio"]["before"]["token"],
+            preview["audio"]["before"]["token"],
+        )
+        self.assertEqual(
+            restarted["current_preview"]["audio"]["before"]["evidence_url"],
+            preview["audio"]["before"]["evidence_url"],
+        )
+        self.assertEqual(restarted["artifact_counts"]["stale"], 0)
+        self.assertEqual(restarted["artifact_counts"]["invalid"], 0)
+
+        before_url = restarted["current_preview"]["audio"]["before"]["url"]
+        status, headers, ranged = self._request("GET", before_url, headers={"Range": "bytes=0-7"})
+        self.assertEqual(status, 206)
+        self.assertEqual(headers["Content-Type"], "audio/flac")
+        self.assertEqual(len(ranged), 8)
+
+        workspace_before_visuals = self._workspace_snapshot(workspace)
+        visual_payloads: dict[str, dict[str, object]] = {}
+        for role in ("before", "proposed", "removed"):
+            binding = restarted["current_preview"]["audio"][role]
+            status, _headers, body = self._request(
+                "GET", binding["evidence_url"]
+            )
+            self.assertEqual(status, 200, body)
+            visual = json.loads(body)
+            self.assertEqual(visual["role"], role)
+            self.assertEqual(visual["preview_token"], preview["token"])
+            self.assertEqual(visual["audio_token"], binding["token"])
+            self.assertEqual(visual["audio_sha256"], binding["sha256"])
+            self.assertEqual(visual["evidence"]["source"]["sha256"], binding["sha256"])
+            self.assertTrue(visual["evidence"]["waveform"]["channels"])
+            self.assertTrue(visual["evidence"]["spectrogram"]["dbfs"])
+            self.assertTrue(visual["alignment"]["matched_audio_geometry"])
+            self.assertNotIn(str(self.directory).casefold(), body.decode().casefold())
+            visual_payloads[role] = visual
+        alignment_keys = {
+            "source_start_sample",
+            "source_end_sample_exclusive",
+            "focus_source_sample",
+            "repair_start_source_sample",
+            "repair_end_source_sample_exclusive",
+        }
+        reference_alignment = visual_payloads["before"]["alignment"]
+        for payload in visual_payloads.values():
+            self.assertEqual(
+                {key: payload["alignment"][key] for key in alignment_keys},
+                {key: reference_alignment[key] for key in alignment_keys},
+            )
+        self.assertEqual(
+            visual_payloads["before"]["alignment"]["declared_linear_gain"],
+            1.0,
+        )
+        self.assertEqual(
+            visual_payloads["proposed"]["alignment"]["declared_linear_gain"],
+            1.0,
+        )
+        self.assertGreater(
+            visual_payloads["removed"]["alignment"]["declared_linear_gain"],
+            1.0,
+        )
+        self.assertEqual(self._workspace_snapshot(workspace), workspace_before_visuals)
+
+        self._wait_for_next_utc_second()
+        refreshed_receipt = self._receipt()
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/preview",
+            {
+                **refreshed_receipt,
+                "scan_token": scan["token"],
+                "candidate_ids": [approved_id],
+                "context_seconds": 0.2,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        newer_preview = json.loads(body)["preview"]
+        self.assertNotEqual(newer_preview["token"], preview["token"])
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        coherent = json.loads(body)
+        self.assertEqual(coherent["current_preview"]["token"], newer_preview["token"])
+        self.assertEqual(coherent["current_scan"]["token"], scan["token"])
+        self.assertEqual(coherent["current_recipe"]["token"], recipe["token"])
+        self.assertEqual(coherent["current_render"]["token"], render["token"])
+
+        self._wait_for_next_utc_second()
+        status, _headers, body = self._request(
+            "POST",
+            "/api/restoration/scan",
+            {**refreshed_receipt, "max_candidates": 100},
+        )
+        self.assertEqual(status, 200, body)
+        newer_scan = json.loads(body)["scan"]
+        self.assertNotEqual(newer_scan["token"], scan["token"])
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        reset = json.loads(body)
+        self.assertEqual(reset["current_scan"]["token"], newer_scan["token"])
+        self.assertIsNone(reset["current_recipe"])
+        self.assertIsNone(reset["current_preview"])
+        self.assertIsNone(reset["current_render"])
+
+        self._stop_server()
+        corrupt = workspace / f"scan-{'f' * 32}.json"
+        corrupt.write_bytes(b"not-json")
+        changed = load_project(self.project_path)
+        changed.metadata["restart-test"] = "stale all prior artifacts"
+        save_project(changed, self.project_path)
+        stale_workspace_before = self._workspace_snapshot(workspace)
+        stale_project_before = self.project_path.read_bytes()
+        stale_source_before = self.source_path.read_bytes()
+        self._start_server()
+        self.assertEqual(self._workspace_snapshot(workspace), stale_workspace_before)
+        self.assertEqual(self.project_path.read_bytes(), stale_project_before)
+        self.assertEqual(self.source_path.read_bytes(), stale_source_before)
+
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        self.assertEqual(status, 200, body)
+        diagnostic = json.loads(body)
+        self.assertEqual(diagnostic["artifact_counts"]["artifacts"], 0)
+        self.assertGreaterEqual(diagnostic["artifact_counts"]["stale"], 6)
+        self.assertGreaterEqual(diagnostic["artifact_counts"]["invalid"], 1)
+        self.assertIsNone(diagnostic["current_scan"])
+        self.assertIsNone(diagnostic["current_recipe"])
+        self.assertIsNone(diagnostic["current_preview"])
+        self.assertIsNone(diagnostic["current_render"])
+        self.assertIn(
+            "invalid_json",
+            diagnostic["catalog_diagnostics"]["invalid"]["by_code"],
+        )
+        self.assertNotIn(str(self.directory).casefold(), body.decode().casefold())
 
     def test_scan_rejects_unknown_fields_and_non_strict_numbers(self) -> None:
         receipt = self._receipt()
@@ -614,9 +970,7 @@ class RestorationServerTests(unittest.TestCase):
                     "scan_token": scan["token"],
                     **extra,
                 }
-                status, _headers, _body = self._request(
-                    "POST", "/api/restoration/preview", payload
-                )
+                status, _headers, _body = self._request("POST", "/api/restoration/preview", payload)
                 self.assertEqual(status, 400)
         workflow.assert_not_called()
 
@@ -703,9 +1057,7 @@ class RestorationServerTests(unittest.TestCase):
 
         with patch("groove_serpent.review_server.scan_project_clicks", side_effect=capture):
             for _ in range(2):
-                status, _headers, body = self._request(
-                    "POST", "/api/restoration/scan", receipt
-                )
+                status, _headers, body = self._request("POST", "/api/restoration/scan", receipt)
                 self.assertEqual(status, 200, body)
         self.assertEqual(len(set(generated)), 2)
         for path in generated:
@@ -756,9 +1108,7 @@ class RestorationServerTests(unittest.TestCase):
             )
         self.assertEqual(status, 400, body)
         self.assertEqual(self.server.restoration_audio, {})
-        self.assertEqual(
-            list(self.server.restoration_workspace.glob("preview-*")), []
-        )
+        self.assertEqual(list(self.server.restoration_workspace.glob("preview-*")), [])
 
     def test_failed_postcommit_source_lease_removes_unregistered_scan(self) -> None:
         generated: list[Path] = []
@@ -773,9 +1123,7 @@ class RestorationServerTests(unittest.TestCase):
             "groove_serpent.review_server.scan_project_clicks",
             side_effect=changed_source_after_scan,
         ):
-            status, _headers, body = self._request(
-                "POST", "/api/restoration/scan", self._receipt()
-            )
+            status, _headers, body = self._request("POST", "/api/restoration/scan", self._receipt())
 
         self.assertEqual(status, 400, body)
         self.assertEqual(len(generated), 1)

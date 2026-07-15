@@ -42,6 +42,7 @@ def run_bounded_capture(
     *,
     stdout_limit: int = MAX_DIAGNOSTIC_BYTES,
     stderr_limit: int = MAX_DIAGNOSTIC_BYTES,
+    timeout: float | None = None,
 ) -> BoundedProcessResult:
     """Run a short tool query without stdin or unbounded captured output."""
 
@@ -49,6 +50,8 @@ def run_bounded_capture(
         raise ValueError("A media command cannot be empty.")
     if stdout_limit < 1 or stderr_limit < 1:
         raise ValueError("Media output limits must be positive.")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("Media command timeout must be positive.")
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         completed = subprocess.run(
             command,
@@ -56,6 +59,7 @@ def run_bounded_capture(
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
+            timeout=timeout,
         )
         stdout, stdout_truncated = _bounded_file_prefix(stdout_file, stdout_limit)
         stderr, stderr_truncated = _bounded_file_prefix(stderr_file, stderr_limit)

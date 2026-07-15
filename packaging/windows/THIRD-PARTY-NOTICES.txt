@@ -1,0 +1,63 @@
+Groove Serpent Windows portable candidate component notice
+
+This notice describes the exact Groove Serpent 1.0.0 candidate assembled for
+1.0 acceptance. It is evidence for release review, not legal advice or a
+legal-compliance certification.
+
+Groove Serpent 1.0.0
+Copyright Groove Serpent contributors.
+Licensed under Apache License 2.0. The complete text is shipped as
+LICENSES/GROOVE-SERPENT-LICENSE.txt.
+
+Python 3.13.5 Windows embeddable runtime
+Copyright Python Software Foundation and contributors.
+The runtime's own LICENSE.txt is retained at runtime/LICENSE.txt.
+
+NumPy 2.4.6
+Copyright NumPy developers.
+NumPy and its bundled third-party license texts are retained from the exact
+wheel under app/numpy-2.4.6.dist-info/licenses.
+
+Groove Serpent minimal Windows media runtime
+Profile groove-serpent-minimal-audio-shared-v1, built around FFmpeg and
+ffprobe 8.1.2. The exact executable identity lines exercised by the candidate
+begin with:
+
+ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+ffprobe version 8.1.2 Copyright (c) 2007-2026 the FFmpeg developers
+
+The runtime carries shared FFmpeg libraries, Chromaprint 1.6.0 using KissFFT,
+libsoxr 0.1.3, zlib 1.3.2, and its MinGW/GCC runtime notices. Their exact
+license and build-evidence files remain under tools/LICENSES and tools/. The
+runtime archive supplied to the portable builder has SHA-256:
+
+46456d710c419b0660effb49242905c131c8dc1fd0e87764c9775789d8e169d8
+
+The exact corresponding-source archive has SHA-256:
+
+5b65dc2a7aa0a4faf9972e1f3f4ceb52c32473003a02b321655b65e518481a3e
+
+It is carried inside every portable transport at:
+
+CORRESPONDING-SOURCE/groove-serpent-windows-media-8.1.2-corresponding-source.zip
+
+The source companion contains the exact upstream source archives, detached
+signatures and pinned public keys, Ubuntu 24.04 package inventory, deterministic
+build recipe, capability-smoke implementation, and artifact verifier used for
+the media runtime. The portable manifest binds both archive hashes and the
+carried source bytes. Removing or changing the source companion makes portable
+verification and packaging fail closed.
+
+The FFmpeg configure evidence reports LGPL version 2.1 or later with the GPL,
+nonfree, and version-3 build flags disabled. Shared FFmpeg, Chromaprint, and
+libsoxr libraries remain separately replaceable in the portable directory.
+These facts do not substitute for legal review of a public distribution.
+
+Code signing and platform acceptance
+
+This candidate is unsigned. It makes no Authenticode, publisher identity,
+SmartScreen reputation, notarization, general antivirus compatibility, or
+independent clean-machine certification claim. Each requires separate
+candidate-specific validation before making the corresponding claim; none is
+implied by publishing an unsigned, hash-verifiable portable build. Any exact
+Microsoft Defender evidence is identified separately in the release receipt.

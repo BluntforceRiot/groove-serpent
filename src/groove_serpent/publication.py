@@ -13,7 +13,7 @@ from typing import Any, Mapping
 from .errors import ExportError
 
 
-PUBLICATION_MANIFEST_SCHEMA = "groove-serpent.publication-manifest/1"
+PUBLICATION_MANIFEST_SCHEMA = "groove-serpent.publication-manifest/2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,21 +54,27 @@ class FileReceipt:
         return values
 
     def same_file_object(self, other: "FileReceipt") -> bool:
-        """Compare handle/path identity without Windows' API-dependent ctime value.
+        """Compare handle/path identity across the platform's stat APIs.
 
         CPython 3.13 on Windows can report the same NTFS file's ``st_ctime_ns``
         with slightly different precision through ``fstat`` and ``stat``.  Change
         time remains part of every captured receipt and is compared between stable
         handles/operations, but it cannot be used to prove that an open handle and
-        its path refer to the same file object.
+        its path refer to the same file object.  Windows also synthesizes different
+        permission bits for some executable files through ``fstat`` and ``stat``;
+        retain the file-type bits there while exact receipts still preserve and
+        compare the original modes across like-for-like observations.
         """
+
+        self_mode = stat.S_IFMT(self.mode) if os.name == "nt" else self.mode
+        other_mode = stat.S_IFMT(other.mode) if os.name == "nt" else other.mode
 
         return (
             self.size_bytes,
             self.modified_ns,
             self.device,
             self.inode,
-            self.mode,
+            self_mode,
             self.birth_ns,
             self.file_attributes,
         ) == (
@@ -76,7 +82,7 @@ class FileReceipt:
             other.modified_ns,
             other.device,
             other.inode,
-            other.mode,
+            other_mode,
             other.birth_ns,
             other.file_attributes,
         )

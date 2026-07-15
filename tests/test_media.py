@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import struct
 import subprocess
 import unittest
@@ -49,11 +50,32 @@ class _ExplodingStream(io.BytesIO):
 
 
 class MediaTests(unittest.TestCase):
+    def test_analysis_emits_partial_terminal_rms_window(self) -> None:
+        samples = [0.25] * 2_000 + [0.5] * 40
+        process = _FakeProcess(io.BytesIO(struct.pack("<2040f", *samples)))
+
+        with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
+            "groove_serpent.media.subprocess.Popen", return_value=process
+        ):
+            values, window_seconds = decode_rms_envelope(
+                Path("side.flac"), analysis_rate=8_000, window_ms=50
+            )
+
+        self.assertEqual(len(values), 6)
+        self.assertAlmostEqual(values[0], 20.0 * math.log10(0.25))
+        self.assertAlmostEqual(values[-1], 20.0 * math.log10(0.5))
+        self.assertEqual(window_seconds, 0.05)
+
     def test_ffmpeg_version_query_uses_shared_noninteractive_bounded_policy(self) -> None:
         observed: dict[str, object] = {}
 
-        def fake_run(command, *, check, stdin, stdout, stderr):
-            observed.update(command=command, check=check, stdin=stdin)
+        def fake_run(command, *, check, stdin, stdout, stderr, timeout):
+            observed.update(
+                command=command,
+                check=check,
+                stdin=stdin,
+                timeout=timeout,
+            )
             stdout.write(b"ffmpeg version bounded-test\n")
             return subprocess.CompletedProcess(command, 0)
 
@@ -65,6 +87,7 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(version, "ffmpeg version bounded-test")
         self.assertIn("-nostdin", observed["command"])
         self.assertIs(observed["stdin"], subprocess.DEVNULL)
+        self.assertIsNone(observed["timeout"])
 
     def test_analysis_stderr_is_drained_with_a_bounded_capture(self) -> None:
         captured: dict[str, object] = {}

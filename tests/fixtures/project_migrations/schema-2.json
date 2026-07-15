@@ -1,0 +1,69 @@
+{
+  "source": {
+    "path": "capture.flac",
+    "filename": "capture.flac",
+    "size_bytes": 123456,
+    "modified_ns": 1700000000000000000,
+    "duration_seconds": 10.0,
+    "sample_rate": 1000,
+    "channels": 2,
+    "codec_name": "flac",
+    "bits_per_raw_sample": 24,
+    "sample_format": "s32",
+    "sample_count": 10000,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "settings": {
+    "analysis_rate": 8000,
+    "window_ms": 50,
+    "smoothing_windows": 5,
+    "threshold_margin_db": 6.0,
+    "min_gap_seconds": 0.75,
+    "max_gap_seconds": 15.0,
+    "min_track_seconds": 1.0,
+    "active_run_seconds": 0.45,
+    "lead_in_seconds": 0.2,
+    "tail_seconds": 0.35,
+    "auto_boundary_score": 0.55,
+    "waveform_points": 4000
+  },
+  "analysis": {
+    "music_start_seconds": 0.0,
+    "music_end_seconds": 10.0,
+    "noise_floor_db": -50.0,
+    "silence_threshold_db": -44.0,
+    "active_threshold_db": -32.0,
+    "envelope_window_seconds": 0.05,
+    "candidates": [],
+    "waveform": [0.0, 0.25, 0.5]
+  },
+  "tracks": [
+    {
+      "number": 1,
+      "title": "Sanitized Track",
+      "start_sample": 0,
+      "end_sample": 10000,
+      "start_seconds": 0.0,
+      "end_seconds": 10.0,
+      "confidence": 0.75,
+      "artist": "Fixture Artist",
+      "album": "Fixture Album",
+      "album_artist": "Fixture Artist",
+      "year": "2026",
+      "genre": "Test",
+      "side": "A",
+      "expected_duration_seconds": 10.0,
+      "musicbrainz_recording_id": "",
+      "musicbrainz_track_id": ""
+    }
+  ],
+  "metadata": {
+    "album": "Fixture Album",
+    "artist": "Fixture Artist",
+    "side": "A"
+  },
+  "schema_version": 2,
+  "app_version": "0.2.0.dev1",
+  "created_at": "2026-07-11T01:00:00+00:00",
+  "updated_at": "2026-07-11T01:30:00+00:00"
+}

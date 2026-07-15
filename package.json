@@ -1,0 +1,19 @@
+{
+  "name": "groove-serpent-browser-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Development-only browser and accessibility acceptance for Groove Serpent.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:chromium": "playwright test --project=chromium",
+    "test:browser:install": "playwright install chromium firefox webkit"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1"
+  }
+}

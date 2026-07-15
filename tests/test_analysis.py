@@ -18,7 +18,7 @@ from groove_serpent.analysis import (
     select_boundaries,
     smooth_envelope,
 )
-from groove_serpent.errors import ProjectValidationError
+from groove_serpent.errors import ProjectValidationError, UnsupportedCaptureError
 from groove_serpent.models import AnalysisSettings, AudioSource, BoundaryCandidate
 from groove_serpent.tracklist import TrackSeed
 
@@ -128,11 +128,7 @@ class AnalysisTests(unittest.TestCase):
 
     def test_quiet_edges_use_the_lower_boundary_threshold(self) -> None:
         envelope = np.asarray(
-            [-60.0] * 20
-            + [-38.0] * 20
-            + [-15.0] * 40
-            + [-38.0] * 20
-            + [-60.0] * 20,
+            [-60.0] * 20 + [-38.0] * 20 + [-15.0] * 40 + [-38.0] * 20 + [-60.0] * 20,
             dtype=np.float64,
         )
         bounds = find_music_bounds(
@@ -229,9 +225,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertGreater(selected[0].score, 0.08)
 
     def test_first_sustained_handles_runs_longer_than_int16(self) -> None:
-        mask = np.concatenate(
-            [np.zeros(7, dtype=np.bool_), np.ones(40_000, dtype=np.bool_)]
-        )
+        mask = np.concatenate([np.zeros(7, dtype=np.bool_), np.ones(40_000, dtype=np.bool_)])
         self.assertEqual(_first_sustained(mask, 32_768), 7)
 
     def test_silent_envelope_does_not_create_midpoint_boundary(self) -> None:
@@ -255,9 +249,11 @@ class AnalysisTests(unittest.TestCase):
             size_bytes=1,
             modified_ns=0,
             duration_seconds=20.0,
-            sample_rate=1_000,
+            sample_rate=44_100,
             channels=2,
             codec_name="pcm_s16le",
+            bits_per_raw_sample=16,
+            sample_count=882_000,
         )
         with tempfile.TemporaryDirectory() as directory_value:
             source_path = Path(directory_value) / "silent.wav"
@@ -279,7 +275,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(project.analysis.candidates, [])
         self.assertEqual(len(project.tracks), 1)
         self.assertEqual(project.tracks[0].start_sample, 0)
-        self.assertEqual(project.tracks[0].end_sample, 20_000)
+        self.assertEqual(project.tracks[0].end_sample, 882_000)
         self.assertEqual(project.source.path, "silent.wav")
         self.assertEqual(project.source.filename, "silent.wav")
         self.assertEqual(project.source.sha256, hashlib.sha256(b"x").hexdigest())
@@ -295,9 +291,11 @@ class AnalysisTests(unittest.TestCase):
             size_bytes=1,
             modified_ns=0,
             duration_seconds=100.0,
-            sample_rate=1_000,
+            sample_rate=44_100,
             channels=2,
             codec_name="pcm_s16le",
+            bits_per_raw_sample=16,
+            sample_count=4_410_000,
         )
         with tempfile.TemporaryDirectory() as directory_value:
             source_path = Path(directory_value) / "conservative.wav"
@@ -354,12 +352,14 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual([track.side for track in tracks], ["A", "B"])
 
     def test_invalid_expected_count_is_rejected_before_decoding(self) -> None:
-        with patch("groove_serpent.analysis.probe_audio") as probe, patch(
-            "groove_serpent.analysis.decode_rms_envelope"
-        ) as decode:
+        with (
+            patch("groove_serpent.analysis.probe_audio") as probe,
+            patch("groove_serpent.analysis.decode_rms_envelope") as decode,
+        ):
             for invalid in (0, 1_001, 10**10_000):
-                with self.subTest(invalid=invalid), self.assertRaisesRegex(
-                    ValueError, "at least 1"
+                with (
+                    self.subTest(invalid=invalid),
+                    self.assertRaisesRegex(ValueError, "at least 1"),
                 ):
                     analyze_audio(
                         Path("silent.wav"),
@@ -368,6 +368,37 @@ class AnalysisTests(unittest.TestCase):
                         expected_track_count=invalid,
                     )
         probe.assert_not_called()
+        decode.assert_not_called()
+
+    def test_unsupported_capture_is_rejected_before_decode(self) -> None:
+        source = AudioSource(
+            path="lossy.m4a",
+            filename="lossy.m4a",
+            size_bytes=100,
+            modified_ns=1,
+            duration_seconds=10.0,
+            sample_rate=44_100,
+            channels=2,
+            codec_name="aac",
+            bits_per_raw_sample=16,
+            sample_count=441_000,
+        )
+        with tempfile.TemporaryDirectory() as directory_value:
+            source_path = Path(directory_value) / "lossy.m4a"
+            source_path.write_bytes(b"not decoded")
+            with (
+                patch("groove_serpent.analysis.probe_audio", return_value=source),
+                patch("groove_serpent.analysis.decode_rms_envelope") as decode,
+                self.assertRaisesRegex(
+                    UnsupportedCaptureError,
+                    "outside lossless-vinyl-capture-v1",
+                ),
+            ):
+                analyze_audio(
+                    source_path,
+                    stored_source_path=source_path.name,
+                    settings=AnalysisSettings(),
+                )
         decode.assert_not_called()
 
     def test_analysis_uses_snapshot_during_live_swap_and_restore(self) -> None:
@@ -391,10 +422,11 @@ class AnalysisTests(unittest.TestCase):
                     size_bytes=path.stat().st_size,
                     modified_ns=path.stat().st_mtime_ns,
                     duration_seconds=10.0,
-                    sample_rate=1_000,
+                    sample_rate=44_100,
                     channels=2,
                     codec_name="flac",
-                    sample_count=10_000,
+                    bits_per_raw_sample=16,
+                    sample_count=441_000,
                     sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 )
 

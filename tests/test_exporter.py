@@ -16,6 +16,7 @@ from unittest import mock
 
 import groove_serpent.exporter as exporter_module
 import groove_serpent.portable_names as portable_names_module
+import groove_serpent.publication as publication_module
 from groove_serpent.errors import ExportError, GrooveSerpentError
 from groove_serpent.exporter import (
     _build_command,
@@ -23,6 +24,7 @@ from groove_serpent.exporter import (
     _speed_corrected_sample,
     _speed_correction_details,
     export_project,
+    render_verified_track,
     sanitize_filename,
     suggest_output_directory,
 )
@@ -102,6 +104,33 @@ class ExporterTests(unittest.TestCase):
 
         self.assertNotEqual(handle_receipt, path_receipt)
         self.assertTrue(handle_receipt.same_file_object(path_receipt))
+
+    def test_file_receipt_tolerates_only_windows_synthesized_permission_bits(
+        self,
+    ) -> None:
+        handle_receipt = FileReceipt(
+            sha256="a" * 64,
+            size_bytes=123,
+            modified_ns=456,
+            status_changed_ns=789,
+            device=12,
+            inode=34,
+            mode=0o100666,
+            birth_ns=123,
+            file_attributes=32,
+        )
+        executable_path_receipt = replace(handle_receipt, mode=0o100777)
+        directory_receipt = replace(handle_receipt, mode=0o040777)
+
+        with mock.patch.object(publication_module.os, "name", "nt"):
+            self.assertTrue(
+                handle_receipt.same_file_object(executable_path_receipt)
+            )
+            self.assertFalse(handle_receipt.same_file_object(directory_receipt))
+        with mock.patch.object(publication_module.os, "name", "posix"):
+            self.assertFalse(
+                handle_receipt.same_file_object(executable_path_receipt)
+            )
 
     def test_file_receipt_accepts_stat_without_optional_platform_fields(self) -> None:
         portable_stat = SimpleNamespace(
@@ -598,7 +627,7 @@ class ExporterTests(unittest.TestCase):
         index = command.index("-movie_timescale")
         self.assertEqual(command[index + 1], "48000")
         self.assertEqual(
-            command[command.index("-movflags") + 1], "+faststart+use_metadata_tags"
+            command[command.index("-movflags") + 1], "+faststart"
         )
         self.assertTrue(
             command[command.index("-af") + 1].endswith("asettb=expr=1/48000,asetpts=N")
@@ -921,7 +950,7 @@ class ExporterTests(unittest.TestCase):
             source_path.write_bytes(b"source")
             project = self._project(source_path, bits=24, rate=48_000)
             output_dir = directory / "library" / "new-batch"
-            real_rename = os.rename
+            real_publish = exporter_module.rename_no_replace
             observed: dict[str, object] = {}
 
             def fake_ffmpeg(command: list[str]) -> None:
@@ -946,7 +975,7 @@ class ExporterTests(unittest.TestCase):
                         for item in staged_manifest["files"]
                     )
                 )
-                real_rename(stage, destination)
+                real_publish(stage, destination)
 
             with (
                 mock.patch(
@@ -960,7 +989,7 @@ class ExporterTests(unittest.TestCase):
                     return_value=48_000,
                 ),
                 mock.patch(
-                    "groove_serpent.exporter.os.rename", side_effect=publish
+                    "groove_serpent.exporter.rename_no_replace", side_effect=publish
                 ) as rename_call,
             ):
                 report = export_project(
@@ -1249,7 +1278,7 @@ class ExporterTests(unittest.TestCase):
                     "groove_serpent.exporter.run_ffmpeg", side_effect=fake_ffmpeg
                 ),
                 mock.patch(
-                    "groove_serpent.exporter.os.rename",
+                    "groove_serpent.exporter.rename_no_replace",
                     side_effect=OSError("injected publish failure"),
                 ),
             ):
@@ -1537,7 +1566,7 @@ class ExporterTests(unittest.TestCase):
                 hashlib.sha256(artwork_bytes).hexdigest(),
             )
             self.assertEqual(
-                manifest["artwork"]["file_identity"]["size_bytes"],
+                manifest["artwork"]["size_bytes"],
                 len(artwork_bytes),
             )
 
@@ -1578,7 +1607,7 @@ class ExporterTests(unittest.TestCase):
                 Path(report.manifest_path).read_text(encoding="utf-8")
             )
             self.assertEqual(
-                manifest["schema"], "groove-serpent.publication-manifest/1"
+                manifest["schema"], "groove-serpent.publication-manifest/2"
             )
             self.assertEqual(manifest["project_file_sha256"], expected_project_sha256)
             self.assertEqual(manifest["project_revision"], project.revision)
@@ -1600,10 +1629,29 @@ class ExporterTests(unittest.TestCase):
             self.assertTrue(
                 manifest["files"][0]["verification"]["complete_decode_verified"]
             )
-            for identity in (manifest["project_identity"], manifest["source_identity"]):
-                self.assertIn("file_identity", identity)
-                self.assertIn("inode", identity["file_identity"])
-                self.assertIn("status_changed_ns", identity["file_identity"])
+            self.assertEqual(
+                manifest["project_identity"]["size_bytes"], project_path.stat().st_size
+            )
+            self.assertEqual(
+                manifest["source_identity"],
+                {
+                    "filename": source_path.name,
+                    "sha256": hashlib.sha256(b"source").hexdigest(),
+                    "size_bytes": len(b"source"),
+                },
+            )
+            manifest_text = Path(report.manifest_path).read_text(encoding="utf-8")
+            self.assertNotIn(str(directory), manifest_text)
+            for private_field in (
+                '"file_identity"',
+                '"inode"',
+                '"device"',
+                '"modified_ns"',
+                '"status_changed_ns"',
+                '"birth_ns"',
+                '"file_attributes"',
+            ):
+                self.assertNotIn(private_field, manifest_text)
 
     def test_source_replaced_between_tracks_fails_closed_and_uses_one_snapshot(
         self,
@@ -1785,6 +1833,34 @@ class ExporterRealVerificationTests(unittest.TestCase):
         project_path = directory / "capture.groove.json"
         save_project(project, project_path)
         return project, project_path
+
+    def test_verified_renderer_refuses_preexisting_staged_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            project, _project_path = self._real_project(directory)
+            staged = directory / "preexisting.flac"
+            sentinel = b"do not overwrite"
+            staged.write_bytes(sentinel)
+
+            with self.assertRaises(GrooveSerpentError):
+                render_verified_track(
+                    source_snapshot=directory / "capture.flac",
+                    staged_path=staged,
+                    track=project.tracks[0],
+                    total_tracks=1,
+                    output_format="flac",
+                    expected_sample_count=(
+                        project.tracks[0].end_sample
+                        - project.tracks[0].start_sample
+                    ),
+                    source_sample_rate=project.source.sample_rate,
+                    source_channels=project.source.channels,
+                    source_bits=project.source.bits_per_raw_sample,
+                    flac_compression=8,
+                    aac_bitrate="256k",
+                )
+
+            self.assertEqual(staged.read_bytes(), sentinel)
 
     def test_real_outputs_are_fully_verified_and_archival_flac_is_pcm_exact(
         self,

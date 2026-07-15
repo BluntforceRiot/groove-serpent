@@ -11,6 +11,7 @@ import json
 import os
 import re
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping, cast
 
 from . import __user_agent__
+from .atomic_create import rename_no_replace
 from .errors import GrooveSerpentError
 
 
@@ -36,6 +38,14 @@ _IMAGE_TYPES = {
     "image/jpg": ("image/jpeg", ".jpg"),
     "image/png": ("image/png", ".png"),
 }
+
+
+def _is_reparse(value: os.stat_result) -> bool:
+    """Return whether a Windows filesystem object redirects through a reparse point."""
+
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & flag)
 
 
 class MetadataLookupError(GrooveSerpentError):
@@ -129,9 +139,7 @@ def _track_count(release: Mapping[str, Any]) -> int:
     media = release.get("media")
     if isinstance(media, list):
         counts = [
-            _safe_int(medium.get("track-count"))
-            for medium in media
-            if isinstance(medium, Mapping)
+            _safe_int(medium.get("track-count")) for medium in media if isinstance(medium, Mapping)
         ]
         if any(counts):
             return sum(counts)
@@ -147,9 +155,7 @@ def _cover_art_summary(release: Mapping[str, Any], release_id: str) -> dict[str,
         "front": bool(archive.get("front")),
         "back": bool(archive.get("back")),
         "count": _safe_int(archive.get("count")),
-        "metadata_url": (
-            f"https://coverartarchive.org/release/{release_id}" if available else ""
-        ),
+        "metadata_url": (f"https://coverartarchive.org/release/{release_id}" if available else ""),
     }
 
 
@@ -218,9 +224,7 @@ class MusicBrainzClient:
     def _wait_for_rate_limit(self) -> None:
         with MusicBrainzClient._rate_lock:
             now = self._monotonic()
-            next_request = MusicBrainzClient._next_request_by_origin.get(
-                self._rate_origin, now
-            )
+            next_request = MusicBrainzClient._next_request_by_origin.get(self._rate_origin, now)
             delay = next_request - now
             if delay > 0:
                 self._sleep(delay)
@@ -254,9 +258,7 @@ class MusicBrainzClient:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not reach MusicBrainz: {reason}") from exc
 
-    def search_releases(
-        self, artist: str, album: str, limit: int = 10
-    ) -> list[dict[str, Any]]:
+    def search_releases(self, artist: str, album: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search releases and return compact, JSON-ready choices.
 
         Vinyl media are deliberately sorted ahead of non-vinyl results; within
@@ -306,9 +308,7 @@ class MusicBrainzClient:
         label, catalog_number = _first_label(release)
         release_group = release.get("release-group")
         release_group_id = (
-            str(release_group.get("id") or "")
-            if isinstance(release_group, Mapping)
-            else ""
+            str(release_group.get("id") or "") if isinstance(release_group, Mapping) else ""
         )
         cover_art = _cover_art_summary(release, release_id)
         return {
@@ -377,16 +377,12 @@ class MusicBrainzClient:
                         duration_ms = _optional_int(
                             raw_track.get("length", recording.get("length"))
                         )
-                        title = str(
-                            raw_track.get("title") or recording.get("title") or ""
-                        ).strip()
+                        title = str(raw_track.get("title") or recording.get("title") or "").strip()
                         tracks.append(
                             {
                                 "position": max(
                                     1,
-                                    _safe_int(
-                                        raw_track.get("position"), fallback_track_position
-                                    ),
+                                    _safe_int(raw_track.get("position"), fallback_track_position),
                                 ),
                                 "number": number,
                                 "title": title,
@@ -518,9 +514,7 @@ def _build_track_selections(media: list[dict[str, Any]]) -> list[dict[str, Any]]
         for medium in media:
             tracks = medium.get("tracks")
             if isinstance(tracks, list):
-                release_tracks.extend(
-                    dict(track) for track in tracks if isinstance(track, Mapping)
-                )
+                release_tracks.extend(dict(track) for track in tracks if isinstance(track, Mapping))
             medium_format = str(medium.get("format") or "").strip()
             if medium_format and medium_format not in release_formats:
                 release_formats.append(medium_format)
@@ -623,7 +617,10 @@ class CoverArtArchiveClient:
         folder = Path(artwork_folder)
         if folder.is_absolute() or ".." in folder.parts:
             raise ValueError("artwork_folder must stay inside the project directory.")
-        self.artwork_dir = (self.project_root / folder).resolve()
+        # Keep the intended lexical path. Resolving it here would silently
+        # follow an existing symlink or Windows junction and erase the evidence
+        # that a download had been redirected.
+        self.artwork_dir = Path(os.path.abspath(os.fspath(self.project_root / folder)))
         try:
             self.artwork_dir.relative_to(self.project_root)
         except ValueError as exc:
@@ -632,6 +629,58 @@ class CoverArtArchiveClient:
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("base_url must be an absolute HTTP or HTTPS URL.")
+
+    def _prepare_artwork_directory(self) -> Path:
+        """Create and verify each artwork-directory component without following links."""
+
+        try:
+            root_before = self.project_root.lstat()
+            if (
+                self.project_root.is_symlink()
+                or _is_reparse(root_before)
+                or not stat.S_ISDIR(root_before.st_mode)
+                or self.project_root.resolve(strict=True) != self.project_root
+            ):
+                raise MetadataLookupError("The project folder is not a fixed ordinary directory.")
+            relative = self.artwork_dir.relative_to(self.project_root)
+            current = self.project_root
+            for part in relative.parts:
+                candidate = current / part
+                try:
+                    before = candidate.lstat()
+                except FileNotFoundError:
+                    try:
+                        candidate.mkdir()
+                    except FileExistsError:
+                        pass
+                    before = candidate.lstat()
+                if (
+                    candidate.is_symlink()
+                    or _is_reparse(before)
+                    or not stat.S_ISDIR(before.st_mode)
+                    or candidate.resolve(strict=True) != candidate
+                ):
+                    raise MetadataLookupError(
+                        "The artwork folder may not traverse a symlink, junction, or reparse point."
+                    )
+                after = candidate.lstat()
+                if not os.path.samestat(before, after) or _is_reparse(after):
+                    raise MetadataLookupError(
+                        "The artwork folder changed while it was being checked."
+                    )
+                current = candidate
+            root_after = self.project_root.lstat()
+        except MetadataLookupError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise MetadataLookupError(
+                "The artwork folder could not be proven safe inside the project."
+            ) from exc
+        if not os.path.samestat(root_before, root_after) or _is_reparse(root_after):
+            raise MetadataLookupError(
+                "The project folder changed while the artwork path was checked."
+            )
+        return current
 
     def _open(self, request: urllib.request.Request) -> BinaryIO:
         return cast(BinaryIO, urllib.request.urlopen(request, timeout=self.timeout))
@@ -648,14 +697,10 @@ class CoverArtArchiveClient:
             with self._open(request) as response:
                 return _read_json(response, "Cover Art Archive")
         except urllib.error.HTTPError as exc:
-            raise MetadataLookupError(
-                _http_error_message("Cover Art Archive", exc)
-            ) from exc
+            raise MetadataLookupError(_http_error_message("Cover Art Archive", exc)) from exc
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise MetadataLookupError(
-                f"Could not reach Cover Art Archive: {reason}"
-            ) from exc
+            raise MetadataLookupError(f"Could not reach Cover Art Archive: {reason}") from exc
 
     def _resolve_front_art(
         self,
@@ -753,9 +798,7 @@ class CoverArtArchiveClient:
         if not valid:
             raise MetadataLookupError("Artwork data does not match its declared image type.")
 
-    def download_front_art(
-        self, release_id: str, *, size: str = "1200"
-    ) -> dict[str, Any]:
+    def download_front_art(self, release_id: str, *, size: str = "1200") -> dict[str, Any]:
         """Download front art into ``artwork/`` and return portable file metadata."""
 
         metadata = self.resolve_front_art(release_id)
@@ -789,9 +832,7 @@ class CoverArtArchiveClient:
         try:
             response = self._open(request)
         except urllib.error.HTTPError as exc:
-            raise MetadataLookupError(
-                _http_error_message("Cover Art Archive", exc)
-            ) from exc
+            raise MetadataLookupError(_http_error_message("Cover Art Archive", exc)) from exc
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not download cover artwork: {reason}") from exc
@@ -812,22 +853,13 @@ class CoverArtArchiveClient:
                 content_type = raw_content_type.split(";", 1)[0].strip().casefold()
                 image_type = _IMAGE_TYPES.get(content_type)
                 if image_type is None:
-                    raise MetadataLookupError(
-                        "Cover artwork must be a JPEG or PNG image."
-                    )
+                    raise MetadataLookupError("Cover artwork must be a JPEG or PNG image.")
                 mime_type, extension = image_type
                 content_length = _optional_int(headers.get("Content-Length"))
                 if content_length is not None and content_length > self.max_bytes:
                     raise MetadataLookupError("Cover artwork exceeds the 25 MB download limit.")
 
-                self.artwork_dir.mkdir(parents=True, exist_ok=True)
-                resolved_artwork_dir = self.artwork_dir.resolve()
-                try:
-                    resolved_artwork_dir.relative_to(self.project_root)
-                except ValueError as exc:
-                    raise MetadataLookupError(
-                        "The artwork folder no longer points inside the project."
-                    ) from exc
+                resolved_artwork_dir = self._prepare_artwork_directory()
                 descriptor, temporary_name = tempfile.mkstemp(
                     prefix=".cover-", suffix=".tmp", dir=resolved_artwork_dir
                 )
@@ -862,7 +894,20 @@ class CoverArtArchiveClient:
                 destination = resolved_artwork_dir / (
                     f"{storage_id}-front-{selected_size}{extension}"
                 )
-                os.replace(temporary_path, destination)
+                if self._prepare_artwork_directory() != resolved_artwork_dir:
+                    raise MetadataLookupError(
+                        "The artwork folder changed before the image could be published."
+                    )
+                try:
+                    rename_no_replace(temporary_path, destination)
+                except FileExistsError as exc:
+                    raise MetadataLookupError(
+                        "Cover artwork already exists; Groove Serpent will not overwrite it."
+                    ) from exc
+                except OSError as exc:
+                    raise MetadataLookupError(
+                        "The filesystem cannot atomically create a no-overwrite cover file."
+                    ) from exc
                 temporary_path = None
         except MetadataLookupError:
             raise

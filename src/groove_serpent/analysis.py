@@ -8,6 +8,7 @@ from typing import Iterable
 import numpy as np
 
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
+from .capture_envelope import require_supported_capture
 from .errors import ProjectValidationError
 from .media import decode_rms_envelope, probe_audio
 from .models import (
@@ -27,12 +28,9 @@ from .validation import strict_finite_number
 
 def _validate_expected_track_count(expected_track_count: int | None) -> None:
     if expected_track_count is not None and (
-        type(expected_track_count) is not int
-        or not 1 <= expected_track_count <= MAX_TRACKS
+        type(expected_track_count) is not int or not 1 <= expected_track_count <= MAX_TRACKS
     ):
-        raise ValueError(
-            f"expected_track_count must be at least 1 and no more than {MAX_TRACKS}"
-        )
+        raise ValueError(f"expected_track_count must be at least 1 and no more than {MAX_TRACKS}")
 
 
 def _sample_from_seconds(seconds: float, sample_rate: int, label: str) -> int:
@@ -47,9 +45,7 @@ def _sample_from_seconds(seconds: float, sample_rate: int, label: str) -> int:
             raise OverflowError("non-finite derived sample coordinate")
         result = int(round(scaled))
     except (OverflowError, TypeError, ValueError) as exc:
-        raise ProjectValidationError(
-            f"{label} is outside the supported range."
-        ) from exc
+        raise ProjectValidationError(f"{label} is outside the supported range.") from exc
     if not 0 <= result <= MAX_SOURCE_SAMPLE_COUNT:
         raise ProjectValidationError(f"{label} is outside the supported range.")
     return result
@@ -61,9 +57,7 @@ def _validate_track_seed_durations(track_seeds: list[TrackSeed] | None) -> None:
     for index, seed in enumerate(track_seeds, start=1):
         if seed.duration_seconds is None:
             continue
-        duration = strict_finite_number(
-            seed.duration_seconds, f"Track seed {index} duration"
-        )
+        duration = strict_finite_number(seed.duration_seconds, f"Track seed {index} duration")
         if not 0 < duration <= MAX_SUPPORTED_DURATION_SECONDS:
             raise ProjectValidationError(
                 f"Track seed {index} duration is outside the supported range."
@@ -305,11 +299,7 @@ def _target_boundaries(
             total = math.fsum(concrete)
         except OverflowError:
             total = math.inf
-        if (
-            len(concrete) == expected_track_count
-            and math.isfinite(total)
-            and total > 0
-        ):
+        if len(concrete) == expected_track_count and math.isfinite(total) and total > 0:
             cumulative = 0.0
             result: list[float] = []
             for duration in concrete[:-1]:
@@ -327,9 +317,7 @@ def _virtual_candidate(time_seconds: float, sample_rate: int) -> BoundaryCandida
         start_seconds=time_seconds,
         end_seconds=time_seconds,
         cut_seconds=time_seconds,
-        cut_sample=_sample_from_seconds(
-            time_seconds, sample_rate, "Virtual boundary cut time"
-        ),
+        cut_sample=_sample_from_seconds(time_seconds, sample_rate, "Virtual boundary cut time"),
         duration_seconds=0.0,
         minimum_db=0.0,
         mean_db=0.0,
@@ -364,19 +352,13 @@ def _align_candidate(
     if point.duration_seconds <= 0.0 or point.end_seconds <= point.start_seconds:
         return replace(point, selected=True)
     edge_guard = min(0.5, max(0.0, (point.end_seconds - point.start_seconds) / 4.0))
-    if not (
-        point.start_seconds + edge_guard
-        <= target
-        <= point.end_seconds - edge_guard
-    ):
+    if not (point.start_seconds + edge_guard <= target <= point.end_seconds - edge_guard):
         return replace(point, selected=True)
     cut_seconds = target
     return replace(
         point,
         cut_seconds=cut_seconds,
-        cut_sample=_sample_from_seconds(
-            cut_seconds, sample_rate, "Aligned boundary cut time"
-        ),
+        cut_sample=_sample_from_seconds(cut_seconds, sample_rate, "Aligned boundary cut time"),
         selected=True,
     )
 
@@ -473,11 +455,7 @@ def _select_exact_count(
     if needed <= 0:
         return []
 
-    groups = (
-        _side_groups(expected_track_count, expected_sides)
-        if _allow_side_partition
-        else []
-    )
+    groups = _side_groups(expected_track_count, expected_sides) if _allow_side_partition else []
     if groups:
         side_durations: list[float | None] | None = None
         if expected_durations and len(expected_durations) == expected_track_count:
@@ -490,9 +468,7 @@ def _select_exact_count(
             if len(summed) == len(groups):
                 side_durations = summed
 
-        anchor_candidates = _coalesce_side_change_candidates(
-            candidates, sample_rate=sample_rate
-        )
+        anchor_candidates = _coalesce_side_change_candidates(candidates, sample_rate=sample_rate)
         anchors = _select_exact_count(
             anchor_candidates,
             music_start=music_start,
@@ -509,9 +485,7 @@ def _select_exact_count(
             partition_valid = True
             for group_index, (track_start, track_end) in enumerate(groups):
                 segment_start = (
-                    music_start
-                    if group_index == 0
-                    else anchors[group_index - 1].end_seconds
+                    music_start if group_index == 0 else anchors[group_index - 1].end_seconds
                 )
                 segment_end = (
                     music_end
@@ -533,8 +507,7 @@ def _select_exact_count(
                 ]
                 group_durations = (
                     expected_durations[track_start:track_end]
-                    if expected_durations
-                    and len(expected_durations) == expected_track_count
+                    if expected_durations and len(expected_durations) == expected_track_count
                     else None
                 )
                 selected = _select_exact_count(
@@ -555,9 +528,7 @@ def _select_exact_count(
             if partition_valid:
                 return sorted(partitioned, key=lambda item: item.cut_seconds)
 
-    targets = _target_boundaries(
-        music_start, music_end, expected_track_count, expected_durations
-    )
+    targets = _target_boundaries(music_start, music_end, expected_track_count, expected_durations)
     real = [
         replace(candidate, selected=False)
         for candidate in candidates
@@ -654,8 +625,8 @@ def _select_exact_count(
                         best_value = value
                         best_previous = previous_index
                 if best_previous >= 0:
-                    fallback_values[boundary_index, index] = (
-                        best_value + fallback_point_value(point)
+                    fallback_values[boundary_index, index] = best_value + fallback_point_value(
+                        point
                     )
                     fallback_real_counts[boundary_index, index] = best_real_count
                     fallback_previous[boundary_index, index] = best_previous
@@ -787,20 +758,14 @@ def build_tracks(
     track_seeds: list[TrackSeed] | None,
     metadata: dict[str, str],
 ) -> list[Track]:
-    start_sample = _sample_from_seconds(
-        music_start, sample_rate, "Music start time"
-    )
+    start_sample = _sample_from_seconds(music_start, sample_rate, "Music start time")
     end_sample = _sample_from_seconds(music_end, sample_rate, "Music end time")
     if end_sample <= start_sample:
-        raise ProjectValidationError(
-            "Music bounds must contain at least one source sample."
-        )
+        raise ProjectValidationError("Music bounds must contain at least one source sample.")
     score_by_sample: dict[int, float] = {}
     if end_sample - start_sample > 1:
         for candidate in selected:
-            boundary_sample = max(
-                start_sample + 1, min(end_sample - 1, candidate.cut_sample)
-            )
+            boundary_sample = max(start_sample + 1, min(end_sample - 1, candidate.cut_sample))
             if start_sample < boundary_sample < end_sample:
                 score_by_sample[boundary_sample] = max(
                     score_by_sample.get(boundary_sample, 0.0), candidate.score
@@ -872,6 +837,11 @@ def _analyze_audio_snapshot(
         modified_ns=source_snapshot.live_receipt.modified_ns,
         sha256=source_snapshot.sha256,
     )
+    require_supported_capture(
+        source,
+        analysis_rate=settings.analysis_rate,
+        analysis_window_ms=settings.window_ms,
+    )
     _validate_track_seed_durations(track_seeds)
     raw_envelope, window_seconds = decode_rms_envelope(
         source_snapshot.path,
@@ -901,9 +871,7 @@ def _analyze_audio_snapshot(
     else:
         core_music_start, core_music_end = core_music_bounds
         music_start = max(0.0, core_music_start - settings.lead_in_seconds)
-        music_end = min(
-            source.duration_seconds, core_music_end + settings.tail_seconds
-        )
+        music_end = min(source.duration_seconds, core_music_end + settings.tail_seconds)
         candidates = detect_candidates(
             envelope,
             source_sample_rate=source.sample_rate,
@@ -974,9 +942,7 @@ def _analyze_audio_snapshot(
         analysis=summary,
         tracks=tracks,
         metadata=metadata,
-        analyzer_baseline=AnalyzerBaseline.capture(
-            tracks, metadata, source.sha256
-        ),
+        analyzer_baseline=AnalyzerBaseline.capture(tracks, metadata, source.sha256),
     )
     project.validate()
     return project

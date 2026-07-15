@@ -40,11 +40,12 @@ class SubprocessPolicyTests(unittest.TestCase):
     def test_short_media_capture_uses_no_stdin_and_bounds_both_streams(self) -> None:
         captured: dict[str, object] = {}
 
-        def fake_run(command, *, check, stdin, stdout, stderr):
+        def fake_run(command, *, check, stdin, stdout, stderr, timeout):
             captured.update(
                 command=command,
                 check=check,
                 stdin=stdin,
+                timeout=timeout,
             )
             stdout.write(b"ffmpeg version test\n" + b"x" * MAX_DIAGNOSTIC_BYTES)
             stderr.write(b"warning\n" * MAX_DIAGNOSTIC_BYTES)
@@ -57,6 +58,7 @@ class SubprocessPolicyTests(unittest.TestCase):
 
         self.assertIs(captured["stdin"], subprocess.DEVNULL)
         self.assertFalse(captured["check"])
+        self.assertIsNone(captured["timeout"])
         self.assertEqual(len(completed.stdout), MAX_DIAGNOSTIC_BYTES)
         self.assertEqual(len(completed.stderr), MAX_DIAGNOSTIC_BYTES)
         self.assertTrue(completed.stdout_truncated)

@@ -96,6 +96,68 @@ jobs:
       - name: Compile Python source
         run: uv run --frozen --group dev python -m compileall -q src tests scripts
 
+  browser-e2e:
+    name: Browser E2E / ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        engine:
+          - chromium
+          - firefox
+          - webkit
+          - mobile-chromium
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Install frozen Python and browser test dependencies
+        run: |
+          uv sync --frozen --group dev
+          npm ci
+
+      - name: Install exact Playwright engine
+        run: npx playwright install --with-deps ${{ matrix.engine == 'mobile-chromium' && 'chromium' || matrix.engine }}
+
+      - name: Run checked-in browser and accessibility acceptance
+        run: npx playwright test --project=${{ matrix.engine }}
+
+      - name: Upload browser evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browser-e2e-${{ matrix.engine }}
+          path: |
+            .groove-serpent/browser-test-results/
+            .groove-serpent/browser-report/
+          if-no-files-found: warn
+          retention-days: 14
+
   package:
     name: Build and audit distributions
     runs-on: ubuntu-latest
@@ -122,10 +184,10 @@ jobs:
           sudo apt-get install --yes ffmpeg
 
       - name: Build wheel and source distribution
-        run: uv build
+        run: python scripts/build_python_distributions.py
 
       - name: Check distribution metadata
-        run: uvx --from twine==6.2.0 twine check dist/*
+        run: uvx --from twine==6.2.0 twine check --strict dist/*.whl dist/*.tar.gz
 
       - name: Audit package contents for private material
         shell: python {0}
@@ -150,13 +212,17 @@ jobs:
               ".wav",
           )
           private_patterns = (
-              re.compile(rb"[A-Za-z]:\\Users\\[^\\/\r\n]+", re.IGNORECASE),
-              re.compile(rb"[A-Za-z]:\\HomelabForge(?:\\|/)", re.IGNORECASE),
+              re.compile(rb"[A-Za-z]:(?:/+|\\+)Users(?:/+|\\+)[^\\/\r\n]+", re.IGNORECASE),
+              re.compile(rb"[A-Za-z]:(?:/+|\\+)HomelabForge(?:/+|\\+)", re.IGNORECASE),
               re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
               re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
           )
 
-          archives = sorted(pathlib.Path("dist").glob("*"))
+          archives = sorted(
+              path
+              for path in pathlib.Path("dist").glob("*")
+              if path.suffix == ".whl" or path.name.endswith(".tar.gz")
+          )
           assert archives, "No distributions were built."
           for archive in archives:
               payloads: dict[str, bytes] = {}
@@ -234,6 +300,68 @@ jobs:
               check=True,
           )
 
+      - name: Reconcile final distributions against the build receipt
+        shell: python {0}
+        run: |
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("dist")
+          receipt_name = "PYTHON_DISTRIBUTIONS_RECEIPT.json"
+          wheel_name = "groove_serpent-1.0.0-py3-none-any.whl"
+          sdist_name = "groove_serpent-1.0.0.tar.gz"
+          expected_names = {receipt_name, wheel_name, sdist_name}
+          entries = list(root.iterdir())
+          observed_names = {entry.name for entry in entries}
+          if observed_names != expected_names or any(
+              entry.is_symlink() or not entry.is_file() for entry in entries
+          ):
+              raise SystemExit(f"Unexpected final distribution inventory: {observed_names}")
+
+          receipt_bytes = (root / receipt_name).read_bytes()
+          receipt = json.loads(receipt_bytes.decode("utf-8", errors="strict"))
+          if (
+              receipt.get("schema")
+              != "groove-serpent/python-distribution-build-receipt/1"
+              or receipt.get("result") != "passed"
+              or receipt.get("project")
+              != {"name": "groove-serpent", "version": "1.0.0"}
+          ):
+              raise SystemExit("Final distribution receipt authority is invalid.")
+          outputs = receipt.get("outputs")
+          if not isinstance(outputs, list) or len(outputs) != 2:
+              raise SystemExit("Final distribution receipt output inventory is invalid.")
+          by_role = {
+              item.get("role"): item for item in outputs if isinstance(item, dict)
+          }
+          expected_roles = {"wheel": wheel_name, "sdist": sdist_name}
+          if set(by_role) != set(expected_roles):
+              raise SystemExit("Final distribution receipt roles are invalid.")
+          for role, filename in expected_roles.items():
+              item = by_role[role]
+              payload = (root / filename).read_bytes()
+              if (
+                  item.get("filename") != filename
+                  or item.get("bytes") != len(payload)
+                  or item.get("sha256") != hashlib.sha256(payload).hexdigest()
+              ):
+                  raise SystemExit(f"Final {role} does not match its build receipt.")
+          print("Final Python distributions exactly match the passed build receipt.")
+
+      - name: Upload audited Python distributions and receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-distributions-${{ runner.os }}-${{ github.sha }}
+          path: |
+            dist/groove_serpent-1.0.0-py3-none-any.whl
+            dist/groove_serpent-1.0.0.tar.gz
+            dist/PYTHON_DISTRIBUTIONS_RECEIPT.json
+          if-no-files-found: error
+          retention-days: 7
+
   source-archive:
     name: Deterministic source ZIP / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -257,13 +385,17 @@ jobs:
       - name: Build normalized source archive
         run: python scripts/build_public_archive.py
 
-      - name: Upload archive and manifest
+      - name: Verify source archive commit marker
+        run: python scripts/build_public_archive.py --verify
+
+      - name: Upload archive, manifest, and commit marker
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: source-archive-${{ runner.os }}
           path: |
-            dist/groove-serpent-0.5.0-alpha.1-source.zip
+            dist/groove-serpent-1.0.0-source.zip
             dist/SOURCE_MANIFEST.sha256
+            dist/groove-serpent-1.0.0-source.commit.json
           if-no-files-found: error
           retention-days: 7
 
@@ -273,23 +405,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
       - name: Download source archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: source-archive-*
-          path: comparison
+          path: ${{ runner.temp }}/source-comparison
 
-      - name: Require byte-identical archives
+      - name: Verify every downloaded commit marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in "$RUNNER_TEMP"/source-comparison/source-archive-*; do
+            python scripts/build_public_archive.py --verify \
+              --archive "$directory/groove-serpent-1.0.0-source.zip" \
+              --manifest "$directory/SOURCE_MANIFEST.sha256" \
+              --marker "$directory/groove-serpent-1.0.0-source.commit.json"
+          done
+
+      - name: Require byte-identical archives, manifests, and markers
         shell: python {0}
         run: |
           import hashlib
+          import os
           import pathlib
 
-          archives = sorted(pathlib.Path("comparison").rglob("*.zip"))
-          assert len(archives) == 3, archives
-          receipts = {}
-          for archive in archives:
-              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-              receipts[str(archive)] = digest
-              print(f"{digest}  {archive}")
-          assert len(set(receipts.values())) == 1, receipts
+          names = (
+              "groove-serpent-1.0.0-source.zip",
+              "SOURCE_MANIFEST.sha256",
+              "groove-serpent-1.0.0-source.commit.json",
+          )
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "source-comparison"
+          for name in names:
+              paths = sorted(root.rglob(name))
+              assert len(paths) == 3, paths
+              receipts = {
+                  str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in paths
+              }
+              for path, digest in receipts.items():
+                  print(f"{digest}  {path}")
+              assert len(set(receipts.values())) == 1, receipts

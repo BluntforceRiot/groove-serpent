@@ -47,7 +47,17 @@ def main() -> int:
     if node is None:
         raise RuntimeError("Node.js is missing; JavaScript syntax was not checked.")
     _run([ruff, "check", "src", "tests", "scripts"])
-    _run([node, "--check", "src/groove_serpent/web/app.js"])
+    for script in (
+        "src/groove_serpent/web/app.js",
+        "src/groove_serpent/web/album.js",
+        "playwright.config.mjs",
+        "tests/browser/fixture-crash-probe.mjs",
+        "tests/browser/fixture-process.mjs",
+        "tests/browser/fixture-process.test.mjs",
+        "tests/browser/album-workbench.spec.mjs",
+        "tests/browser/side-review-accessibility.spec.mjs",
+    ):
+        _run([node, "--check", script])
     print("All quality gates passed.")
     return 0
 

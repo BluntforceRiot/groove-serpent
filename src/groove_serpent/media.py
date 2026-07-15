@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -11,6 +10,7 @@ from typing import Iterable
 import numpy as np
 
 from .errors import DependencyError, GrooveSerpentError
+from .executable_discovery import find_executable
 from .models import AudioSource
 from .subprocess_policy import (
     BoundedDiagnostic,
@@ -34,7 +34,7 @@ def sha256_file(path: Path) -> str:
 
 
 def find_tool(name: str) -> str:
-    path = shutil.which(name)
+    path = find_executable(name)
     if path is None:
         raise DependencyError(
             f"Required executable '{name}' was not found on PATH. "
