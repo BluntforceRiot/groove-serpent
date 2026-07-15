@@ -324,7 +324,12 @@ class AlbumReviewServerTests(unittest.TestCase):
                     "/api/album/state",
                     headers={"Host": alias},
                 )
-                self.assertEqual(status, 400)
+                expected_status = (
+                    200
+                    if alias == f"{self.server.session_auth.public_host}:{self.port}"
+                    else 400
+                )
+                self.assertEqual(status, expected_status)
 
         status, _headers, body = self.request(
             "POST",

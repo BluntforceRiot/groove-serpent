@@ -45,6 +45,7 @@ class _FakeProcess:
         wait_timeout: bool = False,
         on_wait: Callable[[], None] | None = None,
     ) -> None:
+        self.args = ("synthetic-fingerprint-process",)
         self.stdout = io.BytesIO(stdout)
         self.stderr = io.BytesIO(stderr)
         self.returncode = returncode
