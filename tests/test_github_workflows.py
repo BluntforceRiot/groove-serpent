@@ -159,10 +159,9 @@ def test_hosted_browser_ci_requires_verified_native_audio_output() -> None:
     )
     assert "continue-on-error" not in browser_job
     assert "fail-fast: false" in browser_job
-    assert (
-        "node --test tests/browser/fixture-process.test.mjs "
-        "tests/browser/startup-audio-monitor.test.mjs" in browser_job
-    )
+    assert "node --test tests/browser/fixture-process.test.mjs" in browser_job
+    assert "startup-audio-monitor" not in browser_job
+    assert "name: Verify browser fixture contracts" in browser_job
 
 
 def test_distribution_scanner_runs_from_runner_temp_and_rejects_private_payload(
@@ -272,6 +271,5 @@ def test_quality_gate_syntax_checks_every_browser_spec() -> None:
     assert '"tests/browser/fixture-crash-probe.mjs"' in text
     assert '"tests/browser/fixture-process.mjs"' in text
     assert '"tests/browser/fixture-process.test.mjs"' in text
-    assert '"tests/browser/startup-audio-monitor.mjs"' in text
-    assert '"tests/browser/startup-audio-monitor.test.mjs"' in text
+    assert "startup-audio-monitor" not in text
     assert '"tests/browser/side-review-accessibility.spec.mjs"' in text

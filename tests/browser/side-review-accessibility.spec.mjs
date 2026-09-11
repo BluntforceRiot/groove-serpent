@@ -3,7 +3,6 @@ import { expect, test } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { startFixture, stopFixture } from "./fixture-process.mjs";
-import { createStartupAudioMonitor } from "./startup-audio-monitor.mjs";
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -15,14 +14,8 @@ let fixtureProcess;
 let fixture;
 let browserProblems;
 let expectedMediaFailureWarning;
-let startupAudioMonitor;
 
 function monitorPage(page, problems) {
-  const audioMonitor = startupAudioMonitor;
-  page.on("request", (request) => audioMonitor.requestStarted(request));
-  page.on("requestfinished", async (request) => {
-    audioMonitor.requestFinished(request, await request.response());
-  });
   page.on("console", (message) => {
     if (message.type() === "error") {
       const location = message.location();
@@ -43,15 +36,11 @@ function monitorPage(page, problems) {
     ) {
       return;
     }
-    const message = `request: ${request.method()} ${request.url()} ${failure}`;
-    if (!audioMonitor.holdStartupCancellation(request, failure, message)) {
-      problems.push(message);
-    }
+    problems.push(`request: ${request.method()} ${request.url()} ${failure}`);
   });
 }
 
 async function loadSideReview(page) {
-  startupAudioMonitor.beginLoad();
   await page.goto(fixture.url, { waitUntil: "domcontentloaded" });
   await expect(page).toHaveTitle("Groove Serpent Review");
   await expect(page.locator("#sourceIntegrity")).toHaveText("SOURCE VERIFIED");
@@ -62,15 +51,6 @@ async function loadSideReview(page) {
     "Select any track marker",
   );
   await expect(page.locator("#evidenceStatus")).not.toHaveClass(/busy/);
-  if (startupAudioMonitor.hasPending()) {
-    await expect.poll(() => startupAudioMonitor.hasReplacementProof()).toBe(true);
-    await expect.poll(() => page.locator("#audioPlayer").evaluate((element) => (
-      element.readyState >= 1 || element.error !== null
-    ))).toBe(true);
-  }
-  startupAudioMonitor.finishLoad(await page.locator("#audioPlayer").evaluate((element) => ({
-    currentSrc: element.currentSrc, readyState: element.readyState, error: element.error?.code ?? null,
-  })));
 }
 
 async function tabUntil(page, predicate, limit = 100, key = "Tab") {
@@ -89,7 +69,7 @@ async function tabUntil(page, predicate, limit = 100, key = "Tab") {
   );
 }
 
-test.beforeEach(async ({ page, browserName }) => {
+test.beforeEach(async ({ page }) => {
   const started = await startFixture({
     repositoryRoot,
     script: "tests/browser/serve_side_fixture.py",
@@ -100,9 +80,6 @@ test.beforeEach(async ({ page, browserName }) => {
   fixture = started.ready;
   browserProblems = [];
   expectedMediaFailureWarning = null;
-  startupAudioMonitor = createStartupAudioMonitor({
-    browserName, sourceUrl: new URL("/audio", fixture.url).href, problems: browserProblems,
-  });
   monitorPage(page, browserProblems);
 });
 
@@ -116,7 +93,6 @@ test.afterEach(async ({ page }, testInfo) => {
         });
       }
     }
-    startupAudioMonitor?.finishLoad(null);
   } finally {
     await stopFixture(fixtureProcess, "Side fixture");
   }
@@ -125,6 +101,97 @@ test.afterEach(async ({ page }, testInfo) => {
     "Unexpected browser errors",
   ).toEqual([]);
 });
+
+for (const projectResult of ["verified", "missing-receipt"]) {
+  test(`defers source audio until project verification: ${projectResult}`, async ({
+    page, browserName,
+  }) => {
+    const sourceUrl = new URL("/audio", fixture.url).href;
+    await page.addInitScript(() => {
+      window.__sourceAudioStarts = [];
+      document.addEventListener("loadstart", (event) => {
+        const element = event.target;
+        if (element instanceof HTMLMediaElement && element.id === "audioPlayer") {
+          window.__sourceAudioStarts.push({
+            currentSrc: element.currentSrc, src: element.getAttribute("src"),
+          });
+        }
+      }, true);
+    });
+    const audioRequests = [];
+    page.on("request", (request) => {
+      if (request.url() === sourceUrl) audioRequests.push(request);
+    });
+    let releaseScript;
+    let releaseProject;
+    let scriptRequested = false;
+    let projectRequested = false;
+    const scriptGate = new Promise((resolve) => { releaseScript = resolve; });
+    const projectGate = new Promise((resolve) => { releaseProject = resolve; });
+    await page.route((url) => url.pathname === "/app.js", async (route) => {
+      scriptRequested = true;
+      await scriptGate;
+      await route.continue();
+    });
+    await page.route((url) => url.pathname === "/api/project", async (route) => {
+      projectRequested = true;
+      await projectGate;
+      const response = await route.fetch();
+      if (projectResult === "missing-receipt") {
+        const payload = await response.json();
+        delete payload.source_receipt;
+        await route.fulfill({ response, json: payload });
+      } else {
+        await route.fulfill({ response });
+      }
+    });
+    try {
+      await page.goto(fixture.url, { waitUntil: "commit" });
+      await expect.poll(() => scriptRequested).toBe(true);
+      const player = page.locator("#audioPlayer");
+      // Prove the parsed HTML cannot preload audio before app.js runs. The
+      // second barrier proves initialized JavaScript waits for source authority.
+      expect(await player.getAttribute("src")).toBeNull();
+      expect(await player.evaluate((element) => element.currentSrc)).toBe("");
+      expect(audioRequests).toEqual([]);
+      releaseScript();
+      await expect.poll(() => projectRequested).toBe(true);
+      expect(await player.getAttribute("src")).toBeNull();
+      expect(await player.evaluate((element) => element.currentSrc)).toBe("");
+      expect(audioRequests).toEqual([]);
+      releaseProject();
+      if (projectResult === "verified") {
+        await expect(page.locator("#sourceIntegrity")).toHaveText("SOURCE VERIFIED");
+        await expect(page.locator("#status")).toHaveText("Ready");
+        await expect(player).toHaveAttribute("src", "/audio");
+        if (browserName === "webkit") {
+          // Windows WebKit's native media requests can bypass Playwright's
+          // network events. Observe native source activation without media mocks;
+          // the separate native audition test still checks playback or refusal.
+          await expect.poll(() => page.evaluate((expected) => (
+            window.__sourceAudioStarts.some((event) => (
+              event.currentSrc === expected && event.src === "/audio"
+            ))
+          ), sourceUrl)).toBe(true);
+        } else {
+          await expect.poll(() => audioRequests.length).toBeGreaterThan(0);
+        }
+        await expect.poll(() => player.evaluate((element) => element.currentSrc))
+          .toBe(sourceUrl);
+      } else {
+        await expect(page.locator("#sourceIntegrity")).toHaveText("INTEGRITY FAILED");
+        await expect(page.locator("#status"))
+          .toHaveText("The review server did not supply an integrity receipt.");
+        expect(await player.getAttribute("src")).toBeNull();
+        expect(await player.evaluate((element) => element.currentSrc)).toBe("");
+        expect(audioRequests).toEqual([]);
+      }
+    } finally {
+      releaseScript();
+      releaseProject();
+    }
+  });
+}
 
 test("exposes named dynamic controls and no automated WCAG A/AA violations", async ({
   page,

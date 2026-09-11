@@ -237,9 +237,10 @@ test("opens the exact side cockpit with synchronized visual and marker controls"
 }) => {
   await loadWorkbench(page);
   const popupPromise = page.waitForEvent("popup");
+  // Register popup observation before opening the child.
+  page.context().once("page", monitorPage);
   await page.getByRole("button", { name: "Open exact Side A review" }).click();
   const cockpit = await popupPromise;
-  monitorPage(cockpit);
   await cockpit.waitForURL(
     (url) => url.protocol === "http:" && url.pathname === "/",
     { waitUntil: "domcontentloaded" },

@@ -12,9 +12,12 @@ to changed bytes. See [1.1 release notes](RELEASE_NOTES_1.1.md).
 
 - Fix the hosted package audit's import path when GitHub executes its Python
   script from a temporary directory. Keep private-content rejection enforced.
+- Start review players without an audio source until the verified project
+  receipt arrives, preventing speculative startup loads and their cancellation.
+  Failed verification leaves audio unavailable in standalone and popup review.
 - Give headless browser tests their own audio service and realistic native
-  audition lead-in; keep failed/interrupted playback non-authorizing. Require
-  successful replacement audio before accepting a WebKit startup cancellation.
+  audition lead-in; keep failed/interrupted playback non-authorizing. Retain
+  strict WebKit errors instead of accepting a startup cancellation exception.
 - Check actual filesystem alias behavior in Unicode race tests while preserving
   the foreign file's identity and contents on macOS, Linux, and Windows.
 - Refuse preexisting staged track outputs before rendering. Error-only FFmpeg

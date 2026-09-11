@@ -41,6 +41,8 @@ Check the selected release's hashes and validation receipt. See
   with mismatched bit depth, channels, sample rate, codec, sample format, or frame count. Original
   audition uses the same source-authority checks. Archival FLAC verification retains low-order
   24-bit information instead of comparing at a precision selected by the output.
+- **Verified audio startup:** the review player stays source-free until the server supplies its
+  integrity receipt, preventing speculative audio requests during startup or failed verification.
 - **Playback-backed click approval:** the owner browser must play Original, Proposed, and Removed
   Signal continuously at normal speed through the changed window. Seeking, pausing, stalling, or
   changing speed does not count as a completed audition. This records a browser action, not proof

@@ -76,7 +76,11 @@ Hosted CI also checks the package scanner from GitHub's temporary-script environ
 an owned headless audio service for real browser playback, and verifies foreign-file preservation
 on both normalization-sensitive and normalization-insensitive filesystems. Native audition tests
 use an explicit lead-in before the changed window; interrupted-playback rejection tests retain
-their short-window cases. No application audition requirement is relaxed by these test repairs.
+their short-window cases. The review page starts without an audio source and assigns one only
+after receiving its integrity receipt; this prevents speculative, then cancelled, audio requests
+in both standalone review and album popups. Failed verification leaves the player source-free.
+No application audition requirement is relaxed. WebKit's optional success screenshot is omitted
+because the pinned test tool injects inline CSS; its native playback and strict error checks remain.
 
 ## Install or upgrade
 

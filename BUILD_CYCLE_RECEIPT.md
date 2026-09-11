@@ -29,7 +29,11 @@ approval on its own frozen bytes. This stable-version preparation changes
 metadata, documentation, artwork, final release provenance, and refusal of
 stale or decoder-error media renders. Subsequent hosted CI repairs address the
 temporary-script package import path, headless audio setup, native test lead-in,
-WebKit startup cancellation evidence, and Unicode filesystem test assumptions.
+verified-only audio startup, and Unicode filesystem test assumptions. The
+initial HTML audio source was removed so it cannot load before verification;
+the temporary WebKit startup-cancellation test exception was retired. Native
+audition and strict browser error checks remain, with only an optional WebKit
+success screenshot omitted because the test tool injects CSP-blocked CSS.
 They do not relax application audition or foreign-file preservation requirements.
 Updated release documentation is a package input and requires fresh distributions.
 All applicable gates and independent review must be repeated. Historical green

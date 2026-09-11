@@ -54,8 +54,6 @@ def main() -> int:
         "tests/browser/fixture-crash-probe.mjs",
         "tests/browser/fixture-process.mjs",
         "tests/browser/fixture-process.test.mjs",
-        "tests/browser/startup-audio-monitor.mjs",
-        "tests/browser/startup-audio-monitor.test.mjs",
         "tests/browser/album-workbench.spec.mjs",
         "tests/browser/side-review-accessibility.spec.mjs",
     ):

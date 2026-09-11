@@ -144,8 +144,8 @@ jobs:
       - name: Install exact Playwright engine
         run: npx playwright install --with-deps ${{ matrix.engine == 'mobile-chromium' && 'chromium' || matrix.engine }}
 
-      - name: Verify browser fixture and startup-monitor contracts
-        run: node --test tests/browser/fixture-process.test.mjs tests/browser/startup-audio-monitor.test.mjs
+      - name: Verify browser fixture contracts
+        run: node --test tests/browser/fixture-process.test.mjs
 
       - name: Run checked-in browser and accessibility acceptance
         run: uv run --frozen --group dev python scripts/run_browser_acceptance.py --engine ${{ matrix.engine }}
