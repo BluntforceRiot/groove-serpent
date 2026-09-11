@@ -18,7 +18,13 @@ def test_active_release_receipts_match_the_publication_boundary() -> None:
         encoding="utf-8"
     )
 
-    assert "Status: ACTIVE" in contract
+    assert "Status: ACTIVE — owner-authorized GitHub publication" in contract
+    current_contract = contract.split("## Historical preparation boundaries", 1)[0]
+    assert "codex/publication-ci-1.1.0" in contract
+    assert "conditional on current gates" in current_contract
+    assert "stable tag/release requires the final exact public commit" in current_contract
+    assert "no remote publication is authorized" not in current_contract
+    assert "Publication remains out of scope" not in current_contract
     for receipt in (build_receipt, continuum_receipt):
         assert f"Groove Serpent {version}" in receipt
         assert "Status: RELEASE_PUBLICATION_BOUNDARY" in receipt
