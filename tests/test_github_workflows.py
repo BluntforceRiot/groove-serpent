@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 import textwrap
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -143,6 +147,73 @@ def test_ci_uses_the_audited_deterministic_python_distribution_builder() -> None
     assert "retention-days: 7" in package_job
 
 
+def test_hosted_browser_ci_requires_verified_native_audio_output() -> None:
+    text = _ci_workflow_text()
+    browser_job = text.split("\n  browser-e2e:", maxsplit=1)[1].split(
+        "\n  package:", maxsplit=1
+    )[0]
+    assert "sudo apt-get install --yes ffmpeg pulseaudio pulseaudio-utils" in browser_job
+    assert (
+        "uv run --frozen --group dev python scripts/run_browser_acceptance.py "
+        "--engine ${{ matrix.engine }}" in browser_job
+    )
+    assert "continue-on-error" not in browser_job
+    assert "fail-fast: false" in browser_job
+    assert (
+        "node --test tests/browser/fixture-process.test.mjs "
+        "tests/browser/startup-audio-monitor.test.mjs" in browser_job
+    )
+
+
+def test_distribution_scanner_runs_from_runner_temp_and_rejects_private_payload(
+    tmp_path: Path,
+) -> None:
+    text = _ci_workflow_text()
+    marker = "      - name: Audit package contents for private material\n"
+    step = text.split(marker, maxsplit=1)[1].split("\n      - name:", maxsplit=1)[0]
+    assert "        shell: python {0}\n" in step
+    assert "        env:\n          PYTHONPATH: ${{ github.workspace }}\n" in step
+    code = textwrap.dedent(step.split("        run: |\n", maxsplit=1)[1])
+
+    runner_temp = tmp_path / "runner temp"
+    runner_temp.mkdir()
+    script = runner_temp / "audit.py"
+    script.write_text(code, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    dist = workspace / "dist"
+    dist.mkdir(parents=True)
+    archive = dist / "synthetic.whl"
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("groove_serpent/__init__.py", "__version__ = '1.1.0'\n")
+
+    env = dict(os.environ)
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    command = [sys.executable, str(script)]
+    missing_workspace = subprocess.run(
+        command, cwd=workspace, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert missing_workspace.returncode != 0
+    assert "No module named 'scripts'" in missing_workspace.stderr
+
+    env["PYTHONPATH"] = str(ROOT)
+    clean = subprocess.run(
+        command, cwd=workspace, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+    assert "Audited 1 distributions without private-content matches." in clean.stdout
+
+    with zipfile.ZipFile(archive, "a") as package:
+        private = json.dumps({"path": "\\".join(("X:", "Users", "synthetic", "file"))})
+        package.writestr("synthetic.json", private)
+    rejected = subprocess.run(
+        command, cwd=workspace, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert rejected.returncode != 0
+    assert "private material" in rejected.stderr
+
+
 def test_ci_final_distribution_reconciliation_executes_and_rejects_tampering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -201,4 +272,6 @@ def test_quality_gate_syntax_checks_every_browser_spec() -> None:
     assert '"tests/browser/fixture-crash-probe.mjs"' in text
     assert '"tests/browser/fixture-process.mjs"' in text
     assert '"tests/browser/fixture-process.test.mjs"' in text
+    assert '"tests/browser/startup-audio-monitor.mjs"' in text
+    assert '"tests/browser/startup-audio-monitor.test.mjs"' in text
     assert '"tests/browser/side-review-accessibility.spec.mjs"' in text

@@ -453,9 +453,14 @@ def test_plan_commit_rolls_back_when_a_portable_equivalent_races_rename(
     destination = tmp_path / "Caf\u00e9.json"
     racing = tmp_path / "Cafe\u0301.json"
     real_rename = publication_plan_module.rename_no_replace
+    alias_at_commit: list[bool] = []
+    racer_identity: list[tuple[int, int]] = []
 
     def race_then_rename(source: Path, target: Path) -> None:
         racing.write_text("foreign racing file", encoding="utf-8")
+        alias_at_commit.append(destination.exists() and destination.samefile(racing))
+        observed = racing.stat()
+        racer_identity.append((observed.st_dev, observed.st_ino))
         real_rename(source, target)
 
     monkeypatch.setattr(
@@ -463,10 +468,20 @@ def test_plan_commit_rolls_back_when_a_portable_equivalent_races_rename(
         "rename_no_replace",
         race_then_rename,
     )
-    with pytest.raises(ProjectValidationError, match="portable-equivalent"):
+    with pytest.raises(ProjectValidationError) as caught:
         save_album_publication_plan(representative_plan(), destination)
 
-    assert not destination.exists()
+    assert len(alias_at_commit) == 1
+    if alias_at_commit[0]:
+        # APFS can identify NFC/NFD spellings as the same foreign file. The
+        # native no-replace error is earlier than the portable rollback guard.
+        assert str(caught.value) == f"Publication plan already exists: {destination}."
+        assert destination.samefile(racing)
+    else:
+        assert "portable-equivalent" in str(caught.value)
+        assert not destination.exists()
+    observed = racing.stat()
+    assert racer_identity == [(observed.st_dev, observed.st_ino)]
     assert racing.read_text(encoding="utf-8") == "foreign racing file"
 
 

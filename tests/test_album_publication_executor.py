@@ -652,22 +652,38 @@ class AlbumPublicationExecutorTests(unittest.TestCase):
         output = self.root / "Caf\u00e9"
         racer = self.root / "Cafe\u0301"
         sentinel = racer / "foreign.txt"
+        alias_at_commit: list[bool] = []
+        racer_identity: list[tuple[int, int]] = []
 
         def race_then_commit(source: Path, destination: Path) -> None:
             if destination == output:
                 racer.mkdir()
                 sentinel.write_text("foreign", encoding="utf-8")
+                alias_at_commit.append(output.exists() and output.samefile(racer))
+                observed = racer.stat()
+                racer_identity.append((observed.st_dev, observed.st_ino))
             _atomic_no_replace_directory(source, destination)
 
         with mock.patch(
             "groove_serpent.album_publication_executor._atomic_no_replace_directory",
             side_effect=race_then_commit,
         ):
-            with self.assertRaisesRegex(ExportError, "atomic commit|portable"):
+            with self.assertRaises(ExportError) as caught:
                 execute_album_publication_plan(plan_path, output)
 
-        self.assertFalse(output.exists())
+        self.assertEqual(len(alias_at_commit), 1)
+        if alias_at_commit[0]:
+            # Normalization-insensitive filesystems expose both spellings as
+            # the foreign directory; native no-replace refuses before rollback.
+            self.assertEqual(str(caught.exception), "Publication output already exists.")
+            self.assertTrue(output.samefile(racer))
+        else:
+            self.assertRegex(str(caught.exception), "atomic commit|portable")
+            self.assertFalse(output.exists())
+        observed = racer.stat()
+        self.assertEqual(racer_identity, [(observed.st_dev, observed.st_ino)])
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "foreign")
+        self.assertEqual({path.name for path in racer.iterdir()}, {"foreign.txt"})
         self.assertFalse(
             any(
                 path.name.startswith(".groove-serpent-album-publication-")

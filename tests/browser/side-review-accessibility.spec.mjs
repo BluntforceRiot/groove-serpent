@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { startFixture, stopFixture } from "./fixture-process.mjs";
+import { createStartupAudioMonitor } from "./startup-audio-monitor.mjs";
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -14,8 +15,14 @@ let fixtureProcess;
 let fixture;
 let browserProblems;
 let expectedMediaFailureWarning;
+let startupAudioMonitor;
 
 function monitorPage(page, problems) {
+  const audioMonitor = startupAudioMonitor;
+  page.on("request", (request) => audioMonitor.requestStarted(request));
+  page.on("requestfinished", async (request) => {
+    audioMonitor.requestFinished(request, await request.response());
+  });
   page.on("console", (message) => {
     if (message.type() === "error") {
       const location = message.location();
@@ -36,11 +43,15 @@ function monitorPage(page, problems) {
     ) {
       return;
     }
-    problems.push(`request: ${request.method()} ${request.url()} ${failure}`);
+    const message = `request: ${request.method()} ${request.url()} ${failure}`;
+    if (!audioMonitor.holdStartupCancellation(request, failure, message)) {
+      problems.push(message);
+    }
   });
 }
 
 async function loadSideReview(page) {
+  startupAudioMonitor.beginLoad();
   await page.goto(fixture.url, { waitUntil: "domcontentloaded" });
   await expect(page).toHaveTitle("Groove Serpent Review");
   await expect(page.locator("#sourceIntegrity")).toHaveText("SOURCE VERIFIED");
@@ -51,6 +62,15 @@ async function loadSideReview(page) {
     "Select any track marker",
   );
   await expect(page.locator("#evidenceStatus")).not.toHaveClass(/busy/);
+  if (startupAudioMonitor.hasPending()) {
+    await expect.poll(() => startupAudioMonitor.hasReplacementProof()).toBe(true);
+    await expect.poll(() => page.locator("#audioPlayer").evaluate((element) => (
+      element.readyState >= 1 || element.error !== null
+    ))).toBe(true);
+  }
+  startupAudioMonitor.finishLoad(await page.locator("#audioPlayer").evaluate((element) => ({
+    currentSrc: element.currentSrc, readyState: element.readyState, error: element.error?.code ?? null,
+  })));
 }
 
 async function tabUntil(page, predicate, limit = 100, key = "Tab") {
@@ -69,7 +89,7 @@ async function tabUntil(page, predicate, limit = 100, key = "Tab") {
   );
 }
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page, browserName }) => {
   const started = await startFixture({
     repositoryRoot,
     script: "tests/browser/serve_side_fixture.py",
@@ -80,11 +100,26 @@ test.beforeEach(async ({ page }) => {
   fixture = started.ready;
   browserProblems = [];
   expectedMediaFailureWarning = null;
+  startupAudioMonitor = createStartupAudioMonitor({
+    browserName, sourceUrl: new URL("/audio", fixture.url).href, problems: browserProblems,
+  });
   monitorPage(page, browserProblems);
 });
 
-test.afterEach(async () => {
-  await stopFixture(fixtureProcess, "Side fixture");
+test.afterEach(async ({ page }, testInfo) => {
+  try {
+    if (!page.isClosed()) {
+      const mediaEvents = await page.evaluate(() => window.__nativeRestorationEvents ?? null);
+      if (mediaEvents) {
+        await testInfo.attach("native-restoration-media-events", {
+          body: JSON.stringify(mediaEvents, null, 2), contentType: "application/json",
+        });
+      }
+    }
+    startupAudioMonitor?.finishLoad(null);
+  } finally {
+    await stopFixture(fixtureProcess, "Side fixture");
+  }
   expect(
     browserProblems.filter((problem) => problem !== expectedMediaFailureWarning),
     "Unexpected browser errors",
@@ -524,6 +559,23 @@ for (const interruption of [
 test("handles native restoration playback without bypassing failed decoders", async ({
   page, browserName,
 }, testInfo) => {
+  await page.addInitScript(() => {
+    window.__nativeRestorationEvents = [];
+    for (const name of [
+      "loadedmetadata", "playing", "waiting", "stalled", "seeking", "seeked",
+      "timeupdate", "pause", "ended", "error",
+    ]) {
+      document.addEventListener(name, (event) => {
+        const element = event.target;
+        if (!(element instanceof HTMLMediaElement) || !element.id.startsWith("restoration")) return;
+        window.__nativeRestorationEvents.push({
+          event: name, player: element.id, observed: performance.now(),
+          currentTime: element.currentTime, paused: element.paused, seeking: element.seeking,
+          readyState: element.readyState, error: element.error?.code ?? null,
+        });
+      }, true);
+    }
+  });
   const unavailableDecoder = browserName === "webkit" && process.platform === "win32";
   await loadRestorationAudition(page, {
     mockPlayback: false, expectDecodeFailure: unavailableDecoder,

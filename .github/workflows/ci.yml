@@ -131,10 +131,10 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg and headless audio services
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg
+          sudo apt-get install --yes ffmpeg pulseaudio pulseaudio-utils
 
       - name: Install frozen Python and browser test dependencies
         run: |
@@ -144,8 +144,11 @@ jobs:
       - name: Install exact Playwright engine
         run: npx playwright install --with-deps ${{ matrix.engine == 'mobile-chromium' && 'chromium' || matrix.engine }}
 
+      - name: Verify browser fixture and startup-monitor contracts
+        run: node --test tests/browser/fixture-process.test.mjs tests/browser/startup-audio-monitor.test.mjs
+
       - name: Run checked-in browser and accessibility acceptance
-        run: npx playwright test --project=${{ matrix.engine }}
+        run: uv run --frozen --group dev python scripts/run_browser_acceptance.py --engine ${{ matrix.engine }}
 
       - name: Upload browser evidence on failure
         if: failure()
@@ -191,6 +194,8 @@ jobs:
 
       - name: Audit package contents for private material
         shell: python {0}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           from __future__ import annotations
 
