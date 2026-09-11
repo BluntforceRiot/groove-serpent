@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_active_release_receipts_match_the_stable_version_candidate() -> None:
+def test_active_release_receipts_match_the_publication_boundary() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     version = project["project"]["version"]
     assert version == "1.1.0"
@@ -21,10 +21,23 @@ def test_active_release_receipts_match_the_stable_version_candidate() -> None:
     assert "Status: ACTIVE" in contract
     for receipt in (build_receipt, continuum_receipt):
         assert f"Groove Serpent {version}" in receipt
-        assert "codex/1.1.0-dev" in receipt
+        assert "Status: RELEASE_PUBLICATION_BOUNDARY" in receipt
+        assert "codex/publication-ci-1.1.0" in receipt
         assert "local" in receipt.casefold()
-        assert "no push" in receipt.casefold()
         assert "Groove Serpent 1.0.0" not in receipt
+        assert "exact" in receipt.casefold()
+        assert "external" in receipt.casefold()
+
+    assert "HOLD_REVIEW" in build_receipt
+    assert "successful current gates before stable release" in build_receipt
+    assert "not a claim that" in build_receipt
+    assert "Stable publication remains conditional on exact-byte review" in (
+        continuum_receipt
+    )
+    assert "does not assert that either pending operation has run" in continuum_receipt
+    assert "After the authorized repair/publication and final receipts, stop" in (
+        continuum_receipt
+    )
 
 
 def test_prior_release_receipts_are_explicitly_historical() -> None:

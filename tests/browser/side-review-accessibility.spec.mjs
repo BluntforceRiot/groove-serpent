@@ -619,7 +619,12 @@ test("handles native restoration playback without bypassing failed decoders", as
     await expect(page.getByRole("button", { name: "Apply proposed" })).toBeEnabled();
   }
   await page.locator("#restorationPreviewPanel").scrollIntoViewIfNeeded();
-  await page.screenshot({ path: testInfo.outputPath("restoration-audition-ready.png") });
+  // Playwright 1.61.1 injects inline "body {}" when preparing WebKit screenshots,
+  // even with caret: "initial". Keep strict CSP and console checks; the native
+  // assertions and attached media events above remain the WebKit proof.
+  if (browserName !== "webkit") {
+    await page.screenshot({ path: testInfo.outputPath("restoration-audition-ready.png") });
+  }
 });
 
 test("keeps backend-valid 33 rpm to 78 rpm correction operable", async ({ page }) => {
