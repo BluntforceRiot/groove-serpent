@@ -282,6 +282,7 @@ test("does not credit an endpoint audition when playback fails", async ({ page }
 
 async function loadRestorationAudition(page, {
   mockPlayback = true, expectDecodeFailure = false,
+  changedWindowStartFrame = 960,
 } = {}) {
   if (mockPlayback) await page.addInitScript(() => {
     window.__restorationTestNow = 0;
@@ -356,9 +357,9 @@ async function loadRestorationAudition(page, {
     candidates: [{
       id: "clk-browser-proof",
       type: "impulse",
-      peak_frame: 960,
-      start_frame: 960,
-      end_frame_exclusive: 1088,
+      peak_frame: changedWindowStartFrame,
+      start_frame: changedWindowStartFrame,
+      end_frame_exclusive: changedWindowStartFrame + 128,
       channels: [0],
       confidence: 0.9,
       repairable: true,
@@ -368,8 +369,8 @@ async function loadRestorationAudition(page, {
       end_frame_exclusive: 96000,
       repair_windows: [{
         candidate_id: "clk-browser-proof",
-        start_in_preview: 960,
-        end_in_preview_exclusive: 1088,
+        start_in_preview: changedWindowStartFrame,
+        end_in_preview_exclusive: changedWindowStartFrame + 128,
         channels: [0],
       }],
     },
@@ -430,9 +431,9 @@ async function loadRestorationAudition(page, {
             matched_audio_geometry: true,
             source_start_sample: 0,
             source_end_sample_exclusive: 96000,
-            focus_source_sample: 960,
-            repair_start_source_sample: 960,
-            repair_end_source_sample_exclusive: 1088,
+            focus_source_sample: changedWindowStartFrame,
+            repair_start_source_sample: changedWindowStartFrame,
+            repair_end_source_sample_exclusive: changedWindowStartFrame + 128,
             declared_linear_gain: role === "removed" ? 16 : 1,
           },
           selection: { start_sample: 0, end_sample_exclusive: 96000 },
@@ -579,6 +580,10 @@ test("handles native restoration playback without bypassing failed decoders", as
   const unavailableDecoder = browserName === "webkit" && process.platform === "win32";
   await loadRestorationAudition(page, {
     mockPlayback: false, expectDecodeFailure: unavailableDecoder,
+    // Native media may settle a queued seek or cold audio sink after playing.
+    // Leave one second of real preroll inside this two-second preview; keep the
+    // deterministic mocked 20 ms window and all fail-closed credit gates intact.
+    changedWindowStartFrame: 48000,
   });
   if (unavailableDecoder) {
     // Windows Playwright WebKit advertises FLAC but rejects the actual fixture bytes,

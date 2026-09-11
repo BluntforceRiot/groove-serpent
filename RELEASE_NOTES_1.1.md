@@ -1,8 +1,9 @@
 # Groove Serpent 1.1.0 release notes
 
-Prepared for release; not yet published. These notes describe the local stable-version candidate,
-not a completed upload or a transfer of approval from earlier development bytes. The exact release
-build-cycle receipt and artifact hashes determine the tested and distributable boundary.
+These notes describe Groove Serpent 1.1.0. Published asset availability and exact validation
+records are listed on [GitHub Releases](https://github.com/BluntforceRiot/groove-serpent/releases).
+The release receipt and artifact hashes determine the tested and distributable boundary;
+approval of earlier development bytes does not transfer to a changed build.
 
 ## What changed since 1.0
 
@@ -71,6 +72,12 @@ source/package scans inspect normalized text and Python/JSON literals; private o
 values come from an external private policy. Source archives exclude Git history bundles.
 Historical releases and Git history are not rewritten by these changes.
 
+Hosted CI also checks the package scanner from GitHub's temporary-script environment, provides
+an owned headless audio service for real browser playback, and verifies foreign-file preservation
+on both normalization-sensitive and normalization-insensitive filesystems. Native audition tests
+use an explicit lead-in before the changed window; interrupted-playback rejection tests retain
+their short-window cases. No application audition requirement is relaxed by these test repairs.
+
 ## Install or upgrade
 
 Use the [README installation and album workflow](README.md). The source package accepts Python
@@ -98,11 +105,15 @@ context, not a fresh stable-release pass. Changed 1.1.0 source and artifact byte
 tests, package checks, independent review, and build-cycle/Continuum receipts. No final test count
 or stable approval is asserted in these notes.
 
-Native Linux/WSL/macOS, Python 3.12, live online/raw-fpcalc identification, and physical-device
-Safari were not newly proved by that development review. Windows WebKit's missing FLAC decoder
-must fail closed; its refusal test is not evidence of successful Safari playback. Transport checks
-and screenshots do not establish a new human listening decision. The real-album evidence used no
-restoration; it does not approve previously rejected or undecided repairs.
+The current hosted CI matrix exercises Windows, Ubuntu, and macOS with Python 3.11/3.12/3.13,
+four Linux browser projects, package audit/installation, and cross-platform source ZIP identity.
+Only completed successful jobs for the exact selected commit count as runtime proof. See the
+release's validation record for observed results, including skips and limitations. WSL, live
+online/raw-fpcalc identification, and physical-device Safari require separate evidence. Windows
+WebKit's missing FLAC decoder must fail closed; its refusal test is not evidence of successful
+Safari playback. Transport checks and screenshots do not establish a new human listening
+decision. The real-album evidence used no restoration; it does not approve previously rejected
+or undecided repairs.
 
 A Windows portable builder is included, but this handoff delivers source and Python packages,
 not a newly certified 1.1 portable. Any later portable must be separately listed with exact

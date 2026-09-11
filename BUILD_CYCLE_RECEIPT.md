@@ -1,15 +1,18 @@
 # BUILD_CYCLE_RECEIPT - Groove Serpent 1.1.0
 
-Status: LOCAL_RELEASE_BOUNDARY - exact approval is recorded externally.
+Status: RELEASE_PUBLICATION_BOUNDARY - exact approval and outcome are recorded externally.
 
 Date: 2026-09-11
 
 ## Authority and acceptance
 
-The source is the local `codex/1.1.0-dev` branch, based on published `v1.0.0`
-commit `a3923fdf337a1a2284ec4defd03355032706883c`. The owner designated Astra
-to review, repair, and issue the final local decision. No push, tag, release,
-or public deployment is authorized.
+The public source is based on published `v1.0.0` commit
+`a3923fdf337a1a2284ec4defd03355032706883c`. The owner designated Astra to review,
+repair, and issue the final local decision, then explicitly authorized GitHub
+upload and repair of hosted CI errors. The repair branch is
+`codex/publication-ci-1.1.0`. Private development ancestry is not published.
+This authorization does not replace the requirement for exact-byte review and
+successful current gates before stable release.
 
 The completion contract is `BUILD_CONTRACT_1.1.md`. Required evidence includes
 the exact candidate test and browser results, quality gates, reproducible source
@@ -24,9 +27,13 @@ partial audition-window credit, nonportable legacy relative paths, cleanup
 ownership, and source-stream precision/channel authority. It received local
 approval on its own frozen bytes. This stable-version preparation changes
 metadata, documentation, artwork, final release provenance, and refusal of
-stale or decoder-error media renders. All applicable
-gates and independent review must be repeated. Historical green logs do not
-establish a pass for changed source.
+stale or decoder-error media renders. Subsequent hosted CI repairs address the
+temporary-script package import path, headless audio setup, native test lead-in,
+WebKit startup cancellation evidence, and Unicode filesystem test assumptions.
+They do not relax application audition or foreign-file preservation requirements.
+Updated release documentation is a package input and requires fresh distributions.
+All applicable gates and independent review must be repeated. Historical green
+logs do not establish a pass for changed source.
 
 The owner's historical rejection of one auditioned repair remains authoritative
 only for its exact preview bytes. The fresh real-album workflow must preserve
@@ -44,9 +51,11 @@ the circular dependency of embedding a commit's hash inside itself.
 
 Only a complete external receipt can classify these bytes as `PROMOTABLE` and
 record Astra's `APPROVE`. Without that receipt the decision is `HOLD_REVIEW`.
-The handoff includes source and Python distributions, not a newly certified
-Windows portable. Hosted CI requires a future authorized GitHub upload; local
-evidence cannot be presented as that unrun hosted proof.
+The release includes source and Python distributions, not a newly certified
+Windows portable. The final external receipt must identify the exact successful
+hosted run, public commit/tag, uploaded asset hashes, and download verification.
+Local evidence cannot substitute for an unrun or failed hosted job. Consult
+the selected GitHub release's validation records for the actual publication state.
 
 ## Preservation, rollback, and scope
 

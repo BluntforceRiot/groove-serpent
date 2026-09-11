@@ -1,16 +1,18 @@
 # Epic Continuum Project-State Receipt - Groove Serpent 1.1.0
 
-Status: LOCAL_RELEASE_BOUNDARY - exact checkpoint is recorded externally.
+Status: RELEASE_PUBLICATION_BOUNDARY - exact checkpoint is recorded externally.
 
 Date: 2026-09-11
 
 Project: `groove-serpent`; session: `codex-groove-serpent-astra-20260907`;
-agent: `codex-root`; branch: `codex/1.1.0-dev`.
+agent: `codex-root`; public repair branch: `codex/publication-ci-1.1.0`.
 
 The owner designated Astra to review and repair the local candidate, then
 authorized stable 1.1.0 upload preparation and current release documentation.
 This continues the same project/session after the approved development cycle.
-No push, tag, release, or public deployment is authorized.
+The owner subsequently authorized GitHub upload and fixes for hosted CI errors.
+Stable publication remains conditional on exact-byte review and successful
+current gates; the external final receipt must record its actual outcome.
 
 ## Acyclic evidence boundary
 
@@ -34,5 +36,7 @@ operation proof alone is not a substitute for that content check.
 - Other unauditioned candidates remain undecided.
 - Source captures are immutable and all publications are new derivatives.
 - Findings and evidence gaps must be closed on the exact reviewed candidate.
-- The final local approval terminates this build cycle and does not authorize
-  GitHub publication.
+- Local approval alone does not authorize publication. The owner's separate
+  upload authorization and final successful gates must both be recorded.
+- After the authorized repair/publication and final receipts, stop; do not
+  continue unrelated feature work or unattended build loops.

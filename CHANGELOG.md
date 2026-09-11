@@ -2,15 +2,21 @@
 
 All notable public changes to Groove Serpent are documented here.
 
-## 1.1.0 — prepared for release, not yet published
+## 1.1.0
 
-These entries describe the changes from published 1.0.0 to the local 1.1 release
-candidate. Development-candidate approval does not transfer to changed stable
-bytes. Exact release validation and asset availability are governed by the new
-candidate's receipts; see [1.1 release notes](RELEASE_NOTES_1.1.md).
+These entries describe the changes from 1.0.0 to 1.1.0. Exact release validation
+and asset availability are recorded on GitHub Releases; approval does not transfer
+to changed bytes. See [1.1 release notes](RELEASE_NOTES_1.1.md).
 
 ### Fixed
 
+- Fix the hosted package audit's import path when GitHub executes its Python
+  script from a temporary directory. Keep private-content rejection enforced.
+- Give headless browser tests their own audio service and realistic native
+  audition lead-in; keep failed/interrupted playback non-authorizing. Require
+  successful replacement audio before accepting a WebKit startup cancellation.
+- Check actual filesystem alias behavior in Unicode race tests while preserving
+  the foreign file's identity and contents on macOS, Linux, and Windows.
 - Refuse preexisting staged track outputs before rendering. Error-only FFmpeg
   diagnostics now fail the operation even when the encoder exits zero, preventing
   a stale but valid AAC file from being credited as a newly rendered track.

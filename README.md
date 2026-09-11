@@ -26,13 +26,14 @@ the exact bytes that were inspected. **Your ears are the final authority.**
 
 ![Groove Serpent Album Workbench](assets/groove-serpent-workbench.png)
 
-## 1.1 release status
+## Groove Serpent 1.1.0
 
-This tree is being prepared as **Groove Serpent 1.1.0** for release; it is not yet published.
 1.1 focuses on source fidelity, trustworthy restoration review, safer recovery, and release
-integrity. A reviewed development candidate is not proof of changed stable-release bytes: consult
-the exact version and artifact hashes in the release's build-cycle receipt before relying on a
-validation claim. See [1.1 release notes](RELEASE_NOTES_1.1.md) and [CHANGELOG.md](CHANGELOG.md).
+integrity. Published downloads and their exact validation records belong on the
+[GitHub Releases page](https://github.com/BluntforceRiot/groove-serpent/releases).
+A source checkout or green check on another commit is not approval of different release bytes.
+Check the selected release's hashes and validation receipt. See
+[1.1 release notes](RELEASE_NOTES_1.1.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## What's new in 1.1
 
@@ -82,9 +83,12 @@ The source package accepts Python 3.11, 3.12, or 3.13 and requires FFmpeg and ff
 NumPy installs with the package. Fixed-speed correction additionally needs FFmpeg's libsoxr support;
 `doctor` reports the available tools and capabilities.
 
-The reviewed 1.1 development evidence covers native Windows with Python 3.11 and 3.13. Native
-Linux/WSL/macOS and Python 3.12 were not rerun for that candidate. The commands below describe
-installation, not a claim of fresh stable-release certification on every platform.
+The [CI workflow](https://github.com/BluntforceRiot/groove-serpent/actions/workflows/ci.yml)
+tests Windows, Ubuntu, and macOS with Python 3.11, 3.12, and 3.13, plus Chromium, Firefox,
+WebKit, and mobile Chromium on Linux. Consult the exact commit's completed run for results;
+the matrix configuration alone is not a pass. Headless playback checks do not certify physical
+Safari devices or replace owner listening. Windows Playwright WebKit's unavailable FLAC decoder
+is tested for safe refusal, not claimed as successful playback.
 
 Windows PowerShell:
 
