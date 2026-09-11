@@ -9,7 +9,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,9 +35,11 @@ from scripts._release_evidence import (  # noqa: E402
     ACYCLIC_GENERATED_REPORT_PATHS,
     CANDIDATE_INDEX_NAME,
     INDEX_NAME,
+    PrivateContentPolicy,
     PublicationAttempt,
     assert_public_payload_safe,
     canonical_json_bytes,
+    load_private_content_policy,
     marker_artifact,
     product_source_authority,
     require_sha256,
@@ -46,16 +48,18 @@ from scripts._release_evidence import (  # noqa: E402
     validate_marker_artifact,
     validate_public_release_commit,
 )
+from groove_serpent import __version__  # noqa: E402
 from groove_serpent.executable_discovery import find_executable  # noqa: E402
 
 
-VERSION = "1.0.0"
+VERSION = __version__
 RELEASE_NAME = f"groove-serpent-{VERSION}"
 DEFAULT_ARCHIVE = ROOT / "dist" / f"{RELEASE_NAME}-source.zip"
 DEFAULT_MANIFEST = ROOT / "dist" / "SOURCE_MANIFEST.sha256"
 MARKER_NAME = f"{RELEASE_NAME}-source.commit.json"
 DEFAULT_MARKER = ROOT / "dist" / MARKER_NAME
 MARKER_SCHEMA = "groove-serpent.public-source-archive-commit/1"
+CANDIDATE_MARKER_SCHEMA = "groove-serpent.candidate-source-archive-commit/1"
 PUBLIC_RELEASE_COMMIT_NAME = "PUBLIC_RELEASE_COMMIT.json"
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -64,8 +68,10 @@ ZIP_CREATE_SYSTEM_UNIX = 3
 ZIP_VERSION_2_0 = 20
 ZIP_REGULAR_FILE_MODE = 0o100644
 GIT_COMMIT_RE = re.compile(rb"[0-9a-f]{40,64}\Z")
+AuthorityMode = Literal["release", "candidate"]
 EXCLUDED_PARTS = {
     ".git",
+    ".groove-serpent",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
@@ -82,10 +88,12 @@ EXCLUDED_PARTS = {
 FORBIDDEN_SUFFIXES = {
     ".aif",
     ".aiff",
+    ".bundle",
     ".flac",
     ".m4a",
     ".mp3",
     ".p12",
+    ".pack",
     ".pem",
     ".pfx",
     ".pyc",
@@ -289,7 +297,10 @@ def _git_inventory(root: Path, git: str, commit: str) -> list[tuple[str, str]]:
     return sorted(selected, key=lambda item: item[0].casefold())
 
 
-def _canonical_git_payloads(root: Path) -> tuple[str, str, list[tuple[str, bytes]]]:
+def _canonical_git_payloads(
+    root: Path,
+    policy: PrivateContentPolicy | None = None,
+) -> tuple[str, str, list[tuple[str, bytes]]]:
     git = _git_executable()
     commit = _assert_git_authority(root, git, None)
     git_inventory = _git_inventory(root, git, commit)
@@ -312,6 +323,7 @@ def _canonical_git_payloads(root: Path) -> tuple[str, str, list[tuple[str, bytes
             relative,
             canonical,
             context="Public source Git blob",
+            policy=policy,
         )
         total += len(canonical)
         if total > MAX_TOTAL_BYTES:
@@ -376,6 +388,24 @@ def _public_release_authority(
             "Public release commit identifies the wrong selected product-source authority."
         )
     return authority, candidate_digest
+
+
+def _candidate_source_authority(records: Sequence[tuple[str, bytes]]) -> str:
+    """Bind a development archive to every exact Git payload byte.
+
+    Candidate archives deliberately do not interpret ``PUBLIC_RELEASE_COMMIT.json``.
+    That file names an already-frozen public release and is expected to remain stale
+    while an ordinary pull request changes the source tree. Final release archives
+    continue through :func:`_public_release_authority` and remain fail-closed.
+    """
+
+    return product_source_authority(
+        [
+            (relative, len(payload), sha256_bytes(payload))
+            for relative, payload in records
+        ],
+        release_version=VERSION,
+    )
 
 
 def require_canonical_git_checkout(
@@ -477,14 +507,36 @@ def _verify_archive(path: Path, records: Sequence[tuple[str, bytes]]) -> bytes:
 def _source_marker_bytes(
     *,
     candidate_authority: str,
-    candidate_evidence_sha256: str,
+    candidate_evidence_sha256: str | None,
     git_commit: str,
     archive_path: Path,
     archive_payload: bytes,
     manifest_path: Path,
     manifest_payload: bytes,
     member_count: int,
+    authority_mode: AuthorityMode = "release",
 ) -> bytes:
+    if authority_mode == "candidate":
+        if candidate_evidence_sha256 is not None:
+            raise RuntimeError("Candidate source markers cannot claim release evidence.")
+        return canonical_json_bytes(
+            {
+                "archive": marker_artifact(
+                    archive_path,
+                    archive_payload,
+                    member_count=member_count,
+                ),
+                "git_commit": git_commit,
+                "manifest": marker_artifact(manifest_path, manifest_payload),
+                "release_version": VERSION,
+                "schema": CANDIDATE_MARKER_SCHEMA,
+                "source_authority": candidate_authority,
+            }
+        )
+    if authority_mode != "release":
+        raise RuntimeError(f"Unsupported source archive authority mode: {authority_mode}")
+    if candidate_evidence_sha256 is None:
+        raise RuntimeError("Release source markers require candidate evidence authority.")
     return canonical_json_bytes(
         {
             "archive": marker_artifact(
@@ -538,31 +590,54 @@ def verify_source_archive_commit(
     expected_commit: str | None = None,
     archive_name: str | None = None,
     manifest_name: str | None = None,
+    authority_mode: AuthorityMode = "release",
+    policy: PrivateContentPolicy | None = None,
 ) -> tuple[int, str]:
     marker_payload = read_single_link_file(
         marker_path,
         MAX_FILE_BYTES,
         "Public source commit marker",
     )
+    assert_public_payload_safe(
+        marker_path.name, marker_payload, context="Public source commit marker", policy=policy
+    )
     marker = strict_json_object(marker_payload, "Public source commit marker")
-    expected_keys = {
-        "archive",
-        "candidate_authority",
-        "candidate_evidence_sha256",
-        "git_commit",
-        "manifest",
-        "release_version",
-        "schema",
-    }
+    if authority_mode == "release":
+        expected_keys = {
+            "archive",
+            "candidate_authority",
+            "candidate_evidence_sha256",
+            "git_commit",
+            "manifest",
+            "release_version",
+            "schema",
+        }
+        expected_schema = MARKER_SCHEMA
+    elif authority_mode == "candidate":
+        expected_keys = {
+            "archive",
+            "git_commit",
+            "manifest",
+            "release_version",
+            "schema",
+            "source_authority",
+        }
+        expected_schema = CANDIDATE_MARKER_SCHEMA
+    else:
+        raise RuntimeError(f"Unsupported source archive authority mode: {authority_mode}")
     if set(marker) != expected_keys:
         raise RuntimeError("Public source commit marker keys are invalid.")
-    if marker["schema"] != MARKER_SCHEMA or marker["release_version"] != VERSION:
+    if marker["schema"] != expected_schema or marker["release_version"] != VERSION:
         raise RuntimeError("Public source commit marker schema or version is invalid.")
-    authority = require_sha256(marker["candidate_authority"], "Public source authority")
-    candidate_digest = require_sha256(
-        marker["candidate_evidence_sha256"],
-        "Public source candidate evidence",
-    )
+    if authority_mode == "release":
+        authority = require_sha256(marker["candidate_authority"], "Public source authority")
+        candidate_digest = require_sha256(
+            marker["candidate_evidence_sha256"],
+            "Public source candidate evidence",
+        )
+    else:
+        authority = require_sha256(marker["source_authority"], "Candidate source authority")
+        candidate_digest = None
     commit = marker["git_commit"]
     if (
         not isinstance(commit, str)
@@ -632,6 +707,12 @@ def verify_source_archive_commit(
                 if not _zip_info_has_release_profile(info):
                     raise RuntimeError("Public source ZIP member profile is not canonical.")
                 payload = archive.read(info)
+                assert_public_payload_safe(
+                    relative,
+                    payload,
+                    context="Archived public source payload",
+                    policy=policy,
+                )
                 if sha256_bytes(payload) != digest:
                     raise RuntimeError("Public source ZIP member does not match its manifest.")
                 payload_records.append((relative, payload))
@@ -641,9 +722,14 @@ def verify_source_archive_commit(
                 raise RuntimeError("Public source ZIP carries a different manifest.")
     except (OSError, zipfile.BadZipFile) as exc:
         raise RuntimeError("Public source ZIP cannot be independently verified.") from exc
-    public_authority, public_candidate_digest = _public_release_authority(payload_records)
-    if authority != public_authority or candidate_digest != public_candidate_digest:
-        raise RuntimeError("Public source commit marker disagrees with the public release commit.")
+    if authority_mode == "release":
+        public_authority, public_candidate_digest = _public_release_authority(payload_records)
+        if authority != public_authority or candidate_digest != public_candidate_digest:
+            raise RuntimeError(
+                "Public source commit marker disagrees with the public release commit."
+            )
+    elif authority != _candidate_source_authority(payload_records):
+        raise RuntimeError("Candidate source commit marker disagrees with the exact Git payload.")
     return member_count, commit
 
 
@@ -654,12 +740,27 @@ def build_archive(
     root: Path = ROOT,
     require_git_checkout: bool = True,
     marker_path: Path | None = None,
+    authority_mode: AuthorityMode = "release",
+    private_policy_path: Path | None = None,
 ) -> tuple[int, str]:
     if not require_git_checkout:
         raise RuntimeError("Unanchored public source archives are unsupported.")
     root = Path(os.path.abspath(os.fspath(root)))
-    git, commit, payload_records = _canonical_git_payloads(root)
-    candidate_authority, candidate_evidence_sha256 = _public_release_authority(payload_records)
+    policy = (
+        None
+        if private_policy_path is None
+        else load_private_content_policy(private_policy_path, root=root)
+    )
+    git, commit, payload_records = _canonical_git_payloads(root, policy)
+    if authority_mode == "release":
+        candidate_authority, candidate_evidence_sha256 = _public_release_authority(
+            payload_records
+        )
+    elif authority_mode == "candidate":
+        candidate_authority = _candidate_source_authority(payload_records)
+        candidate_evidence_sha256 = None
+    else:
+        raise RuntimeError(f"Unsupported source archive authority mode: {authority_mode}")
     _manifest_name, manifest_portable = canonical_portable_relative_path(
         "SOURCE_MANIFEST.sha256",
         "Generated source manifest",
@@ -679,6 +780,11 @@ def build_archive(
         )
     )
     output_paths = (archive_path, manifest_path, marker_path)
+    for output_path in output_paths:
+        assert_public_payload_safe(
+            "", output_path.name.encode("utf-8"),
+            context="Public source artifact name", policy=policy,
+        )
     if len(set(output_paths)) != len(output_paths):
         raise RuntimeError("Public source archive, manifest, and marker paths must be distinct.")
     require_stable_creation_identity(
@@ -777,6 +883,7 @@ def build_archive(
             manifest_path=manifest_path,
             manifest_payload=manifest,
             member_count=len(records),
+            authority_mode=authority_mode,
         )
         with marker_temporary.open("xb") as destination:
             marker_identity = capture_descriptor_identity(destination.fileno())
@@ -802,6 +909,8 @@ def build_archive(
             expected_commit=commit,
             archive_name=archive_path.name,
             manifest_name=manifest_path.name,
+            authority_mode=authority_mode,
+            policy=policy,
         )
 
         manifest_publication.publish(
@@ -833,6 +942,8 @@ def build_archive(
             expected_commit=commit,
             archive_name=archive_path.name,
             manifest_name=manifest_path.name,
+            authority_mode=authority_mode,
+            policy=policy,
         )
         _assert_git_authority(root, git, commit)
         marker_publication.publish(marker_temporary, marker_path, marker_identity)
@@ -863,18 +974,42 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--marker", type=Path, default=DEFAULT_MARKER)
     parser.add_argument(
+        "--private-policy",
+        type=Path,
+        help="external canonical owner-literal JSON policy (never included in the archive)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--candidate",
+        action="store_true",
+        help="build a deterministic development archive without claiming release authority",
+    )
+    mode.add_argument(
         "--verify",
         action="store_true",
-        help="independently verify an existing ZIP, manifest, and commit marker",
+        help="verify a final-release ZIP, manifest, and release-authority marker",
+    )
+    mode.add_argument(
+        "--verify-candidate",
+        action="store_true",
+        help="verify a development ZIP and its exact Git-tree authority",
     )
     args = parser.parse_args()
-    if args.verify:
-        git, commit, records = _canonical_git_payloads(ROOT)
+    if args.verify or args.verify_candidate:
+        authority_mode: AuthorityMode = "candidate" if args.verify_candidate else "release"
+        policy = (
+            None
+            if args.private_policy is None
+            else load_private_content_policy(args.private_policy, root=ROOT)
+        )
+        git, commit, records = _canonical_git_payloads(ROOT, policy)
         count, _marker_commit = verify_source_archive_commit(
             args.marker,
             args.archive,
             args.manifest,
             expected_commit=commit,
+            authority_mode=authority_mode,
+            policy=policy,
         )
         expected_manifest = (
             "\n".join(f"{sha256_bytes(payload)}  {relative}" for relative, payload in records)
@@ -896,6 +1031,8 @@ def main() -> int:
         args.archive,
         args.manifest,
         marker_path=args.marker,
+        authority_mode="candidate" if args.candidate else "release",
+        private_policy_path=args.private_policy,
     )
     print(f"Created {args.archive} with {count} members")
     print(f"SHA-256 {digest}")

@@ -36,9 +36,15 @@ def _synthetic_features(
     *,
     sample_rate: int = 1_000,
     impulses: set[int] | None = None,
+    centroids: list[float] | None = None,
+    high_frequency_ratios: list[float] | None = None,
 ) -> tuple[EndpointWindowFeature, ...]:
     if len(energies) != len(flatness):
         raise AssertionError("Synthetic feature families must align.")
+    if centroids is not None and len(centroids) != len(energies):
+        raise AssertionError("Synthetic centroids must align.")
+    if high_frequency_ratios is not None and len(high_frequency_ratios) != len(energies):
+        raise AssertionError("Synthetic high-frequency ratios must align.")
     transient_indexes = impulses or set()
     return tuple(
         EndpointWindowFeature(
@@ -47,16 +53,18 @@ def _synthetic_features(
             rms_dbfs=energy,
             peak_dbfs=min(0.0, energy + 10.0),
             crest_factor=3.0,
-            spectral_centroid_hz=250.0 if shape < 0.8 else 100.0,
+            spectral_centroid_hz=(
+                centroids[index] if centroids is not None else 250.0 if shape < 0.8 else 100.0
+            ),
             spectral_flatness=shape,
-            high_frequency_ratio=0.1,
+            high_frequency_ratio=(
+                high_frequency_ratios[index] if high_frequency_ratios is not None else 0.1
+            ),
             spectral_flux=0.0,
             derivative_peak=1.0 if index in transient_indexes else 0.01,
             impulse_count=1 if index in transient_indexes else 0,
         )
-        for index, (energy, shape) in enumerate(
-            zip(energies, flatness, strict=True)
-        )
+        for index, (energy, shape) in enumerate(zip(energies, flatness, strict=True))
     )
 
 
@@ -74,13 +82,12 @@ class EndpointProposalFeatureTests(unittest.TestCase):
         )
 
         self.assertEqual(proposal.status, "proposed")
-        self.assertEqual(proposal.proposed_music_start_sample, 4_000)
-        self.assertEqual(proposal.proposed_music_end_sample_exclusive, 24_000)
-        self.assertIn("quiet_tonal_extent_protected", proposal.reasons)
+        self.assertEqual(proposal.start.sample, 4_000)
+        self.assertEqual(proposal.end.sample, 24_000)
+        self.assertIn("quiet_tonal_extent_protected", proposal.start.reasons)
+        self.assertIn("quiet_tonal_extent_protected", proposal.end.reasons)
         self.assertTrue(proposal.requires_review)
-        self.assertTrue(
-            proposal.evidence["policy"]["automatic_application_forbidden"]
-        )
+        self.assertTrue(proposal.evidence["policy"]["automatic_application_forbidden"])
         self.assertTrue(
             all(
                 item["role"] == "confirmation-only"
@@ -88,7 +95,7 @@ class EndpointProposalFeatureTests(unittest.TestCase):
             )
         )
 
-    def test_contradictory_family_boundaries_abstain_instead_of_cutting(self) -> None:
+    def test_one_contradictory_boundary_does_not_hide_the_other(self) -> None:
         energies = [-60.0] * 2 + [-53.0] * 8 + [-20.0] * 10 + [-60.0] * 8
         flatness = [0.98] * 2 + [0.10] * 18 + [0.98] * 8
         features = _synthetic_features(energies, flatness)
@@ -99,9 +106,15 @@ class EndpointProposalFeatureTests(unittest.TestCase):
             sample_rate=1_000,
         )
 
-        self.assertEqual(proposal.status, "abstained")
-        self.assertIsNone(proposal.proposed_music_start_sample)
-        self.assertEqual(proposal.reasons, ("contradictory_endpoint_families",))
+        self.assertEqual(proposal.status, "partial")
+        self.assertEqual(proposal.start.status, "abstained")
+        self.assertIsNone(proposal.start.sample)
+        self.assertEqual(
+            proposal.start.reasons,
+            ("contradictory_endpoint_families",),
+        )
+        self.assertEqual(proposal.end.status, "proposed")
+        self.assertEqual(proposal.end.sample, 20_000)
 
     def test_silence_and_truncated_scope_abstain(self) -> None:
         silence = _synthetic_features([-90.0] * 12, [1.0] * 12)
@@ -112,9 +125,10 @@ class EndpointProposalFeatureTests(unittest.TestCase):
         )
         self.assertEqual(silent.status, "abstained")
         self.assertEqual(
-            silent.reasons,
+            silent.start.reasons,
             ("silence_or_insufficient_dynamic_range",),
         )
+        self.assertEqual(silent.end.reasons, silent.start.reasons)
 
         truncated = _synthetic_features(
             [-20.0] * 8 + [-60.0] * 4,
@@ -125,11 +139,13 @@ class EndpointProposalFeatureTests(unittest.TestCase):
             truncated,
             sample_rate=1_000,
         )
-        self.assertEqual(clipped.status, "abstained")
+        self.assertEqual(clipped.status, "partial")
         self.assertEqual(
-            clipped.reasons,
+            clipped.start.reasons,
             ("scope_boundary_truncated_or_transition_ambiguous",),
         )
+        self.assertEqual(clipped.end.status, "proposed")
+        self.assertEqual(clipped.end.sample, 8_000)
 
     def test_subthreshold_tonal_tail_forces_ambiguity_abstention(self) -> None:
         energies = [-60.0] * 4 + [-20.0] * 10 + [-59.0] * 2 + [-60.0] * 4
@@ -141,16 +157,45 @@ class EndpointProposalFeatureTests(unittest.TestCase):
             sample_rate=1_000,
         )
 
-        self.assertEqual(proposal.status, "abstained")
+        self.assertEqual(proposal.status, "partial")
+        self.assertEqual(proposal.start.status, "proposed")
+        self.assertEqual(proposal.end.status, "abstained")
         self.assertEqual(
-            proposal.reasons,
+            proposal.end.reasons,
             ("quiet_intro_or_tail_transition_ambiguous",),
         )
         self.assertEqual(
-            proposal.evidence["transition_context"][
-                "quiet_tonal_after_end_samples"
-            ],
+            proposal.evidence["transition_context"]["quiet_tonal_after_end_samples"],
             2_000,
+        )
+
+    def test_needle_bracketed_sub_bass_groove_does_not_hide_music_end(self) -> None:
+        music_count = 85
+        runout_count = 8
+        energies = [-20.0] * music_count + [-46.0] * runout_count + [-15.0] + [-80.0] * 2
+        flatness = [0.2] * music_count + [0.001] * (runout_count + 1) + [1.0] * 2
+        centroids = [400.0] * music_count + [20.0] * (runout_count + 1) + [400.0] * 2
+        high_ratios = [0.02] * music_count + [0.0001] * (runout_count + 1) + [0.2] * 2
+
+        proposal = propose_scope_endpoints(
+            EndpointScope("needle-bracketed", 0, len(energies) * 1_000),
+            _synthetic_features(
+                energies,
+                flatness,
+                impulses={music_count + runout_count},
+                centroids=centroids,
+                high_frequency_ratios=high_ratios,
+            ),
+            sample_rate=1_000,
+        )
+
+        self.assertEqual(proposal.status, "partial")
+        self.assertEqual(proposal.start.status, "abstained")
+        self.assertEqual(proposal.end.status, "proposed")
+        self.assertEqual(proposal.end.sample, music_count * 1_000)
+        self.assertIn(
+            "needle_bracketed_low_frequency_groove_context",
+            proposal.end.reasons,
         )
 
     def test_feature_windows_must_be_exact_adjacent_and_scope_bound(self) -> None:
@@ -194,11 +239,7 @@ class EndpointProposalIntegrationTests(unittest.TestCase):
             fade = sample_rate // 2
             envelope[:fade] = np.linspace(0.08, 1.0, fade)
             envelope[-fade:] = np.linspace(1.0, 0.08, fade)
-            mono[start:end] += (
-                0.12
-                * envelope
-                * np.sin(2.0 * np.pi * frequency * time[start:end])
-            )
+            mono[start:end] += 0.12 * envelope * np.sin(2.0 * np.pi * frequency * time[start:end])
         for seconds in (1.3, 5.7, 8.3, 12.7):
             sample = round(seconds * sample_rate)
             mono[sample : sample + 2] = (0.9, -0.9)
@@ -259,10 +300,7 @@ class EndpointProposalIntegrationTests(unittest.TestCase):
 
     @staticmethod
     def _receipts(paths: tuple[Path, ...]) -> dict[str, str]:
-        return {
-            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in paths
-        }
+        return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
     def _scopes(self, sample_rate: int) -> tuple[EndpointScope, EndpointScope]:
         return (
@@ -291,11 +329,11 @@ class EndpointProposalIntegrationTests(unittest.TestCase):
         ):
             self.assertEqual(proposal["status"], "proposed", proposal)
             self.assertLessEqual(
-                abs(proposal["proposed_music_start_sample"] - expected_start),
+                abs(proposal["start"]["sample"] - expected_start),
                 sample_rate // 2,
             )
             self.assertLessEqual(
-                abs(proposal["proposed_music_end_sample_exclusive"] - expected_end),
+                abs(proposal["end"]["sample"] - expected_end),
                 sample_rate // 2,
             )
             self.assertTrue(proposal["requires_review"])
@@ -334,11 +372,14 @@ class EndpointProposalIntegrationTests(unittest.TestCase):
             target.write_bytes(b"concurrent owner")
             raise FileExistsError("destination appeared")
 
-        with mock.patch.object(
-            endpoint_module,
-            "rename_no_replace",
-            side_effect=collide,
-        ), self.assertRaisesRegex(ProjectValidationError, "appeared"):
+        with (
+            mock.patch.object(
+                endpoint_module,
+                "rename_no_replace",
+                side_effect=collide,
+            ),
+            self.assertRaisesRegex(ProjectValidationError, "appeared"),
+        ):
             write_endpoint_proposal_document(document, raced)
         self.assertEqual(raced.read_bytes(), b"concurrent owner")
         self.assertEqual(tuple(self.root.glob(".raced endpoint proposal.json.*.tmp")), ())
@@ -369,13 +410,18 @@ class EndpointProposalIntegrationTests(unittest.TestCase):
         )
         tampered = copy.deepcopy(document)
         tampered["scopes"][0]["requires_review"] = False
-        without_hash = {
-            key: tampered[key] for key in tampered if key != "proposal_sha256"
-        }
+        without_hash = {key: tampered[key] for key in tampered if key != "proposal_sha256"}
         tampered["proposal_sha256"] = canonical_json_sha256(without_hash)
 
         with self.assertRaisesRegex(ProjectValidationError, "requires human review"):
             validate_endpoint_proposal_document(tampered)
+
+        inconsistent = copy.deepcopy(document)
+        inconsistent["scopes"][0]["status"] = "abstained"
+        without_hash = {key: inconsistent[key] for key in inconsistent if key != "proposal_sha256"}
+        inconsistent["proposal_sha256"] = canonical_json_sha256(without_hash)
+        with self.assertRaisesRegex(ProjectValidationError, "does not match"):
+            validate_endpoint_proposal_document(inconsistent)
 
     def test_snapshot_substitution_is_detected_before_a_proposal_can_publish(self) -> None:
         project_path, _source_path, sample_rate = self._project()

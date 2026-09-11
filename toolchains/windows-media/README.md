@@ -64,10 +64,10 @@ It completely decodes the generated audio and byte-compares extracted art.
 
 ## Reference build
 
-The reference environment is the `neuroforge` WSL Ubuntu 24.04 instance. Run:
+The reference environment is WSL with Ubuntu 24.04. From a local checkout, run:
 
 ```bash
-cd '/mnt/n/HomelabForge/Groove Serpent/toolchains/windows-media'
+cd toolchains/windows-media
 /usr/bin/bash --noprofile --norc -p ./bootstrap-ubuntu-24.04.sh
 DIST_DIR=/tmp/gs-media-dist-a /usr/bin/python3.12 -I -B ./build.py
 ```
@@ -124,8 +124,8 @@ provider check and every subsequent helper, key, package, verification, and
 source-archive read come from that snapshot, which is revalidated before and
 after important consumers and immediately before publication.
 Staged file and directory modes are normalized explicitly before hashing and
-archiving. The WSL smoke converts native Linux paths to the documented
-`\\wsl.localhost\DISTRO\...` form directly and does not depend on WSL's
+archiving. The WSL smoke converts native Linux paths to the distribution's
+Windows UNC form directly and does not depend on WSL's
 unpackaged `wslpath` shim.
 The build refuses a different version, a different generic MinGW thread
 variant, an existing output directory, any input hash/signature mismatch, any

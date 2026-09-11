@@ -27,8 +27,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from .atomic_create import probe_atomic_no_replace, rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    probe_atomic_no_replace,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import ProjectValidationError
+from .file_identity import stable_creation_time_ns
 from .portable_names import portable_relative_path_key
 
 
@@ -58,11 +65,7 @@ class _LockIdentity:
             file_type=stat.S_IFMT(value.st_mode),
             link_count=int(value.st_nlink),
             size=int(value.st_size),
-            birth_ns=(
-                int(birth) if (birth := getattr(value, "st_birthtime_ns", None))
-                is not None
-                else None
-            ),
+            birth_ns=stable_creation_time_ns(value),
             file_attributes=(
                 int(attributes)
                 if (attributes := getattr(value, "st_file_attributes", None))
@@ -118,7 +121,6 @@ class _TargetIdentity:
 
     @classmethod
     def capture(cls, value: os.stat_result) -> _TargetIdentity:
-        birth = getattr(value, "st_birthtime_ns", None)
         attributes = getattr(value, "st_file_attributes", None)
         return cls(
             device=int(value.st_dev),
@@ -128,7 +130,7 @@ class _TargetIdentity:
             size=int(value.st_size),
             modified_ns=int(value.st_mtime_ns),
             changed_ns=int(value.st_ctime_ns),
-            birth_ns=int(birth) if birth is not None else None,
+            birth_ns=stable_creation_time_ns(value),
             file_attributes=int(attributes) if attributes is not None else None,
         )
 
@@ -247,10 +249,14 @@ def _write_new_lock_file(path: Path) -> None:
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(_LOCK_MAGIC)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary, _LOCK_MAGIC, owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         try:
             rename_no_replace(temporary, path)
@@ -261,7 +267,8 @@ def _write_new_lock_file(path: Path) -> None:
                 "The filesystem cannot atomically create a project write lock."
             ) from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 def _ensure_lock_file(path: Path) -> None:

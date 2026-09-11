@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass, replace
@@ -16,8 +15,21 @@ from . import __version__
 from .atomic_create import rename_no_replace
 from .cache_storage import ensure_free_space
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
-from .media import find_tool, probe_audio, run_ffmpeg, tool_version
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    probe_audio,
+    run_ffmpeg,
+    tool_version,
+)
 from .models import Project, Track, resolve_source_path, utc_now_iso
+from .owned_directory import (
+    OwnedDirectoryReceipt,
+    assert_owned_directory_receipt,
+    capture_owned_directory_receipt,
+    register_owned_directory,
+    remove_owned_directory_if_present,
+)
 from .portable_names import (
     PortablePathError,
     normalize_portable_name,
@@ -247,7 +259,9 @@ def _resolve_portable_export_path(
     return resolved, resolution.entry_exists
 
 
-def _cleanup_staging_directory(stage_dir: Path, expected_parent: Path) -> None:
+def _cleanup_staging_directory(
+    stage_dir: Path, expected_parent: Path, receipt: OwnedDirectoryReceipt | None,
+) -> None:
     """Remove only a staging entry created by this exporter beside its target."""
 
     if stage_dir.parent != expected_parent or not (
@@ -257,12 +271,9 @@ def _cleanup_staging_directory(stage_dir: Path, expected_parent: Path) -> None:
         raise ExportError(
             f"Refusing to remove an unexpected export staging path: {stage_dir}"
         )
-    if not _path_entry_exists(stage_dir):
-        return
-    if stage_dir.is_symlink() or not stage_dir.is_dir():
-        stage_dir.unlink()
-    else:
-        shutil.rmtree(stage_dir)
+    if receipt is None:
+        raise ExportError(f"Staging cleanup has no ownership receipt; preserved {stage_dir}")
+    remove_owned_directory_if_present(stage_dir, receipt)
 
 
 def _cover_art_details(
@@ -848,6 +859,35 @@ def _decoded_pcm_sha256(
     return digest.hexdigest()
 
 
+def _verify_render_source_geometry(
+    source_snapshot: Path,
+    *,
+    source_sample_rate: int,
+    source_channels: int,
+    source_bits: int | None,
+    output_format: str,
+) -> None:
+    """Refuse encoding authority that disagrees with the actual input stream."""
+
+    actual = _probe_exact_audio_stream(source_snapshot)
+    if (
+        actual["sample_rate"] != source_sample_rate
+        or actual["channels"] != source_channels
+        or actual["bits_per_raw_sample"] != source_bits
+    ):
+        raise ExportError(
+            "Source stream geometry or PCM precision differs from the render binding."
+        )
+    if output_format == "flac" and source_bits is not None:
+        if source_bits > 24 or actual["sample_format"] not in {
+            "u8", "u8p", "s16", "s16p", "s32", "s32p",
+        }:
+            raise ExportError(
+                "FLAC export requires integer source PCM precision no greater than 24 bits. "
+                "The source cannot be losslessly represented by this encoder."
+            )
+
+
 def _verify_staged_output(
     *,
     staged_path: Path,
@@ -861,6 +901,13 @@ def _verify_staged_output(
     source_speed_factor: float | None,
     total_tracks: int,
 ) -> _StagedAudioVerification:
+    _verify_render_source_geometry(
+        source_snapshot,
+        source_sample_rate=source_sample_rate,
+        source_channels=source_channels,
+        source_bits=source_bits,
+        output_format=output_format,
+    )
     details = _probe_exact_audio_stream(staged_path)
     expected_codec = "flac" if output_format == "flac" else "aac"
     if details["codec_name"] != expected_codec:
@@ -918,7 +965,10 @@ def _verify_staged_output(
                 f"Staged FLAC '{staged_path.name}' declares {declared_bits}-bit PCM; "
                 f"expected {expected_bits}-bit PCM."
             )
-        pcm_format = "s32le" if declared_bits > 16 else "s16le"
+        # Never choose the comparison precision from the output: downconverting
+        # both streams would hide lost low-order bits in an incorrectly encoded
+        # "archival" file. This preserves every supported integer source bit.
+        pcm_format = "s32le"
         decoded_pcm_sha256 = _decoded_pcm_sha256(staged_path, sample_format=pcm_format)
         if source_speed_factor is None and source_bits is not None:
             source_range_pcm_sha256 = _decoded_pcm_sha256(
@@ -1141,6 +1191,17 @@ def render_verified_track(
     length, complete-decode, and lossless PCM checks as ``export_project``.
     """
 
+    if portable_path_entry_exists(staged_path):
+        raise ExportError(
+            f"Refusing an existing staged output: {staged_path.name}"
+        )
+    _verify_render_source_geometry(
+        source_snapshot,
+        source_sample_rate=source_sample_rate,
+        source_channels=source_channels,
+        source_bits=source_bits,
+        output_format=output_format,
+    )
     command = _build_command(
         source_path=source_snapshot,
         output_path=staged_path,
@@ -1299,16 +1360,8 @@ def export_project(
     source_receipt = capture_file_receipt(source_path, label="Source audio")
     current_source = probe_audio(source_path)
     if (
-        not operation_project.source.sha256
-        or current_source.sha256.lower() != source_receipt.sha256
-        or source_receipt.sha256 != operation_project.source.sha256.lower()
-        or current_source.size_bytes != operation_project.source.size_bytes
-        or current_source.sample_rate != operation_project.source.sample_rate
-        or current_source.channels != operation_project.source.channels
-        or abs(
-            current_source.duration_seconds - operation_project.source.duration_seconds
-        )
-        > 0.05
+        current_source.sha256.lower() != source_receipt.sha256
+        or audio_source_descriptor_mismatches(operation_project.source, current_source)
     ):
         raise ExportError(
             "The source audio no longer matches the file that was analyzed. "
@@ -1480,12 +1533,15 @@ def export_project(
         f"{_STAGING_PREFIX}{uuid.uuid4().hex}{_STAGING_SUFFIX}"
     )
     stage_created = False
+    stage_receipt: OwnedDirectoryReceipt | None = None
     exported: list[ExportedFile] = []
     try:
         stage_dir.mkdir()
         stage_created = True
+        stage_receipt = capture_owned_directory_receipt(stage_dir)
         operation_dir = stage_dir / ".operation-inputs"
         operation_dir.mkdir()
+        register_owned_directory(stage_receipt, operation_dir)
         source_snapshot = operation_dir / (
             "source" + (source_path.suffix.casefold() or ".audio")
         )
@@ -1680,7 +1736,7 @@ def export_project(
                 artwork_snapshot_receipt,
                 label="Staged artwork snapshot",
             )
-        shutil.rmtree(operation_dir)
+        remove_owned_directory_if_present(operation_dir, stage_receipt)
 
         if canonical_json_sha256(project.to_dict()) != operation_project_sha256:
             raise ExportError(
@@ -1703,18 +1759,21 @@ def export_project(
                 "The output directory was created while this batch was staging; "
                 "nothing was replaced."
             )
+        assert_owned_directory_receipt(stage_dir, stage_receipt)
         rename_no_replace(stage_dir, output_dir)
         stage_created = False
     except BaseException as exc:
         cleanup_error: Exception | None = None
         if stage_created:
             try:
-                _cleanup_staging_directory(stage_dir, output_dir.parent)
+                _cleanup_staging_directory(stage_dir, output_dir.parent, stage_receipt)
             except (
                 Exception
             ) as cleanup_exc:  # pragma: no cover - rare filesystem failure
                 cleanup_error = cleanup_exc
         if not isinstance(exc, Exception):
+            if cleanup_error is not None:
+                exc.add_note(f"Staging cleanup preserved uncertain material: {cleanup_error}")
             raise
         if isinstance(exc, ExportError) and cleanup_error is None:
             raise

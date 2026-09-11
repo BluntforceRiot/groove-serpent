@@ -49,6 +49,7 @@ from groove_serpent.models import (
     Project,
     Track,
 )
+from groove_serpent.publication import canonical_json_sha256
 from groove_serpent.project_io import load_project_with_sha256, save_project
 from groove_serpent.restoration_catalog import (
     RestorationArtifact,
@@ -60,6 +61,7 @@ from groove_serpent.restoration_catalog import (
 from groove_serpent.restoration_workflow import (
     SCAN_SCHEMA,
     _detector_manifest,
+    create_click_preview,
     create_restoration_recipe,
     render_restored_side,
     scan_project_clicks,
@@ -75,6 +77,47 @@ _OBSERVATIONS = ToolObservations(
     ffmpeg_version_output_sha256="3" * 64,
     ffprobe_version_output_sha256="4" * 64,
 )
+
+
+def _test_owner_authority_proof(
+    approved: dict[str, object],
+    preview_manifest: Path,
+) -> dict[str, object]:
+    """Create exact-shaped owner authority for an isolated workflow fixture."""
+
+    preview = json.loads(preview_manifest.read_text(encoding="utf-8"))
+    preview_candidates = preview.get("candidates")
+    if not isinstance(preview_candidates, list) or not any(
+        isinstance(item, dict) and item.get("id") == approved["id"]
+        for item in preview_candidates
+    ):
+        raise AssertionError("Fixture preview does not cover the approved candidate.")
+    preview_sha256 = sha256_file(preview_manifest)
+    journal_sha256 = hashlib.sha256(b"builder-owner-journal").hexdigest()
+    body_sha256 = hashlib.sha256(b"builder-owner-journal-body").hexdigest()
+    candidate_id = str(approved["id"])
+    return {
+        "schema": "groove-serpent.owner-authority-proof/1",
+        "channel": "same-origin-owner-cookie",
+        "claim": "owner-channel-action-not-human-perception",
+        "decision_journal": {
+            "token": f"decision-{journal_sha256[:32]}",
+            "sha256": journal_sha256,
+            "body_sha256": body_sha256,
+        },
+        "approvals": [
+            {
+                "candidate_id": candidate_id,
+                "candidate_sha256": canonical_json_sha256(approved),
+                "preview_token": f"preview-{preview_sha256[:32]}",
+                "preview_sha256": preview_sha256,
+                "auditioned_roles": ["before", "proposed", "removed"],
+                "capability_sha256": hashlib.sha256(
+                    f"builder-owner-{candidate_id}".encode("utf-8")
+                ).hexdigest(),
+            }
+        ],
+    }
 
 
 class AlbumPublicationBuilderTests(unittest.TestCase):
@@ -969,12 +1012,25 @@ class AlbumPublicationBuilderTests(unittest.TestCase):
             }
             for item in candidates
         ]
+        preview_bundle = workspace / f"preview-{'d' * 32}"
+        create_click_preview(
+            project_path,
+            scan_path,
+            approved["id"],
+            preview_bundle,
+            context_seconds=0.1,
+        )
         recipe_path = workspace / f"recipe-{'b' * 32}.json"
         create_restoration_recipe(
             project_path,
             scan_path,
             decisions,
             recipe_path,
+            review_preview_manifests=[preview_bundle / "preview.json"],
+            owner_authority_proof=_test_owner_authority_proof(
+                approved,
+                preview_bundle / "preview.json",
+            ),
         )
         render_bundle = workspace / f"render-{'c' * 32}"
         render_restored_side(

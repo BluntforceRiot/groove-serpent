@@ -21,8 +21,19 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import ProjectValidationError
+from .portable_names import (
+    PortablePathError,
+    portable_path_entry_exists,
+    resolve_portable_path,
+)
+from .transaction_lock import exclusive_target_write_lease
 from .publication import same_file_object_stats
 from .validation import strict_finite_number
 
@@ -1669,23 +1680,52 @@ def save_album_publication_plan(plan: AlbumPublicationPlan, path: Path) -> None:
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary,
+                text.encode("utf-8"),
+                owned_descriptor=handle.fileno(),
+            )
             os.fsync(handle.fileno())
-        try:
-            rename_no_replace(temporary, destination)
-        except FileExistsError as exc:
-            raise ProjectValidationError(
-                f"Publication plan already exists: {destination}."
-            ) from exc
-        except OSError as exc:
-            raise ProjectValidationError(
-                "The filesystem cannot atomically create a no-overwrite publication plan."
-            ) from exc
+        assert temporary_receipt is not None
+        with exclusive_target_write_lease(destination) as write_lease:
+            write_lease.assert_current()
+            if portable_path_entry_exists(destination):
+                raise ProjectValidationError(
+                    "Publication plan or a portable-equivalent sibling already exists: "
+                    f"{destination}."
+                )
+            try:
+                rename_no_replace(temporary, destination)
+            except FileExistsError as exc:
+                raise ProjectValidationError(
+                    f"Publication plan already exists: {destination}."
+                ) from exc
+            except OSError as exc:
+                raise ProjectValidationError(
+                    "The filesystem cannot atomically create a no-overwrite "
+                    "publication plan."
+                ) from exc
+            try:
+                confirmed = resolve_portable_path(destination)
+            except PortablePathError as exc:
+                remove_owned_file_if_present(destination, temporary_receipt)
+                raise ProjectValidationError(
+                    "A portable-equivalent publication plan appeared during commit."
+                ) from exc
+            if not confirmed.entry_exists or confirmed.path != destination:
+                remove_owned_file_if_present(destination, temporary_receipt)
+                raise ProjectValidationError(
+                    "The publication plan destination changed during commit."
+                )
+            write_lease.assert_current()
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,12 +15,13 @@ import threading
 import unicodedata
 import uuid
 import webbrowser
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable, Iterator, Mapping, cast
 from urllib.parse import urlsplit
 
 from .album import (
@@ -76,10 +77,14 @@ from .album_identification_catalog import (
     save_album_identification_proposal,
 )
 from .album_workbench import build_album_workbench_state
+from .atomic_create import OwnedFileReceipt, remove_owned_file_if_present
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
+from .endpoint_proposals import EndpointScope
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
+from .file_identity import stable_creation_time_ns
 from .media import sha256_file
 from .metadata import (
+    ArtworkDownloadResult,
     CoverArtArchiveClient,
     MetadataLookupError,
     MusicBrainzClient,
@@ -87,18 +92,24 @@ from .metadata import (
 from .models import Project, resolve_source_path
 from .portable_names import portable_name_key
 from .project_io import load_project_with_sha256
+from .transaction_lock import (
+    TargetWriteLease,
+    exclusive_target_write_lease,
+    target_lock_path,
+)
 from .publication import canonical_json_sha256
 from .recognition import (
     AcoustIDRecognitionProvider,
     RecognitionError,
     RecognitionProvider,
 )
-from .review_server import ReviewServer
+from .review_server import ReviewServer, _drain_rejected_request_body
 from .session_auth import (
     LoopbackSessionAuth,
     SessionAuthentication,
     request_target_is_exact,
 )
+from .strict_json import decode_strict_json
 
 
 _MAX_REQUEST_BODY = 64 * 1024
@@ -174,6 +185,8 @@ class _SideReviewChild:
     side_label: str
     project_path: Path
     current_identity: dict[str, int | str]
+    endpoint_scope: EndpointScope
+    cohort_sha256: str
     server: ReviewServer
     thread: threading.Thread
     url: str = field(repr=False)
@@ -251,19 +264,6 @@ def _normalized_host(host: str) -> str:
         return str(ipaddress.ip_address(host))
     except ValueError:
         return host.casefold()
-
-
-def _strict_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"Duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"Invalid JSON number: {value}")
 
 
 def _strict_object(
@@ -703,6 +703,159 @@ def _resolved_side_project(state: Mapping[str, Any], side_label: str) -> Path:
     return resolved
 
 
+def _side_project_file_binding(path: Path) -> dict[str, int | str | None]:
+    """Bind one cohort member to its canonical path and file incarnation."""
+
+    try:
+        value = path.lstat()
+    except OSError as exc:
+        raise _AlbumConflictError(
+            "A side project could not be inspected while its scope was bound."
+        ) from exc
+    if (
+        path.is_symlink()
+        or _is_reparse(value)
+        or not stat.S_ISREG(value.st_mode)
+        or int(value.st_nlink) != 1
+    ):
+        raise _AlbumConflictError(
+            "A side project must remain a single-link regular non-reparse file."
+        )
+    attributes = getattr(value, "st_file_attributes", None)
+    return {
+        "canonical_path": os.path.normcase(os.path.normpath(os.fspath(path))),
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "mode": int(value.st_mode),
+        "link_count": int(value.st_nlink),
+        "size": int(value.st_size),
+        "modified_ns": int(value.st_mtime_ns),
+        "changed_ns": int(value.st_ctime_ns),
+        "birth_ns": stable_creation_time_ns(value),
+        "file_attributes": int(attributes) if attributes is not None else None,
+    }
+
+
+def _side_endpoint_scope_binding(
+    state: Mapping[str, Any], side_label: str
+) -> tuple[EndpointScope, str]:
+    """Derive and bind one scope to every same-source sibling identity."""
+
+    target_path = _resolved_side_project(state, side_label)
+    target_project, _target_sha256 = load_project_with_sha256(target_path)
+    source_sample_count = target_project.source.sample_count
+    if type(source_sample_count) is not int or source_sample_count <= 0:
+        raise ProjectValidationError(
+            "Shared-capture side review requires an exact positive sample count."
+        )
+    target_source = resolve_source_path(target_project, target_path).resolve()
+    shared: list[
+        tuple[
+            int,
+            int,
+            str,
+            Project,
+            dict[str, int | str],
+            dict[str, int | str | None],
+        ]
+    ] = []
+    raw_sides = state.get("sides")
+    if type(raw_sides) is not list:
+        raise RuntimeError("Album Workbench state has no side list.")
+    for raw_side in raw_sides:
+        if type(raw_side) is not dict:
+            raise RuntimeError("Album Workbench state contains an invalid side.")
+        label = raw_side.get("label")
+        if not isinstance(label, str):
+            raise RuntimeError("Album Workbench state contains an invalid side label.")
+        project_path = _resolved_side_project(state, label)
+        project, project_sha256 = load_project_with_sha256(project_path)
+        current_identity = _side_current_identity(state, label)
+        if current_identity["project_sha256"] != project_sha256:
+            raise _AlbumConflictError(
+                f"Side {label} changed while its physical scope was bound."
+            )
+        source = resolve_source_path(project, project_path).resolve()
+        try:
+            same_source = source.samefile(target_source)
+        except OSError:
+            same_source = source == target_source
+        if not same_source:
+            continue
+        if project.source.sample_count != source_sample_count:
+            raise ProjectValidationError(
+                "Shared-capture side projects disagree about the source sample count."
+            )
+        shared.append(
+            (
+                project.tracks[0].start_sample,
+                project.tracks[-1].end_sample,
+                label,
+                project,
+                current_identity,
+                _side_project_file_binding(project_path),
+            )
+        )
+    shared.sort(key=lambda item: (item[0], item[1], item[2].casefold()))
+    target_index = next(
+        (index for index, item in enumerate(shared) if item[2] == side_label),
+        None,
+    )
+    if target_index is None:
+        raise RuntimeError("Album Workbench could not bind the selected side scope.")
+    boundaries: list[int] = []
+    for left, right in zip(shared, shared[1:]):
+        if left[1] >= right[0]:
+            raise ProjectValidationError(
+                "Shared-capture side projects overlap or are not physically ordered."
+            )
+        boundaries.append((left[1] + right[0]) // 2)
+    start = 0 if target_index == 0 else boundaries[target_index - 1]
+    end = (
+        source_sample_count
+        if target_index == len(shared) - 1
+        else boundaries[target_index]
+    )
+    scope = EndpointScope(f"Side {side_label}", start, end)
+    scope.validate(source_sample_count)
+    if (
+        scope.start_sample > target_project.tracks[0].start_sample
+        or scope.end_sample_exclusive < target_project.tracks[-1].end_sample
+    ):
+        raise ProjectValidationError(
+            "The derived physical-side scope does not contain every reviewed track."
+        )
+    cohort_sha256 = canonical_json_sha256(
+        {
+            "source_sha256": target_project.source.sha256,
+            "source_sample_count": source_sample_count,
+            "members": [
+                {
+                    "label": label,
+                    "track_start_sample": track_start,
+                    "track_end_sample": track_end,
+                    "current_identity": identity,
+                    "project_file": project_file,
+                }
+                for (
+                    track_start,
+                    track_end,
+                    label,
+                    _project,
+                    identity,
+                    project_file,
+                ) in shared
+            ],
+            "scope": {
+                "label": scope.label,
+                "start_sample": scope.start_sample,
+                "end_sample_exclusive": scope.end_sample_exclusive,
+            },
+        }
+    )
+    return scope, cohort_sha256
+
+
 def _review_server_url(server: ReviewServer) -> str:
     address = server.server_address
     if server.address_family != socket.AF_INET or not isinstance(address, tuple):
@@ -1084,6 +1237,8 @@ def _safe_review_artwork_path(
 ) -> tuple[Path, bytes]:
     """Open and verify one contained review image without trusting its pathname."""
 
+    if type(expected_size) is not int or not 1 <= expected_size <= 25 * 1024 * 1024:
+        raise ProjectValidationError("Review artwork has an invalid bounded byte length.")
     normalized = _strict_relative_reference(relative_path, "Review artwork path")
     if "\\" in normalized or not normalized.startswith("artwork/review/"):
         raise ProjectValidationError(
@@ -1112,7 +1267,9 @@ def _safe_review_artwork_path(
                 raise ProjectValidationError("Review artwork identity changed before preview.")
             digest = hashlib.sha256()
             body = bytearray()
-            while chunk := handle.read(1024 * 1024):
+            while chunk := handle.read(min(1024 * 1024, expected_size - len(body) + 1)):
+                if len(body) + len(chunk) > expected_size:
+                    raise ProjectValidationError("Review artwork grew beyond its reviewed size.")
                 digest.update(chunk)
                 body.extend(chunk)
             after = os.fstat(handle.fileno())
@@ -1125,6 +1282,7 @@ def _safe_review_artwork_path(
         not os.path.samestat(before, after)
         or not os.path.samestat(before, current)
         or _is_reparse(current)
+        or len(body) != expected_size
         or digest.hexdigest() != expected_sha256
     ):
         raise ProjectValidationError("Review artwork changed after download.")
@@ -1132,7 +1290,7 @@ def _safe_review_artwork_path(
 
 
 def _normalize_artwork_download(value: Any) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != {
+    if type(value) not in {dict, ArtworkDownloadResult} or set(value) != {
         "relative_path",
         "source_url",
         "mime_type",
@@ -1182,9 +1340,15 @@ def _normalize_artwork_download(value: Any) -> dict[str, Any]:
     }
 
 
-def _discard_exact_review_artwork(album_path: Path, artwork: Mapping[str, Any]) -> None:
+def _discard_exact_review_artwork(
+    album_path: Path,
+    artwork: Mapping[str, Any],
+    receipt: OwnedFileReceipt | None = None,
+) -> bool:
     """Remove only the exact server-created file after a failed final identity lease."""
 
+    if receipt is None:
+        return False
     try:
         candidate, _body = _safe_review_artwork_path(
             album_path,
@@ -1192,9 +1356,9 @@ def _discard_exact_review_artwork(album_path: Path, artwork: Mapping[str, Any]) 
             expected_sha256=cast(str, artwork["sha256"]),
             expected_size=cast(int, artwork["size_bytes"]),
         )
-        candidate.unlink()
+        return remove_owned_file_if_present(candidate, receipt)
     except (KeyError, OSError, ProjectValidationError, TypeError, ValueError):
-        return
+        return False
 
 
 def _snapshot_album_identification_inputs(
@@ -1581,6 +1745,7 @@ def _save_album_mutation(
         raise _AlbumConflictError(
             "The album revision did not advance exactly once. Reload."
         )
+    server.retire_stale_side_reviews(updated_state)
     return updated_state
 
 
@@ -1663,28 +1828,153 @@ class AlbumReviewServer(ThreadingHTTPServer):
         finally:
             connection.close()
 
+    @contextmanager
+    def _side_endpoint_transaction(
+        self, project_path: Path
+    ) -> Iterator[TargetWriteLease]:
+        """Serialize side acceptance with the album and every sibling project."""
+
+        with self.operation_lock:
+            with exclusive_target_write_lease(self.album_path):
+                album = load_album_project(self.album_path)
+                selected_lock = target_lock_path(project_path)
+                selected_key = os.path.normcase(
+                    os.path.normpath(os.fspath(selected_lock))
+                )
+                project_targets: dict[str, Path] = {selected_key: project_path}
+                for side in album.sides:
+                    target = resolve_album_reference(
+                        self.album_path,
+                        side.project,
+                        f"Album side {side.label} project reference",
+                    )
+                    lock_path = target_lock_path(target)
+                    lock_key = os.path.normcase(
+                        os.path.normpath(os.fspath(lock_path))
+                    )
+                    project_targets.setdefault(lock_key, target)
+                with ExitStack() as project_leases:
+                    selected_lease: TargetWriteLease | None = None
+                    for lock_key in sorted(project_targets):
+                        lease = project_leases.enter_context(
+                            exclusive_target_write_lease(project_targets[lock_key])
+                        )
+                        if lock_key == selected_key:
+                            selected_lease = lease
+                    if selected_lease is None:
+                        raise AssertionError("Selected side write lease was not acquired.")
+                    yield selected_lease
+
     def retire_stale_side_review(
         self,
         side_label: str,
         current_identity: Mapping[str, Any],
+        endpoint_scope: EndpointScope,
+        cohort_sha256: str,
     ) -> None:
-        """Close a child that no longer represents the side's exact identity."""
+        """Close a child that no longer represents its exact cohort-derived scope."""
 
         stale: _SideReviewChild | None = None
         with self._side_review_lock:
             existing = self._side_review_children.get(side_label)
-            if existing is not None and existing.current_identity != current_identity:
+            if existing is not None and (
+                existing.current_identity != current_identity
+                or existing.endpoint_scope != endpoint_scope
+                or existing.cohort_sha256 != cohort_sha256
+            ):
                 stale = self._side_review_children.pop(side_label)
         if stale is not None:
             stale.close()
+
+    def retire_stale_side_reviews(self, state: Mapping[str, Any]) -> None:
+        """Retire every child whose same-source cohort or scope changed."""
+
+        with self._side_review_lock:
+            children = list(self._side_review_children.items())
+        stale: list[_SideReviewChild] = []
+        for side_label, child in children:
+            try:
+                identity = _side_current_identity(state, side_label)
+                scope, cohort_sha256 = _side_endpoint_scope_binding(state, side_label)
+                current = (
+                    identity == child.current_identity
+                    and scope == child.endpoint_scope
+                    and cohort_sha256 == child.cohort_sha256
+                )
+            except (GrooveSerpentError, OSError, RuntimeError, ValueError):
+                current = False
+            if current:
+                continue
+            with self._side_review_lock:
+                if self._side_review_children.get(side_label) is child:
+                    self._side_review_children.pop(side_label)
+                    stale.append(child)
+        for child in stale:
+            child.close()
+
+    def _validate_side_review_binding(
+        self,
+        side_label: str,
+        project_path: Path,
+        current_identity: Mapping[str, Any],
+        endpoint_scope: EndpointScope,
+        cohort_sha256: str,
+    ) -> EndpointScope:
+        """Recompute the live cohort immediately before child endpoint work."""
+
+        try:
+            album, album_sha256 = load_album_project_with_sha256(self.album_path)
+            state = _workbench_state(
+                album,
+                self.album_path,
+                album_sha256,
+                self.recognition_provider,
+            )
+            live_identity = _side_current_identity(state, side_label)
+            live_project_path = _resolved_side_project(state, side_label)
+            live_scope, live_cohort_sha256 = _side_endpoint_scope_binding(
+                state, side_label
+            )
+        except (OSError, ProjectValidationError, RuntimeError, ValueError) as exc:
+            raise _AlbumConflictError(
+                f"Side {side_label} or its shared-capture cohort changed. Reopen review."
+            ) from exc
+        if _album_digest_or_conflict(self.album_path) != album_sha256:
+            raise _AlbumConflictError(
+                f"Side {side_label} cohort changed while its scope was verified. Reopen review."
+            )
+        if (
+            live_project_path != project_path
+            or live_identity != current_identity
+            or live_scope != endpoint_scope
+            or live_cohort_sha256 != cohort_sha256
+        ):
+            raise _AlbumConflictError(
+                f"Side {side_label} physical scope changed. Close and reopen review."
+            )
+        return live_scope
 
     def open_side_review(
         self,
         side_label: str,
         project_path: Path,
         current_identity: dict[str, int | str],
+        endpoint_scope: EndpointScope,
+        cohort_sha256: str | None = None,
     ) -> tuple[_SideReviewChild, bool]:
         """Reuse or start the child bound to one exact side-project identity."""
+
+        if cohort_sha256 is None:
+            cohort_sha256 = canonical_json_sha256(
+                {
+                    "current_identity": current_identity,
+                    "scope": {
+                        "label": endpoint_scope.label,
+                        "start_sample": endpoint_scope.start_sample,
+                        "end_sample_exclusive": endpoint_scope.end_sample_exclusive,
+                    },
+                }
+            )
 
         stale: _SideReviewChild | None = None
         with self._side_review_lock:
@@ -1695,6 +1985,8 @@ class AlbumReviewServer(ThreadingHTTPServer):
                 if (
                     existing.project_path == project_path
                     and existing.current_identity == current_identity
+                    and existing.endpoint_scope == endpoint_scope
+                    and existing.cohort_sha256 == cohort_sha256
                     and existing.thread.is_alive()
                 ):
                     existing.server.session_auth.rearm_bootstrap_if_consumed()
@@ -1704,7 +1996,24 @@ class AlbumReviewServer(ThreadingHTTPServer):
         if stale is not None:
             stale.close()
 
-        child_server = ReviewServer(("127.0.0.1", 0), project_path)
+        def validate_scope() -> EndpointScope:
+            return self._validate_side_review_binding(
+                side_label,
+                project_path,
+                current_identity,
+                endpoint_scope,
+                cohort_sha256,
+            )
+
+        child_server = ReviewServer(
+            ("127.0.0.1", 0),
+            project_path,
+            endpoint_scope=endpoint_scope,
+            endpoint_scope_validator=validate_scope,
+            endpoint_transaction_factory=lambda: self._side_endpoint_transaction(
+                project_path
+            ),
+        )
         thread: threading.Thread | None = None
         try:
             url = _review_server_url(child_server)
@@ -1718,6 +2027,8 @@ class AlbumReviewServer(ThreadingHTTPServer):
                 side_label=side_label,
                 project_path=project_path,
                 current_identity=dict(current_identity),
+                endpoint_scope=endpoint_scope,
+                cohort_sha256=cohort_sha256,
                 server=child_server,
                 thread=thread,
                 url=url,
@@ -1743,6 +2054,8 @@ class AlbumReviewServer(ThreadingHTTPServer):
                     existing is not None
                     and existing.project_path == project_path
                     and existing.current_identity == current_identity
+                    and existing.endpoint_scope == endpoint_scope
+                    and existing.cohort_sha256 == cohort_sha256
                     and existing.thread.is_alive()
                 ):
                     winner = existing
@@ -1824,6 +2137,7 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         self._validated_authority = authority
         if not self._request_has_session_access():
             self.close_connection = True
+            self._discard_declared_request_body()
             self._unauthorized()
             return False
         return True
@@ -1934,20 +2248,32 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         return True
 
     def _discard_declared_request_body(self) -> None:
+        _drain_rejected_request_body(self, _MAX_REQUEST_BODY)
+
+    def _validate_get_framing(self) -> bool:
+        """Reject body-bearing GET requests and close their connection."""
+
+        if self.headers.get_all("Transfer-Encoding", []):
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "GET does not accept Transfer-Encoding.")
+            return False
         lengths = self.headers.get_all("Content-Length", [])
-        if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
-            return
-        try:
-            remaining = int(lengths[0])
-        except ValueError:
-            return
-        if remaining < 0 or remaining > _MAX_REQUEST_BODY:
-            return
-        while remaining:
-            chunk = self.rfile.read(min(16 * 1024, remaining))
-            if not chunk:
-                return
-            remaining -= len(chunk)
+        if not lengths:
+            return True
+        if (
+            len(lengths) != 1
+            or not lengths[0].isascii()
+            or not lengths[0].isdigit()
+            or len(lengths[0]) > 20
+        ):
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "Invalid GET Content-Length header.")
+            return False
+        if int(lengths[0]) != 0:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "GET request bodies are not supported.")
+            return False
+        return True
 
     def _read_json(self) -> dict[str, Any]:
         lengths = self.headers.get_all("Content-Length", [])
@@ -1967,11 +2293,7 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise ProjectValidationError("Request body is incomplete.")
         try:
-            payload = json.loads(
-                raw_body.decode("utf-8"),
-                object_pairs_hook=_strict_object_pairs,
-                parse_constant=_reject_json_constant,
-            )
+            payload = decode_strict_json(raw_body)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
             self.close_connection = True
             raise ProjectValidationError("Request body is not valid JSON.") from exc
@@ -1991,6 +2313,8 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2030,6 +2354,8 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._validate_get_framing():
+            return
         if self.server.session_auth.is_bootstrap_target(self.path):
             self._bootstrap_session()
             return
@@ -2303,6 +2629,7 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
                 raise _AlbumConflictError(
                     "The album project changed while its new state was loaded. Reload."
                 )
+        self.server.retire_stale_side_reviews(updated_state)
         self._json(updated_state)
 
     def _add_side(self) -> None:
@@ -3090,6 +3417,7 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         if not self.server.metadata_network_lock.acquire(blocking=False):
             raise ProjectValidationError("Another metadata network action is already running.")
         normalized_artwork: dict[str, Any] | None = None
+        artwork_cleanup_receipt: OwnedFileReceipt | None = None
         try:
             with self.server.operation_lock:
                 _album, state = _load_expected_album(
@@ -3129,6 +3457,8 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
                     release_mbid,
                     size="1200",
                 )
+                if isinstance(raw_artwork, ArtworkDownloadResult):
+                    artwork_cleanup_receipt = raw_artwork.cleanup_receipt
             except MetadataLookupError as exc:
                 raise ProjectValidationError(
                     f"Cover Art Archive review failed: {str(exc)[:1_024]}"
@@ -3218,12 +3548,17 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
             )
             with self.server.release_review_lock:
                 self.server.artwork_previews[preview_token] = preview
-        except BaseException:
+        except BaseException as primary_error:
             if normalized_artwork is not None:
-                _discard_exact_review_artwork(
+                removed = _discard_exact_review_artwork(
                     self.server.album_path,
                     normalized_artwork,
+                    artwork_cleanup_receipt,
                 )
+                if not removed:
+                    primary_error.add_note(
+                        "Downloaded artwork preserved without proven original-writer ownership."
+                    )
             raise
         finally:
             self.server.metadata_network_lock.release()
@@ -4040,16 +4375,27 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
                 )
 
             current_identity = _side_current_identity(state, side_label)
-            self.server.retire_stale_side_review(side_label, current_identity)
             if current_identity != expected_identity:
                 raise _AlbumConflictError(
                     f"Side {side_label} changed after it was loaded. Reload."
                 )
             project_path = _resolved_side_project(state, side_label)
+            endpoint_scope, cohort_sha256 = _side_endpoint_scope_binding(
+                state, side_label
+            )
+            self.server.retire_stale_side_reviews(state)
+            self.server.retire_stale_side_review(
+                side_label,
+                current_identity,
+                endpoint_scope,
+                cohort_sha256,
+            )
             child, reused = self.server.open_side_review(
                 side_label,
                 project_path,
                 current_identity,
+                endpoint_scope,
+                cohort_sha256,
             )
 
             try:
@@ -4063,12 +4409,19 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
                     self.server.recognition_provider,
                 )
                 latest_identity = _side_current_identity(latest_state, side_label)
-            except (OSError, ProjectValidationError):
+                latest_scope, latest_cohort_sha256 = _side_endpoint_scope_binding(
+                    latest_state, side_label
+                )
+            except (OSError, ProjectValidationError, RuntimeError, ValueError):
                 self.server.retire_side_review(side_label)
                 raise _AlbumConflictError(
                     f"Side {side_label} changed while its review was opening. Reload."
                 ) from None
-            if latest_identity != current_identity:
+            if (
+                latest_identity != current_identity
+                or latest_scope != endpoint_scope
+                or latest_cohort_sha256 != cohort_sha256
+            ):
                 self.server.retire_side_review(side_label)
                 raise _AlbumConflictError(
                     f"Side {side_label} changed while its review was opening. Reload."

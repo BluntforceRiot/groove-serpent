@@ -132,6 +132,14 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 class BuildPythonDistributionsTests(unittest.TestCase):
+    def test_package_metadata_accepts_the_canonical_development_version(self) -> None:
+        name, version, normalized, distribution_root = builder._package_metadata(ROOT)
+
+        self.assertEqual(name, "groove-serpent")
+        self.assertEqual(version, "1.1.0")
+        self.assertEqual(normalized, "groove_serpent")
+        self.assertEqual(distribution_root, "groove_serpent-1.1.0")
+
     def test_constraints_pin_one_backend_with_both_expected_hashes(self) -> None:
         payload = (ROOT / "packaging" / "python-build-constraints.txt").read_bytes()
         receipt = builder._constraints(payload)
@@ -141,15 +149,47 @@ class BuildPythonDistributionsTests(unittest.TestCase):
         self.assertEqual(set(hashes), builder.SETUPTOOLS_HASHES)
         self.assertEqual(receipt["file_sha256"], hashlib.sha256(payload).hexdigest())
 
+    def test_uv_build_constraint_uses_encoded_local_file_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            source = root / "source tree"
+            source.mkdir()
+            constraints = root / "constraints with spaces.txt"
+            constraints.write_text("setuptools==83.0.0\n", encoding="utf-8")
+            environment = {"PATH": os.environ.get("PATH", "")}
+
+            with mock.patch.object(builder, "_run_bounded") as run:
+                builder._run_uv_build(
+                    root / "uv.exe",
+                    source,
+                    root / "raw output",
+                    constraints,
+                    environment,
+                )
+                builder._run_uv_wheel_from_sdist(
+                    root / "uv.exe",
+                    root / "package with spaces.tar.gz",
+                    root / "rebuilt output",
+                    constraints,
+                    environment,
+                )
+
+            expected = constraints.absolute().as_uri()
+            self.assertIn("%20", expected)
+            self.assertNotIn(" ", expected)
+            for call in run.call_args_list:
+                command = call.args[0]
+                index = command.index("--build-constraints")
+                self.assertEqual(command[index + 1], expected)
+
     def test_private_path_audit_rejects_both_windows_separator_forms(self) -> None:
         backslash = b"\\"
         slash = b"/"
-        private_album = b"Mystery" + b".flac"
         private_payloads = (
             backslash.join((b"C:", b"Users", b"Owner", b"private.flac")),
             slash.join((b"C:", b"Users", b"Owner", b"private.flac")),
-            backslash.join((b"N:", b"HomelabForge", b"Groove Serpent", private_album)),
-            slash.join((b"N:", b"HomelabForge", b"Groove Serpent", private_album)),
+            slash.join((b"", b"mnt", b"z", b"synthetic-workspace", b"capture.wav")),
+            slash.join((b"", b"home", b"synthetic-owner", b"capture.wav")),
         )
         for payload in private_payloads:
             with self.subTest(payload=payload), self.assertRaisesRegex(
@@ -442,34 +482,68 @@ class BuildPythonDistributionsTests(unittest.TestCase):
             grandchild_pid = root / "grandchild.pid"
             probe = root / "probe.py"
             probe.write_text(
-                "import subprocess, sys, time\n"
-                "code = (\"import os,pathlib,signal,subprocess,sys,time;\"\n"
-                "        \"signal.signal(signal.SIGTERM,signal.SIG_IGN);\"\n"
-                "        \"grand=subprocess.Popen([sys.executable,'-c',\"\n"
-                "        \"'import signal,time;signal.signal(signal.SIGTERM,\"\n"
-                "        \"signal.SIG_IGN);time.sleep(30)']);\"\n"
-                "        \"pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));\"\n"
-                "        \"pathlib.Path(sys.argv[2]).write_text(str(grand.pid));\"\n"
-                "        \"time.sleep(30)\")\n"
-                "child = subprocess.Popen([sys.executable, '-c', code, sys.argv[1], "
-                "sys.argv[2]])\n"
+                "import os, pathlib, signal, subprocess, sys, time\n"
+                "role = sys.argv[1]\n"
+                "if role == 'parent':\n"
+                "    time.sleep(1.25)\n"
+                "    subprocess.Popen([sys.executable, __file__, 'child', *sys.argv[2:]])\n"
+                "else:\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "    if role == 'child':\n"
+                "        subprocess.Popen([sys.executable, __file__, 'grandchild', "
+                "*sys.argv[2:]])\n"
+                "    destination = sys.argv[2] if role == 'child' else sys.argv[3]\n"
+                "    pathlib.Path(destination).write_text(str(os.getpid()), encoding='ascii')\n"
                 "time.sleep(30)\n",
                 encoding="utf-8",
             )
             environment = dict(os.environ)
-            with self.assertRaisesRegex(RuntimeError, "exceeded|survived forced cleanup"):
+            original_start = builder._OwnedProcessScope.start
+            ready_pids: set[int] = set()
+            ready_at: float | None = None
+
+            def start_ready(scope, *args, **kwargs):
+                nonlocal ready_at
+                process = original_start(scope, *args, **kwargs)
+                # Startup is a separate bounded fixture prerequisite. Do not spend the
+                # real one-second containment deadline importing three interpreters.
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline:
+                    self.assertIsNone(process.poll(), "Owned probe exited before readiness")
+                    try:
+                        pids = {
+                            int(child_pid.read_text(encoding="ascii")),
+                            int(grandchild_pid.read_text(encoding="ascii")),
+                        }
+                    except (FileNotFoundError, ValueError):
+                        time.sleep(0.02)
+                        continue
+                    if len(pids) == 2 and all(_pid_is_alive(pid) for pid in pids):
+                        ready_pids.update(pids)
+                        ready_at = time.monotonic()
+                        return process
+                    time.sleep(0.02)
+                self.fail("Owned child and grandchild did not become ready within 15 seconds")
+
+            with (
+                mock.patch.object(builder._OwnedProcessScope, "start", start_ready),
+                self.assertRaisesRegex(RuntimeError, "command exceeded 1 seconds"),
+            ):
                 builder._run_bounded(
-                    (sys.executable, str(probe), str(child_pid), str(grandchild_pid)),
+                    (sys.executable, str(probe), "parent", str(child_pid), str(grandchild_pid)),
                     root,
                     environment,
                     timeout_seconds=1.0,
                 )
+            self.assertIsNotNone(ready_at)
+            self.assertGreaterEqual(time.monotonic() - cast(float, ready_at), 1.0)
             self.assertTrue(child_pid.is_file())
             self.assertTrue(grandchild_pid.is_file())
             pids = {
                 int(child_pid.read_text(encoding="ascii")),
                 int(grandchild_pid.read_text(encoding="ascii")),
             }
+            self.assertEqual(pids, ready_pids)
             deadline = time.monotonic() + 3.0
             while any(_pid_is_alive(pid) for pid in pids) and time.monotonic() < deadline:
                 time.sleep(0.02)

@@ -195,9 +195,10 @@ jobs:
           from __future__ import annotations
 
           import pathlib
-          import re
           import tarfile
           import zipfile
+
+          from scripts._release_evidence import assert_public_payload_safe
 
           forbidden_endings = (
               ".aif",
@@ -210,12 +211,6 @@ jobs:
               ".mp3",
               ".restoration-recipe.json",
               ".wav",
-          )
-          private_patterns = (
-              re.compile(rb"[A-Za-z]:(?:/+|\\+)Users(?:/+|\\+)[^\\/\r\n]+", re.IGNORECASE),
-              re.compile(rb"[A-Za-z]:(?:/+|\\+)HomelabForge(?:/+|\\+)", re.IGNORECASE),
-              re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-              re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
           )
 
           archives = sorted(
@@ -255,10 +250,7 @@ jobs:
                   assert not lowered.endswith(forbidden_endings), (
                       f"Private media/project artifact packaged: {name}"
                   )
-                  for pattern in private_patterns:
-                      assert pattern.search(data) is None, (
-                          f"Private or secret material matched in {archive.name}:{name}"
-                      )
+                  assert_public_payload_safe(name, data, context="CI distribution member")
 
           print(f"Audited {len(archives)} distributions without private-content matches.")
 
@@ -311,8 +303,8 @@ jobs:
 
           root = pathlib.Path("dist")
           receipt_name = "PYTHON_DISTRIBUTIONS_RECEIPT.json"
-          wheel_name = "groove_serpent-1.0.0-py3-none-any.whl"
-          sdist_name = "groove_serpent-1.0.0.tar.gz"
+          wheel_name = "groove_serpent-1.1.0-py3-none-any.whl"
+          sdist_name = "groove_serpent-1.1.0.tar.gz"
           expected_names = {receipt_name, wheel_name, sdist_name}
           entries = list(root.iterdir())
           observed_names = {entry.name for entry in entries}
@@ -328,7 +320,7 @@ jobs:
               != "groove-serpent/python-distribution-build-receipt/1"
               or receipt.get("result") != "passed"
               or receipt.get("project")
-              != {"name": "groove-serpent", "version": "1.0.0"}
+              != {"name": "groove-serpent", "version": "1.1.0"}
           ):
               raise SystemExit("Final distribution receipt authority is invalid.")
           outputs = receipt.get("outputs")
@@ -356,8 +348,8 @@ jobs:
         with:
           name: python-distributions-${{ runner.os }}-${{ github.sha }}
           path: |
-            dist/groove_serpent-1.0.0-py3-none-any.whl
-            dist/groove_serpent-1.0.0.tar.gz
+            dist/groove_serpent-1.1.0-py3-none-any.whl
+            dist/groove_serpent-1.1.0.tar.gz
             dist/PYTHON_DISTRIBUTIONS_RECEIPT.json
           if-no-files-found: error
           retention-days: 7
@@ -381,20 +373,20 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build normalized source archive
-        run: python scripts/build_public_archive.py
+      - name: Build normalized candidate source archive
+        run: python scripts/build_public_archive.py --candidate
 
-      - name: Verify source archive commit marker
-        run: python scripts/build_public_archive.py --verify
+      - name: Verify candidate source archive commit marker
+        run: python scripts/build_public_archive.py --verify-candidate
 
       - name: Upload archive, manifest, and commit marker
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: source-archive-${{ runner.os }}
           path: |
-            dist/groove-serpent-1.0.0-source.zip
+            dist/groove-serpent-1.1.0-source.zip
             dist/SOURCE_MANIFEST.sha256
-            dist/groove-serpent-1.0.0-source.commit.json
+            dist/groove-serpent-1.1.0-source.commit.json
           if-no-files-found: error
           retention-days: 7
 
@@ -418,15 +410,15 @@ jobs:
           pattern: source-archive-*
           path: ${{ runner.temp }}/source-comparison
 
-      - name: Verify every downloaded commit marker
+      - name: Verify every downloaded candidate commit marker
         shell: bash
         run: |
           set -euo pipefail
           for directory in "$RUNNER_TEMP"/source-comparison/source-archive-*; do
-            python scripts/build_public_archive.py --verify \
-              --archive "$directory/groove-serpent-1.0.0-source.zip" \
+            python scripts/build_public_archive.py --verify-candidate \
+              --archive "$directory/groove-serpent-1.1.0-source.zip" \
               --manifest "$directory/SOURCE_MANIFEST.sha256" \
-              --marker "$directory/groove-serpent-1.0.0-source.commit.json"
+              --marker "$directory/groove-serpent-1.1.0-source.commit.json"
           done
 
       - name: Require byte-identical archives, manifests, and markers
@@ -437,9 +429,9 @@ jobs:
           import pathlib
 
           names = (
-              "groove-serpent-1.0.0-source.zip",
+              "groove-serpent-1.1.0-source.zip",
               "SOURCE_MANIFEST.sha256",
-              "groove-serpent-1.0.0-source.commit.json",
+              "groove-serpent-1.1.0-source.commit.json",
           )
           root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "source-comparison"
           for name in names:

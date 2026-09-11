@@ -238,8 +238,10 @@ def _write_project(directory: Path, source: Path, stem: str, title: str) -> Path
 
 def _build_album(directory: Path, lifecycle: FixtureLifecycle) -> Path:
     source = _make_source(directory, lifecycle)
+    side_b_source = directory / "side-b-source.flac"
+    shutil.copyfile(source, side_b_source)
     side_a = _write_project(directory, source, "side-a", "First")
-    side_b = _write_project(directory, source, "side-b", "Second")
+    side_b = _write_project(directory, side_b_source, "side-b", "Second")
     album_path = directory / "fixture-album.groove-album.json"
     album = AlbumProject(
         metadata={"artist": "Fixture Artist", "album": "Fixture Album"},

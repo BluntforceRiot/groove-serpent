@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import posixpath
 import tempfile
 import unittest
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import groove_serpent.project_io as project_io_module
 
+from groove_serpent.cli import _stored_source_path
 from groove_serpent.models import (
     EDIT_ACTION_KINDS,
     MAX_CHECKPOINTS,
@@ -71,6 +75,10 @@ class ProjectTests(unittest.TestCase):
             r"\Device\HarddiskVolume1\capture.flac",
             r"N:capture.flac",
             "N:",
+            "1:/capture.flac",
+            "é:/capture.flac",
+            "Ｎ:/capture.flac",
+            "K:/capture.flac",
             "NUL.flac",
             r"captures\COM1.wav",
             "capture.flac:$DATA",
@@ -117,6 +125,125 @@ class ProjectTests(unittest.TestCase):
                 resolve_source_path(project, directory / "side.groove.json"),
                 source,
             )
+
+    def test_stored_source_path_is_portable_for_nested_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value) / "Original"
+            source = directory / "Captures été" / "Side A.flac"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+            project_path = directory / "Projects" / "Album" / "side.groove.json"
+            project_path.parent.mkdir(parents=True)
+            stored = _stored_source_path(source, project_path)
+            self.assertEqual(stored, "../../Captures été/Side A.flac")
+            project = make_history_project()
+            project.source.path = stored
+            project.source.filename = source.name
+            save_project(project, project_path)
+            self.assertEqual(
+                resolve_source_path(load_project(project_path), project_path), source.resolve()
+            )
+            relocated = Path(directory_value) / "Relocated"
+            directory.rename(relocated)
+            moved_project_path = relocated / "Projects" / "Album" / project_path.name
+            self.assertEqual(
+                resolve_source_path(load_project(moved_project_path), moved_project_path),
+                (relocated / "Captures été" / source.name).resolve(),
+            )
+
+    def test_stored_source_path_uses_portable_absolute_fallback(self) -> None:
+        source = Path("Side A.flac").resolve()
+        with patch("groove_serpent.cli.os.path.relpath", side_effect=ValueError):
+            self.assertEqual(
+                _stored_source_path(source, Path("side.groove.json")), source.as_posix()
+            )
+
+    @unittest.skipIf(os.name == "nt", "Literal backslash filenames require POSIX.")
+    def test_posix_literal_backslashes_round_trip_without_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            project_path = directory / "side.groove.json"
+            for relative in (r"Literal\Side A.flac", r"Captures\été/Side A.flac"):
+                with self.subTest(relative=relative):
+                    source = directory / relative
+                    source.parent.mkdir(exist_ok=True)
+                    source.write_bytes(b"audio")
+                    project = make_history_project()
+                    project.source.path = _stored_source_path(source, project_path)
+                    project.source.filename = source.name
+                    self.assertEqual(project.source.path, relative)
+                    self.assertEqual(resolve_source_path(project, project_path), source)
+
+    def test_posix_source_resolution_handles_bounded_legacy_windows_paths(self) -> None:
+        # Exercise POSIX path semantics even in the native Windows test lane.
+        files: set[str] = set()
+        checked: list[str] = []
+
+        class PosixSourcePath(PurePosixPath):
+            def resolve(self) -> PosixSourcePath:
+                return PosixSourcePath(posixpath.normpath(self))
+
+            def is_file(self) -> bool:
+                checked.append(str(self))
+                return str(self) in files
+
+        project_path = PosixSourcePath("/collection/Projects/Album/side.groove.json")
+        cases = (
+            (
+                "../../Captures été/Side A.flac", "Side A.flac",
+                {"/collection/Captures été/Side A.flac"},
+                "/collection/Captures été/Side A.flac",
+            ),
+            (
+                r"..\..\Captures été\Side A.flac", "Side A.flac",
+                {"/collection/Captures été/Side A.flac"},
+                "/collection/Captures été/Side A.flac",
+            ),
+            (
+                r"Captures\Side A.flac", "Side A.flac",
+                {
+                    r"/collection/Projects/Album/Captures\Side A.flac",
+                    "/collection/Projects/Album/Captures/Side A.flac",
+                },
+                r"/collection/Projects/Album/Captures\Side A.flac",
+            ),
+            (
+                r"Captures\Side A.flac", r"Captures\Side A.flac",
+                {"/collection/Projects/Album/Captures/Side A.flac"}, None,
+            ),
+            (
+                r"Captures\été/Side A.flac", "Side A.flac",
+                {"/collection/Projects/Album/Captures/été/Side A.flac"}, None,
+            ),
+            (
+                r"Captures\Side A.flac", "Different.flac",
+                {"/collection/Projects/Album/Captures/Side A.flac"}, None,
+            ),
+            (
+                r"N:\Captures\Side A.flac", "Side A.flac",
+                {"/collection/Projects/Album/Side A.flac"},
+                "/collection/Projects/Album/Side A.flac",
+            ),
+        )
+        with patch("groove_serpent.models.Path", PosixSourcePath), patch(
+            "groove_serpent.models.os", SimpleNamespace(name="posix")
+        ):
+            for stored, filename, available, expected in cases:
+                with self.subTest(stored=stored, filename=filename):
+                    files.clear()
+                    files.update(available)
+                    checked.clear()
+                    project = make_history_project()
+                    project.source.path = stored
+                    project.source.filename = filename
+                    if expected is None:
+                        with self.assertRaises(ProjectValidationError):
+                            resolve_source_path(project, project_path)
+                        self.assertFalse(files.intersection(checked))
+                    else:
+                        self.assertEqual(
+                            str(resolve_source_path(project, project_path)), expected
+                        )
 
     def test_round_trip(self) -> None:
         source = AudioSource(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -10,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from groove_serpent.album import AlbumProject, AlbumSide, save_album_project
 from groove_serpent.cli import main
 from groove_serpent.cache_storage import acquire_snapshot_lease
 from groove_serpent.models import (
@@ -61,6 +64,117 @@ def _analyzed_project() -> Project:
 
 
 class CliTests(unittest.TestCase):
+    def _assert_output_redirect_rejected(self, root: Path, redirect: Path) -> None:
+        project_path = root / "side.groove.json"
+        album_path = root / "album.groove.json"
+        save_project(_analyzed_project(), project_path)
+        save_album_project(
+            AlbumProject(metadata={}, sides=[AlbumSide("A", 1, project_path.name)]),
+            album_path,
+        )
+        target = redirect.resolve()
+        sentinel = target / "preserved.txt"
+        sentinel.write_bytes(b"preserve existing destination contents")
+        project_before = project_path.read_bytes()
+        album_before = album_path.read_bytes()
+        commands = (
+            (
+                ["export", str(project_path), "--output-dir", str(redirect / "batch"),
+                 "--formats", "flac"],
+                "groove_serpent.exporter.capture_file_receipt",
+            ),
+            (
+                ["album", "export", str(album_path), "--output-dir", str(redirect / "batch"),
+                 "--formats", "flac"],
+                "groove_serpent.album.capture_file_receipt",
+            ),
+            (
+                ["click-scan", str(project_path), "--report", str(redirect / "scan.json")],
+                "groove_serpent.restoration_workflow._prepare_restoration_inputs",
+            ),
+            (
+                ["click-preview", str(project_path), str(root / "scan.json"),
+                 "--candidate", "clk-0123456789abcdef0123", "--bundle", str(redirect / "preview")],
+                "groove_serpent.restoration_workflow._prepare_restoration_inputs",
+            ),
+        )
+        for command, receipt_function in commands:
+            with self.subTest(command=command[0:2]):
+                errors = io.StringIO()
+                with mock.patch(
+                    receipt_function,
+                    side_effect=AssertionError("Unsafe output reached source work."),
+                ) as capture, redirect_stderr(errors):
+                    result = main(command)
+                self.assertEqual(result, 2)
+                self.assertIn("symlink or reparse point", errors.getvalue())
+                capture.assert_not_called()
+                self.assertEqual(list(target.iterdir()), [sentinel])
+                self.assertEqual(sentinel.read_bytes(), b"preserve existing destination contents")
+                self.assertEqual(project_path.read_bytes(), project_before)
+                self.assertEqual(album_path.read_bytes(), album_before)
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows junction regression")
+    def test_commands_reject_junction_output_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            target, redirect = root / "actual", root / "redirect"
+            target.mkdir()
+            created = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(redirect), str(target)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False,
+            )
+            if created.returncode:
+                self.skipTest("This host cannot create a synthetic directory junction.")
+            try:
+                self.assertFalse(redirect.is_symlink())
+                self._assert_output_redirect_rejected(root, redirect)
+            finally:
+                os.rmdir(redirect)
+
+    def test_commands_reject_symlink_output_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            target, redirect = root / "actual", root / "redirect"
+            target.mkdir()
+            try:
+                redirect.symlink_to(target, target_is_directory=True)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f"This host cannot create a synthetic symlink: {error}")
+            try:
+                self._assert_output_redirect_rejected(root, redirect)
+            finally:
+                redirect.unlink()
+
+    def test_analyze_rejects_symlink_project_output_before_audio_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            source = root / "side.flac"
+            project_path = root / "side.groove.json"
+            redirect = root / "redirect.groove.json"
+            save_project(_analyzed_project(), project_path)
+            before = project_path.read_bytes()
+            try:
+                redirect.symlink_to(project_path)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f"This host cannot create a synthetic symlink: {error}")
+            try:
+                errors = io.StringIO()
+                with mock.patch("groove_serpent.cli.analyze_audio") as analyze, redirect_stderr(
+                    errors
+                ):
+                    result = main([
+                        "analyze", str(source), "--project", str(redirect), "--overwrite"
+                    ])
+                self.assertEqual(result, 2)
+                self.assertIn("non-reparse", errors.getvalue())
+                analyze.assert_not_called()
+                self.assertEqual(project_path.read_bytes(), before)
+                self.assertTrue(redirect.is_symlink())
+            finally:
+                redirect.unlink()
+
     def test_info_output_survives_a_redirected_legacy_windows_code_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             root = Path(directory_value)
@@ -193,7 +307,7 @@ class CliTests(unittest.TestCase):
             export.assert_called_once_with(
                 mock.ANY,
                 project_path.resolve(),
-                output_dir.resolve(),
+                Path(os.path.abspath(output_dir)),
                 formats=["flac"],
                 overwrite=False,
                 flac_compression=8,
@@ -450,7 +564,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             scan.assert_called_once_with(
                 project.resolve(),
-                report.resolve(),
+                Path(os.path.abspath(report)),
                 start_seconds=10.5,
                 end_seconds=12.25,
                 max_candidates=25,
@@ -488,13 +602,13 @@ class CliTests(unittest.TestCase):
                 project.resolve(),
                 report.resolve(),
                 ["clk-0123456789abcdef0123"],
-                bundle.resolve(),
+                Path(os.path.abspath(bundle)),
                 context_seconds=0.5,
             )
             self.assertIn("approval remains pending", output.getvalue())
             self.assertIn("Source audio and project were not changed", output.getvalue())
 
-    def test_click_recipe_loads_explicit_decisions_and_dispatches(self) -> None:
+    def test_click_recipe_is_retired_in_favor_of_owner_workbench(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             directory = Path(directory_value)
             project = directory / "album.groove.json"
@@ -502,19 +616,16 @@ class CliTests(unittest.TestCase):
             decisions = directory / "decisions.json"
             recipe = directory / "recipe.json"
             decision_payload = [
-                {"candidate_id": "clk-0123456789abcdef0123", "decision": "approved"},
+                {"candidate_id": "clk-0123456789abcdef0123", "decision": "rejected"},
                 {"candidate_id": "clk-abcdef01234567890123", "decision": "rejected"},
             ]
             decisions.write_text(
                 json.dumps({"decisions": decision_payload}), encoding="utf-8"
             )
-            output = io.StringIO()
+            stderr = io.StringIO()
             with mock.patch(
-                "groove_serpent.restoration_workflow.create_restoration_recipe",
-                return_value={
-                    "summary": {"approved": 1, "rejected": 1, "protected": 0}
-                },
-            ) as create, redirect_stdout(output):
+                "groove_serpent.restoration_workflow.create_restoration_recipe"
+            ) as create, redirect_stderr(stderr):
                 result = main(
                     [
                         "click-recipe",
@@ -526,24 +637,51 @@ class CliTests(unittest.TestCase):
                         str(recipe),
                     ]
                 )
-            self.assertEqual(result, 0)
-            create.assert_called_once_with(
-                project.resolve(), scan.resolve(), decision_payload, recipe.resolve()
-            )
-            self.assertIn("1 approved, 1 rejected, 0 protected", output.getvalue())
+            self.assertEqual(result, 2)
+            create.assert_not_called()
+            self.assertIn("created through the owner review workbench", stderr.getvalue())
 
-    def test_click_render_dispatches_reviewed_full_side_bundle(self) -> None:
+    def test_click_recipe_does_not_process_supplied_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            decisions = directory / "decisions.json"
+            decisions.write_text(
+                json.dumps(
+                    [{"candidate_id": "clk-0123456789abcdef0123", "decision": "approved"}]
+                ),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with mock.patch(
+                "groove_serpent.restoration_workflow.create_restoration_recipe"
+            ) as create, redirect_stderr(stderr):
+                result = main(
+                    [
+                        "click-recipe",
+                        str(directory / "album.groove.json"),
+                        str(directory / "clicks.json"),
+                        "--decisions",
+                        str(decisions),
+                        "--recipe",
+                        str(directory / "recipe.json"),
+                    ]
+                )
+            self.assertEqual(result, 2)
+            create.assert_not_called()
+            self.assertIn("created through the owner review workbench", stderr.getvalue())
+            self.assertFalse((directory / "recipe.json").exists())
+
+    def test_click_render_is_retired_in_favor_of_owner_workbench(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             directory = Path(directory_value)
             project = directory / "album.groove.json"
             scan = directory / "clicks.json"
             recipe = directory / "recipe.json"
             bundle = directory / "restored"
-            output = io.StringIO()
+            stderr = io.StringIO()
             with mock.patch(
-                "groove_serpent.restoration_workflow.render_restored_side",
-                return_value={"bundle_path": str(bundle.resolve()), "repairs": [{}, {}]},
-            ) as render, redirect_stdout(output):
+                "groove_serpent.restoration_workflow.render_restored_side"
+            ) as render, redirect_stderr(stderr):
                 result = main(
                     [
                         "click-render",
@@ -554,11 +692,9 @@ class CliTests(unittest.TestCase):
                         str(bundle),
                     ]
                 )
-            self.assertEqual(result, 0)
-            render.assert_called_once_with(
-                project.resolve(), scan.resolve(), recipe.resolve(), bundle.resolve()
-            )
-            self.assertIn("Applied 2 explicitly approved repair", output.getvalue())
+            self.assertEqual(result, 2)
+            render.assert_not_called()
+            self.assertIn("owner-only action in the review workbench", stderr.getvalue())
 
 
 if __name__ == "__main__":

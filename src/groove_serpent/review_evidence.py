@@ -21,7 +21,12 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, Mapping, cast
 
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import GrooveSerpentError
 
 
@@ -620,10 +625,14 @@ def _write_exact_new(path: Path, raw: bytes) -> None:
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     temporary = Path(temporary_name)
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary, raw, owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         try:
             rename_no_replace(temporary, path)
@@ -634,7 +643,8 @@ def _write_exact_new(path: Path, raw: bytes) -> None:
                 "The filesystem cannot atomically create this evidence file without replacement."
             ) from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 def _atomic_no_replace_rename(source: Path, destination: Path) -> None:

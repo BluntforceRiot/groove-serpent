@@ -45,15 +45,58 @@ from groove_serpent.album_publication_policy import (
 )
 from groove_serpent.errors import ExportError
 from groove_serpent.exporter import _probe_exact_audio_stream, _speed_corrected_sample
-from groove_serpent.media import probe_audio
+from groove_serpent.media import probe_audio, sha256_file
 from groove_serpent.models import AnalysisSettings, AnalysisSummary, Project, Track
+from groove_serpent.publication import canonical_json_sha256
 from groove_serpent.project_io import load_project_with_sha256, save_project
 from groove_serpent.restoration_workflow import SCAN_SCHEMA, _detector_manifest
 from groove_serpent.restoration_workflow import (
+    create_click_preview,
     create_restoration_recipe,
     render_restored_side,
     scan_project_clicks,
 )
+
+
+def _test_owner_authority_proof(
+    approved: dict[str, object],
+    preview_manifest: Path,
+) -> dict[str, object]:
+    """Create exact-shaped owner authority for an isolated workflow fixture."""
+
+    preview = json.loads(preview_manifest.read_text(encoding="utf-8"))
+    preview_candidates = preview.get("candidates")
+    if not isinstance(preview_candidates, list) or not any(
+        isinstance(item, dict) and item.get("id") == approved["id"]
+        for item in preview_candidates
+    ):
+        raise AssertionError("Fixture preview does not cover the approved candidate.")
+    preview_sha256 = sha256_file(preview_manifest)
+    journal_sha256 = hashlib.sha256(b"executor-owner-journal").hexdigest()
+    body_sha256 = hashlib.sha256(b"executor-owner-journal-body").hexdigest()
+    candidate_id = str(approved["id"])
+    return {
+        "schema": "groove-serpent.owner-authority-proof/1",
+        "channel": "same-origin-owner-cookie",
+        "claim": "owner-channel-action-not-human-perception",
+        "decision_journal": {
+            "token": f"decision-{journal_sha256[:32]}",
+            "sha256": journal_sha256,
+            "body_sha256": body_sha256,
+        },
+        "approvals": [
+            {
+                "candidate_id": candidate_id,
+                "candidate_sha256": canonical_json_sha256(approved),
+                "preview_token": f"preview-{preview_sha256[:32]}",
+                "preview_sha256": preview_sha256,
+                "auditioned_roles": ["before", "proposed", "removed"],
+                "capability_sha256": hashlib.sha256(
+                    f"executor-owner-{candidate_id}".encode("utf-8")
+                ).hexdigest(),
+            }
+        ],
+    }
 
 
 @unittest.skipUnless(
@@ -355,12 +398,25 @@ class AlbumPublicationExecutorTests(unittest.TestCase):
             }
             for item in candidates
         ]
+        preview_bundle = workspace / f"preview-{'9' * 32}"
+        create_click_preview(
+            project_path,
+            scan_path,
+            approved["id"],
+            preview_bundle,
+            context_seconds=0.1,
+        )
         recipe_path = workspace / f"recipe-{'7' * 32}.json"
         create_restoration_recipe(
             project_path,
             scan_path,
             decisions,
             recipe_path,
+            review_preview_manifests=[preview_bundle / "preview.json"],
+            owner_authority_proof=_test_owner_authority_proof(
+                approved,
+                preview_bundle / "preview.json",
+            ),
         )
         render_root = workspace / f"render-{'8' * 32}"
         render_restored_side(
@@ -583,6 +639,35 @@ class AlbumPublicationExecutorTests(unittest.TestCase):
                 execute_album_publication_plan(plan_path, output)
 
         self.assertFalse(output.exists())
+        self.assertFalse(
+            any(
+                path.name.startswith(".groove-serpent-album-publication-")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_portable_equivalent_racer_at_commit_is_preserved(self) -> None:
+        album_path, _source = self._write_album(speed_factor=1.0)
+        plan_path = self._build(album_path, ("archival-source",))
+        output = self.root / "Caf\u00e9"
+        racer = self.root / "Cafe\u0301"
+        sentinel = racer / "foreign.txt"
+
+        def race_then_commit(source: Path, destination: Path) -> None:
+            if destination == output:
+                racer.mkdir()
+                sentinel.write_text("foreign", encoding="utf-8")
+            _atomic_no_replace_directory(source, destination)
+
+        with mock.patch(
+            "groove_serpent.album_publication_executor._atomic_no_replace_directory",
+            side_effect=race_then_commit,
+        ):
+            with self.assertRaisesRegex(ExportError, "atomic commit|portable"):
+                execute_album_publication_plan(plan_path, output)
+
+        self.assertFalse(output.exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "foreign")
         self.assertFalse(
             any(
                 path.name.startswith(".groove-serpent-album-publication-")

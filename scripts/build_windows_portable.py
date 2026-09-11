@@ -104,7 +104,7 @@ FORBIDDEN_PAYLOAD_SUFFIXES = frozenset(
     }
 )
 FORBIDDEN_PRIVATE_PATTERNS = (
-    re.compile(rb"[A-Za-z]:\\HomelabForge(?:\\|/)", re.IGNORECASE),
+    re.compile(rb"[A-Za-z]:[\\/]Users[\\/][^\\/\r\n]+", re.IGNORECASE),
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
 )

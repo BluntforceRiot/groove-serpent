@@ -1,33 +1,38 @@
-# Epic Continuum Project-State Receipt — Groove Serpent 1.0.0
+# Epic Continuum Project-State Receipt - Groove Serpent 1.1.0
 
-Status: PASS — final project-state checkpoint recorded.
+Status: LOCAL_RELEASE_BOUNDARY - exact checkpoint is recorded externally.
 
-Date: 2026-07-15
+Date: 2026-09-11
 
-Continuum operation:
+Project: `groove-serpent`; session: `codex-groove-serpent-astra-20260907`;
+agent: `codex-root`; branch: `codex/1.1.0-dev`.
 
-- Operation id: `op_20260715T050657Z_597186a54da84454`
-- Operation receipt: local Continuum root, `exports/operation_receipts/op_20260715T050657Z_597186a54da84454.json`
-- Proof pack: local Continuum root, `exports/proof_packs/op_20260715T050657Z_597186a54da84454.json`
-- Card id: `card_5fdae8416247cfb0e727662e`
-- Event id: `evt_05847fecaf56dd45f49ad163`
+The owner designated Astra to review and repair the local candidate, then
+authorized stable 1.1.0 upload preparation and current release documentation.
+This continues the same project/session after the approved development cycle.
+No push, tag, release, or public deployment is authorized.
 
-Recorded project state:
+## Acyclic evidence boundary
 
-- Project id: `groove-serpent`
-- Session id: `codex-groove-serpent-1.0-20260715`
-- Agent id: `codex-root`
-- Objective: publish Groove Serpent 1.0.0 local-first vinyl digitization/restoration release.
-- Repository path: local Codex workspace checkout `outputs/github-groove-serpent-1.0.0-20260715`
-- Branch: `main`
-- Commit recorded before receipt-file addition: `945a9d7804dbc3d4694da6d8d07911f5a6b2dd1e`
-- Tree state recorded as clean at the time of the Continuum checkpoint.
+After source freeze, record a Continuum checkpoint naming the exact commit,
+tree, artifact manifest, gates, and outstanding review state. Its immutable
+operation receipt and proof pack become review inputs. After review, a second
+checkpoint records the final verdict and completion-receipt hash. The final
+checkpoint is an output of review, not a retroactive input to its own verdict.
 
-Recorded decisions:
+This document does not assert that either pending operation has run or that its
+proof is already included. The external completion receipt must supply actual
+paths, hashes, operation results, and verification before claiming completion.
+Read back the persisted Card itself and verify that its exact contents bind
+the intended commit, tree, evidence, verdict, and remaining-work state; an
+operation proof alone is not a substitute for that content check.
 
-- Every coding task should end with the full review loop and subloops across Codex.
-- Windows media corresponding-source layout was fixed so `recipe/keys` is the exact source/verifier authority.
-- Windows portable release uses the verified manifest `e3a52240a373b426d601b282df91d956a6530105c932aab687a2d47c3f8db225`.
-- Remaining task after this receipt: push to GitHub, create the `v1.0.0` release/tag, upload artifacts, then verify hosted CI and release assets.
+## Durable decisions
 
-This receipt is a public-safe pointer to the durable local Continuum operation. The raw Continuum proof files remain outside the public repository in the local Continuum root.
+- The collection owner remains the final listening authority.
+- The historical auditioned repair was rejected; it cannot authorize rendering.
+- Other unauditioned candidates remain undecided.
+- Source captures are immutable and all publications are new derivatives.
+- Findings and evidence gaps must be closed on the exact reviewed candidate.
+- The final local approval terminates this build cycle and does not authorize
+  GitHub publication.

@@ -111,6 +111,13 @@ class ReviewServerTests(unittest.TestCase):
         self.project_path = self.directory / "side.groove.json"
         save_project(project, self.project_path)
 
+        # This class tests HTTP orchestration against opaque fixture bytes, not
+        # audio validity. Native descriptor authority has its own unmocked suite.
+        self._synthetic_source_probe = patch(
+            "groove_serpent.review_server.probe_audio", return_value=project.source,
+        )
+        self._synthetic_source_probe.start()
+        self.addCleanup(self._synthetic_source_probe.stop)
         self.server = ReviewServer(("127.0.0.1", 0), self.project_path)
         _ensure_resolvable_public_host(self.server)
         self.thread = threading.Thread(
@@ -128,6 +135,7 @@ class ReviewServerTests(unittest.TestCase):
         ]
 
     def tearDown(self) -> None:
+        self._synthetic_source_probe.stop()
         snapshot_path = self.server.source_snapshot.path
         self.server.shutdown()
         self.server.server_close()
@@ -966,6 +974,27 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(hasher.call_count, 2)
 
+    def test_request_json_rejects_duplicate_fields_before_mutation(self) -> None:
+        state = json.load(self.authenticated_opener.open(self.base + "/api/project"))
+        body = (
+            "{"
+            f'"expected_revision":{state["revision"]},'
+            f'"expected_project_sha256":"{state["project_sha256"]}",'
+            '"name":"first interpretation",'
+            '"name":"second interpretation"'
+            "}"
+        ).encode("utf-8")
+
+        status, _headers, response, will_close = self.request(
+            "POST",
+            "/api/checkpoint",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400, response)
+        self.assertTrue(will_close)
+
     def test_source_stat_identity_allows_absent_platform_fields(self) -> None:
         portable_stat = SimpleNamespace(
             st_dev=22,
@@ -1741,6 +1770,13 @@ class ReviewServerTests(unittest.TestCase):
                     "Content-Length": "2000001",
                 },
             ),
+            (
+                None,
+                {
+                    "Content-Type": "application/json",
+                    "Content-Length": "9" * 5_000,
+                },
+            ),
         ]
         for body, headers in cases:
             with self.subTest(headers=headers):
@@ -1750,6 +1786,51 @@ class ReviewServerTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(response_headers["Connection"], "close")
                 self.assertTrue(will_close)
+
+    def test_unknown_and_semicolon_post_routes_close_without_aliasing(self) -> None:
+        for path in ("/not-a-route", "/api/endpoints/accept;opaque"):
+            with self.subTest(path=path):
+                status, headers, _body, will_close = self.request(
+                    "POST",
+                    path,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    add_state_receipt=False,
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(headers["Connection"], "close")
+                self.assertTrue(will_close)
+
+    def test_body_framing_rejections_close_persistent_connections(self) -> None:
+        status, headers, _body, will_close = self.request(
+            "POST",
+            "/api/restoration/scan?alias=1",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+            add_state_receipt=False,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Connection"], "close")
+        self.assertTrue(will_close)
+
+        status, headers, _body, will_close = self.request(
+            "GET",
+            "/api/ping",
+            headers={"Content-Length": "9" * 5_000},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Connection"], "close")
+        self.assertTrue(will_close)
+
+        status, headers, _body, will_close = self.request(
+            "GET",
+            "/api/ping",
+            body=b"{}",
+            headers={"Content-Length": "2"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Connection"], "close")
+        self.assertTrue(will_close)
 
     def test_empty_suffix_range_is_unsatisfiable(self) -> None:
         status, headers, body, _will_close = self.request(

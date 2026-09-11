@@ -85,6 +85,12 @@ class ExporterTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # This orchestration-only class uses placeholder source/output bytes and
+        # already mocks the full media verifier. Native stream/precision checks
+        # remain unmocked in ExporterRealVerificationTests and descriptor tests.
+        source_probe = mock.patch("groove_serpent.exporter._verify_render_source_geometry")
+        source_probe.start()
+        self.addCleanup(source_probe.stop)
 
     def test_file_receipt_tolerates_windows_handle_path_ctime_precision_skew(
         self,
@@ -1842,7 +1848,10 @@ class ExporterRealVerificationTests(unittest.TestCase):
             sentinel = b"do not overwrite"
             staged.write_bytes(sentinel)
 
-            with self.assertRaises(GrooveSerpentError):
+            with (
+                mock.patch("groove_serpent.exporter.run_ffmpeg") as encoder,
+                self.assertRaisesRegex(ExportError, "existing staged output"),
+            ):
                 render_verified_track(
                     source_snapshot=directory / "capture.flac",
                     staged_path=staged,
@@ -1860,7 +1869,68 @@ class ExporterRealVerificationTests(unittest.TestCase):
                     aac_bitrate="256k",
                 )
 
+            encoder.assert_not_called()
             self.assertEqual(staged.read_bytes(), sentinel)
+
+    def test_verified_renderer_refuses_valid_wrong_audio_even_after_preflight(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            project, _ = self._real_project(directory)
+            source = directory / "capture.flac"
+            source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            silence = directory / "silence.flac"
+            subprocess.run(
+                [
+                    shutil.which("ffmpeg") or "ffmpeg",
+                    "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-t", "1", "-c:a", "flac", "-sample_fmt", "s32",
+                    str(silence),
+                ],
+                check=True,
+            )
+            staged = directory / "staged.m4a"
+            arguments = dict(
+                staged_path=staged,
+                track=project.tracks[0],
+                total_tracks=1,
+                output_format="m4a",
+                expected_sample_count=(
+                    project.tracks[0].end_sample - project.tracks[0].start_sample
+                ),
+                source_sample_rate=project.source.sample_rate,
+                source_channels=project.source.channels,
+                source_bits=project.source.bits_per_raw_sample,
+                flac_compression=8,
+                aac_bitrate="256k",
+            )
+            # This is valid AAC with exactly the requested duration and tags,
+            # but silence rather than the non-silent source's intended track.
+            render_verified_track(source_snapshot=silence, **arguments)
+            stale_bytes = staged.read_bytes()
+            with self.assertRaisesRegex(ExportError, "existing staged output"):
+                render_verified_track(source_snapshot=source, **arguments)
+            self.assertEqual(staged.read_bytes(), stale_bytes)
+            staged.unlink()
+
+            real_geometry = exporter_module._verify_render_source_geometry
+
+            def place_stale_after_preflight(*args, **kwargs):
+                real_geometry(*args, **kwargs)
+                staged.write_bytes(stale_bytes)
+
+            with (
+                mock.patch(
+                    "groove_serpent.exporter._verify_render_source_geometry",
+                    side_effect=place_stale_after_preflight,
+                ),
+                self.assertRaises(GrooveSerpentError),
+            ):
+                render_verified_track(source_snapshot=source, **arguments)
+            self.assertEqual(staged.read_bytes(), stale_bytes)
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_digest)
 
     def test_real_outputs_are_fully_verified_and_archival_flac_is_pcm_exact(
         self,

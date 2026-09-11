@@ -102,6 +102,28 @@ def _windows_short_path(path: Path) -> Path:
 
 
 class TransactionLockTests(unittest.TestCase):
+    def test_lock_creation_preserves_a_racing_temporary_name(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "project.groove.json"
+            racing_paths: list[Path] = []
+            real_rename = transaction_lock_module.rename_no_replace
+
+            def rename_then_race(source: Path, destination: Path) -> None:
+                real_rename(source, destination)
+                source.write_bytes(b"foreign racing file")
+                racing_paths.append(source)
+
+            with mock.patch.object(
+                transaction_lock_module,
+                "rename_no_replace",
+                side_effect=rename_then_race,
+            ):
+                with exclusive_target_write_lease(target):
+                    pass
+
+            self.assertEqual(len(racing_paths), 1)
+            self.assertEqual(racing_paths[0].read_bytes(), b"foreign racing file")
+
     def test_existing_lock_still_requires_atomic_no_replace_capability(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             target = Path(directory_value) / "project.groove.json"

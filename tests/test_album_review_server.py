@@ -8,13 +8,17 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+import groove_serpent.album_review_server as album_review_server_module
+import groove_serpent.review_server as review_server_module
 from groove_serpent.album import (
     AlbumProject,
     AlbumSide,
@@ -34,6 +38,7 @@ from groove_serpent.album_publication_executor import (
     _journal,
 )
 from groove_serpent.album_publication_policy import ToolObservations
+from groove_serpent.endpoint_proposals import EndpointScope
 from groove_serpent.media import probe_audio, sha256_file
 from groove_serpent.models import (
     AnalysisSettings,
@@ -42,7 +47,11 @@ from groove_serpent.models import (
     Project,
     Track,
 )
-from groove_serpent.project_io import load_project, save_project
+from groove_serpent.project_io import (
+    load_project,
+    load_project_with_sha256,
+    save_project,
+)
 
 
 PUBLICATION_TOOLS = ToolObservations(
@@ -86,8 +95,22 @@ class AlbumReviewServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary_directory.name)
+        self._synthetic_sources: dict[str, AudioSource] = {}
         side_a = self._write_project("side-a", "First")
         side_b = self._write_project("side-b", "Second")
+        # Child-cockpit orchestration uses explicit synthetic descriptors for
+        # opaque fixture bytes. Native publication setup stops this patch below.
+        self._synthetic_source_probe = patch(
+            "groove_serpent.review_server.probe_audio", side_effect=self._probe_synthetic_source,
+        )
+        self._synthetic_source_probe.start()
+        self.addCleanup(self._synthetic_source_probe.stop)
+        self._synthetic_publication_probe = patch(
+            "groove_serpent.album_publication_executor.probe_audio",
+            side_effect=self._probe_synthetic_source,
+        )
+        self._synthetic_publication_probe.start()
+        self.addCleanup(self._synthetic_publication_probe.stop)
         self.album_path = self.directory / "album.groove-album.json"
         album = AlbumProject(
             metadata={"artist": "Example Artist", "album": "Example Album"},
@@ -97,7 +120,7 @@ class AlbumReviewServerTests(unittest.TestCase):
             ],
         )
         repin_album_sides(album, self.album_path)
-        save_album_project(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
 
         # Give the browser a real changed side to approve and repin.
         project = load_project(side_a)
@@ -117,6 +140,8 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.base = self.server.session_auth.origin(port=self.port)
 
     def tearDown(self) -> None:
+        self._synthetic_source_probe.stop()
+        self._synthetic_publication_probe.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -167,7 +192,12 @@ class AlbumReviewServerTests(unittest.TestCase):
         )
         project_path = self.directory / f"{stem}.groove.json"
         save_project(project, project_path)
+        self._synthetic_sources[source.name] = project.source
         return project_path
+
+    def _probe_synthetic_source(self, path: Path, stored_path: str | None = None) -> AudioSource:
+        source = self._synthetic_sources[stored_path or path.name]
+        return replace(source, path=str(path), filename=path.name)
 
     def request(
         self,
@@ -232,6 +262,75 @@ class AlbumReviewServerTests(unittest.TestCase):
         value = json.loads(body)
         self.assertIsInstance(value, dict)
         return value
+
+    def child_endpoint_accept(
+        self,
+        child: album_review_server_module._SideReviewChild,
+        *,
+        start_sample: int,
+        end_sample: int,
+    ) -> tuple[int, bytes]:
+        """Exercise the real accept transaction with a focused sealed proposal."""
+
+        project, project_sha256 = load_project_with_sha256(child.project_path)
+        _source, source_receipt = child.server.verify_source(project)
+        proposal_sha256 = "d" * 64
+        proposal = {
+            "proposal_sha256": proposal_sha256,
+            "scopes": [
+                {
+                    "label": child.endpoint_scope.label,
+                    "scope_start_sample": child.endpoint_scope.start_sample,
+                    "scope_end_sample_exclusive": (
+                        child.endpoint_scope.end_sample_exclusive
+                    ),
+                    "status": "proposed",
+                    "requires_review": True,
+                    "start": {"status": "proposed", "sample": start_sample},
+                    "end": {"status": "proposed", "sample": end_sample},
+                }
+            ],
+        }
+        payload = {
+            "expected_revision": project.revision,
+            "expected_project_sha256": project_sha256,
+            "expected_source_receipt": source_receipt["receipt"],
+            "proposal_sha256": proposal_sha256,
+            "decision": "accept",
+            "intent": "end-at-wanted-music-remove-lead-in-and-runout",
+            "reviewed_start": True,
+            "reviewed_end": True,
+        }
+        port = child.server.server_port
+        headers = {
+            "Authorization": child.server.session_auth.authorization_header,
+            "Host": f"{child.server.session_auth.public_host}:{port}",
+            "Content-Type": "application/json",
+        }
+        with (
+            patch.object(
+                review_server_module.ReviewHandler,
+                "_endpoint_request_state",
+                return_value=(project, project_sha256, source_receipt),
+            ),
+            patch.object(
+                review_server_module.ReviewHandler,
+                "_current_endpoint_proposal",
+                return_value=proposal,
+            ),
+        ):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            connection.request(
+                "POST",
+                "/api/endpoints/accept",
+                body=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+            response = connection.getresponse()
+            body = response.read()
+            status = response.status
+            connection.close()
+        return status, body
 
     def test_album_session_auth_and_parent_child_isolation(self) -> None:
         self.assertRegex(
@@ -492,6 +591,8 @@ class AlbumReviewServerTests(unittest.TestCase):
         }
 
     def _replace_sources_with_real_flac(self) -> None:
+        self._synthetic_source_probe.stop()
+        self._synthetic_publication_probe.stop()
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None or shutil.which("ffprobe") is None:
             self.skipTest("FFmpeg and ffprobe are required for publication execution.")
@@ -1389,6 +1490,517 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.assertFalse(old_child.thread.is_alive())
         self.assertFalse(old_snapshot.exists())
 
+    def test_shared_capture_children_receive_independent_physical_side_scopes(
+        self,
+    ) -> None:
+        side_a_path = self.directory / "side-a.groove.json"
+        side_b_path = self.directory / "side-b.groove.json"
+        side_a = load_project(side_a_path)
+        original_side_b = load_project(side_b_path)
+        side_a.tracks[0] = replace(
+            side_a.tracks[0],
+            start_sample=500,
+            end_sample=4_000,
+            start_seconds=0.5,
+            end_seconds=4.0,
+        )
+        side_b_track = replace(
+            original_side_b.tracks[0],
+            start_sample=6_000,
+            end_sample=9_500,
+            start_seconds=6.0,
+            end_seconds=9.5,
+        )
+        side_b = Project(
+            source=side_a.source,
+            settings=original_side_b.settings,
+            analysis=original_side_b.analysis,
+            tracks=[side_b_track],
+            metadata=dict(original_side_b.metadata),
+        )
+        save_project(side_a, side_a_path)
+        save_project(side_b, side_b_path)
+        album = load_album_project(self.album_path)
+        repin_album_sides(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
+
+        state = self.state()
+        for label in ("A", "B"):
+            status, _headers, body = self.request(
+                "POST",
+                "/api/album/open-side",
+                payload=self.open_side_payload(state, label),
+            )
+            self.assertEqual(status, 200, body)
+
+        self.assertEqual(
+            self.server._side_review_children["A"].endpoint_scope,
+            EndpointScope("Side A", 0, 5_000),
+        )
+        self.assertEqual(
+            self.server._side_review_children["B"].endpoint_scope,
+            EndpointScope("Side B", 5_000, 10_000),
+        )
+
+    def test_sibling_scope_is_retired_when_neighbor_boundary_changes(self) -> None:
+        side_a_path = self.directory / "side-a.groove.json"
+        side_b_path = self.directory / "side-b.groove.json"
+        side_a = load_project(side_a_path)
+        original_side_b = load_project(side_b_path)
+        side_a.tracks[0] = replace(
+            side_a.tracks[0],
+            start_sample=500,
+            end_sample=4_000,
+            start_seconds=0.5,
+            end_seconds=4.0,
+        )
+        side_b_track = replace(
+            original_side_b.tracks[0],
+            start_sample=6_000,
+            end_sample=9_500,
+            start_seconds=6.0,
+            end_seconds=9.5,
+        )
+        side_b = Project(
+            source=side_a.source,
+            settings=original_side_b.settings,
+            analysis=original_side_b.analysis,
+            tracks=[side_b_track],
+            metadata=dict(original_side_b.metadata),
+        )
+        save_project(side_a, side_a_path)
+        save_project(side_b, side_b_path)
+        album = load_album_project(self.album_path)
+        repin_album_sides(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
+
+        state = self.state()
+        for label in ("A", "B"):
+            status, _headers, body = self.request(
+                "POST",
+                "/api/album/open-side",
+                payload=self.open_side_payload(state, label),
+            )
+            self.assertEqual(status, 200, body)
+        old_b = self.server._side_review_children["B"]
+        self.assertEqual(
+            old_b.endpoint_scope, EndpointScope("Side B", 5_000, 10_000)
+        )
+
+        side_a = load_project(side_a_path)
+        side_a.tracks[0] = replace(
+            side_a.tracks[0],
+            end_sample=4_800,
+            end_seconds=4.8,
+        )
+        save_project(side_a, side_a_path)
+        album = load_album_project(self.album_path)
+        repin_album_sides(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
+        updated_state = self.state()
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(updated_state, "A"),
+        )
+        self.assertEqual(status, 200, body)
+
+        self.assertNotIn("B", self.server._side_review_children)
+        self.assertFalse(old_b.thread.is_alive())
+
+    def test_side_accept_revalidates_cohort_at_the_commit_boundary(self) -> None:
+        side_a_path = self.directory / "side-a.groove.json"
+        side_b_path = self.directory / "side-b.groove.json"
+        side_a = load_project(side_a_path)
+        original_side_b = load_project(side_b_path)
+        side_a.tracks[0] = replace(
+            side_a.tracks[0],
+            start_sample=500,
+            end_sample=4_000,
+            start_seconds=0.5,
+            end_seconds=4.0,
+        )
+        side_b = Project(
+            source=side_a.source,
+            settings=original_side_b.settings,
+            analysis=original_side_b.analysis,
+            tracks=[
+                replace(
+                    original_side_b.tracks[0],
+                    start_sample=6_000,
+                    end_sample=9_500,
+                    start_seconds=6.0,
+                    end_seconds=9.5,
+                )
+            ],
+            metadata=dict(original_side_b.metadata),
+        )
+        save_project(side_a, side_a_path)
+        save_project(side_b, side_b_path)
+        album = load_album_project(self.album_path)
+        repin_album_sides(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
+
+        state = self.state()
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(state, "B"),
+        )
+        self.assertEqual(status, 200, body)
+        child = self.server._side_review_children["B"]
+        original_validate = child.server.validate_endpoint_scope
+        mutation_count = 0
+
+        def validate_then_move_neighbor() -> EndpointScope:
+            nonlocal mutation_count
+            scope = original_validate()
+            if mutation_count == 0:
+                mutation_count += 1
+                changed = load_project(side_a_path)
+                changed.tracks[0] = replace(
+                    changed.tracks[0],
+                    end_sample=5_800,
+                    end_seconds=5.8,
+                )
+                save_project(changed, side_a_path)
+            return scope
+
+        with patch.object(
+            child.server,
+            "validate_endpoint_scope",
+            side_effect=validate_then_move_neighbor,
+        ):
+            status, body = self.child_endpoint_accept(
+                child,
+                start_sample=5_200,
+                end_sample=9_300,
+            )
+
+        self.assertEqual(status, 400, body)
+        self.assertEqual(mutation_count, 1)
+        saved_b = load_project(side_b_path)
+        self.assertEqual(saved_b.tracks[0].start_sample, 6_000)
+        self.assertEqual(saved_b.tracks[-1].end_sample, 9_500)
+
+    def test_side_accept_holds_sibling_lease_through_commit(self) -> None:
+        side_a_path = self.directory / "side-a.groove.json"
+        side_b_path = self.directory / "side-b.groove.json"
+        side_a = load_project(side_a_path)
+        original_side_b = load_project(side_b_path)
+        side_a.tracks[0] = replace(
+            side_a.tracks[0],
+            start_sample=500,
+            end_sample=4_000,
+            start_seconds=0.5,
+            end_seconds=4.0,
+        )
+        side_b = Project(
+            source=side_a.source,
+            settings=original_side_b.settings,
+            analysis=original_side_b.analysis,
+            tracks=[
+                replace(
+                    original_side_b.tracks[0],
+                    start_sample=6_000,
+                    end_sample=9_500,
+                    start_seconds=6.0,
+                    end_seconds=9.5,
+                )
+            ],
+            metadata=dict(original_side_b.metadata),
+        )
+        save_project(side_a, side_a_path)
+        save_project(side_b, side_b_path)
+        album = load_album_project(self.album_path)
+        repin_album_sides(album, self.album_path)
+        save_album_project(album, self.album_path, overwrite=True)
+
+        state = self.state()
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(state, "B"),
+        )
+        self.assertEqual(status, 200, body)
+        child = self.server._side_review_children["B"]
+        original_validate = child.server.validate_endpoint_scope
+        final_validation_complete = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+        writer_completed_while_locked = False
+        validation_count = 0
+
+        def write_sibling_concurrently() -> None:
+            try:
+                if not final_validation_complete.wait(timeout=10):
+                    raise TimeoutError("Final validation barrier was not reached.")
+                changed = load_project(side_a_path)
+                changed.tracks[0] = replace(
+                    changed.tracks[0],
+                    end_sample=5_800,
+                    end_seconds=5.8,
+                )
+                writer_started.set()
+                save_project(changed, side_a_path)
+            except Exception as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
+
+        def observe_final_validation() -> EndpointScope:
+            nonlocal validation_count, writer_completed_while_locked
+            scope = original_validate()
+            validation_count += 1
+            if validation_count == 2:
+                final_validation_complete.set()
+                if not writer_started.wait(timeout=10):
+                    raise TimeoutError("Concurrent sibling writer did not start.")
+                writer_completed_while_locked = writer_finished.wait(timeout=0.25)
+            return scope
+
+        writer = threading.Thread(target=write_sibling_concurrently, daemon=True)
+        writer.start()
+        with patch.object(
+            child.server,
+            "validate_endpoint_scope",
+            side_effect=observe_final_validation,
+        ):
+            status, body = self.child_endpoint_accept(
+                child,
+                start_sample=5_200,
+                end_sample=9_300,
+            )
+        writer.join(timeout=10)
+
+        self.assertEqual(validation_count, 2)
+        self.assertFalse(writer_completed_while_locked)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(load_project(side_b_path).tracks[0].start_sample, 5_200)
+        self.assertEqual(load_project(side_a_path).tracks[-1].end_sample, 5_800)
+
+    def test_side_accept_and_real_http_save_share_one_lock_order(self) -> None:
+        state = self.state()
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(state, "B"),
+        )
+        self.assertEqual(status, 200, body)
+        child = self.server._side_review_children["B"]
+        project, project_sha256 = load_project_with_sha256(child.project_path)
+        _source, source_receipt = child.server.verify_source(project)
+        port = child.server.server_port
+        headers = {
+            "Authorization": child.server.session_auth.authorization_header,
+            "Host": f"{child.server.session_auth.public_host}:{port}",
+            "Content-Type": "application/json",
+        }
+
+        state_connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        state_connection.request("GET", "/api/project", headers=headers)
+        state_response = state_connection.getresponse()
+        state_body = state_response.read()
+        state_connection.close()
+        self.assertEqual(state_response.status, 200, state_body)
+        child_state = json.loads(state_body)
+        child_state["tracks"][0]["title"] = "Concurrent HTTP save"
+        save_payload = {
+            "metadata": child_state["metadata"],
+            "tracks": child_state["tracks"],
+            "expected_revision": child_state["revision"],
+            "expected_project_sha256": child_state["project_sha256"],
+        }
+
+        proposal_sha256 = "e" * 64
+        proposal = {
+            "proposal_sha256": proposal_sha256,
+            "scopes": [
+                {
+                    "label": child.endpoint_scope.label,
+                    "scope_start_sample": child.endpoint_scope.start_sample,
+                    "scope_end_sample_exclusive": (
+                        child.endpoint_scope.end_sample_exclusive
+                    ),
+                    "status": "proposed",
+                    "requires_review": True,
+                    "start": {"status": "proposed", "sample": 100},
+                    "end": {"status": "proposed", "sample": 9_900},
+                }
+            ],
+        }
+        accept_payload = {
+            "expected_revision": project.revision,
+            "expected_project_sha256": project_sha256,
+            "expected_source_receipt": source_receipt["receipt"],
+            "proposal_sha256": proposal_sha256,
+            "decision": "accept",
+            "intent": "end-at-wanted-music-remove-lead-in-and-runout",
+            "reviewed_start": True,
+            "reviewed_end": True,
+        }
+
+        class ObservedLock:
+            def __init__(self, lock: threading.Lock) -> None:
+                self._lock = lock
+                self.waiter_started = threading.Event()
+
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
+                if self._lock.acquire(blocking=False):
+                    return True
+                self.waiter_started.set()
+                if not blocking:
+                    return False
+                if timeout == -1:
+                    return self._lock.acquire()
+                return self._lock.acquire(timeout=timeout)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> ObservedLock:
+                if not self.acquire(timeout=5):
+                    raise TimeoutError("Timed out waiting for the observed child lock.")
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc_value: object,
+                traceback: object,
+            ) -> None:
+                self.release()
+
+        observed_lock = ObservedLock(child.server.operation_lock)
+        child.server.operation_lock = observed_lock  # type: ignore[assignment]
+        save_inside_child = threading.Event()
+        release_save = threading.Event()
+        original_save_project = review_server_module.save_project
+        results: dict[str, tuple[int, bytes]] = {}
+        errors: list[BaseException] = []
+
+        def pause_real_http_save(
+            candidate: Project,
+            path: Path,
+            **kwargs: object,
+        ) -> None:
+            if candidate.tracks[0].title == "Concurrent HTTP save":
+                save_inside_child.set()
+                if not release_save.wait(timeout=5):
+                    raise TimeoutError("Endpoint accept did not contend for the child lock.")
+            original_save_project(candidate, path, **kwargs)  # type: ignore[arg-type]
+
+        def post(name: str, path: str, payload: object) -> None:
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    port,
+                    timeout=5,
+                )
+                connection.request(
+                    "POST",
+                    path,
+                    body=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                results[name] = (response.status, response.read())
+                connection.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        started_at = time.monotonic()
+        with (
+            patch.object(
+                review_server_module,
+                "save_project",
+                side_effect=pause_real_http_save,
+            ),
+            patch.object(
+                review_server_module.ReviewHandler,
+                "_current_endpoint_proposal",
+                return_value=proposal,
+            ),
+        ):
+            save_thread = threading.Thread(
+                target=post,
+                args=("save", "/api/save", save_payload),
+                daemon=True,
+            )
+            save_thread.start()
+            self.assertTrue(
+                save_inside_child.wait(timeout=5),
+                "The real /api/save route never reached save_project().",
+            )
+            accept_thread = threading.Thread(
+                target=post,
+                args=("accept", "/api/endpoints/accept", accept_payload),
+                daemon=True,
+            )
+            accept_thread.start()
+            self.assertTrue(
+                observed_lock.waiter_started.wait(timeout=5),
+                "Endpoint acceptance never contended for the child operation lock.",
+            )
+            release_save.set()
+            save_thread.join(timeout=5)
+            accept_thread.join(timeout=5)
+
+        elapsed = time.monotonic() - started_at
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(accept_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(results["save"][0], 200, results["save"][1])
+        self.assertEqual(results["accept"][0], 409, results["accept"][1])
+        self.assertIn(b"changed", results["accept"][1].lower())
+        saved = load_project(child.project_path)
+        self.assertEqual(saved.tracks[0].title, "Concurrent HTTP save")
+        self.assertEqual(saved.tracks[0].start_sample, 0)
+        self.assertEqual(saved.tracks[-1].end_sample, 10_000)
+
+    def test_side_accept_rejects_byte_identical_album_path_retarget(self) -> None:
+        state = self.state()
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(state, "B"),
+        )
+        self.assertEqual(status, 200, body)
+        child = self.server._side_review_children["B"]
+        original_path = self.directory / "side-b.groove.json"
+        replacement_path = self.directory / "side-b-clone.groove.json"
+        shutil.copyfile(original_path, replacement_path)
+        original_before = original_path.read_bytes()
+        replacement_before = replacement_path.read_bytes()
+
+        album = load_album_project(self.album_path)
+        selected = next(side for side in album.sides if side.label == "B")
+        selected.project = replacement_path.name
+        save_album_project(album, self.album_path, overwrite=True)
+
+        with self.assertRaisesRegex(
+            album_review_server_module._AlbumConflictError,
+            "scope changed",
+        ):
+            child.server.validate_endpoint_scope()
+        current = load_project(original_path)
+        status, body = self.child_endpoint_accept(
+            child,
+            start_sample=current.tracks[0].start_sample + 100,
+            end_sample=current.tracks[-1].end_sample - 100,
+        )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(original_path.read_bytes(), original_before)
+        self.assertEqual(replacement_path.read_bytes(), replacement_before)
+
     def test_simultaneous_exact_open_does_not_orphan_a_child(self) -> None:
         state = self.state()
         sides = state["sides"]
@@ -1397,17 +2009,22 @@ class AlbumReviewServerTests(unittest.TestCase):
         identity = side["current_identity"]
         assert isinstance(identity, dict)
         project_path = self.directory / "side-a.groove.json"
-        barrier = threading.Barrier(2)
-        original_wait = self.server._wait_for_side_review
+        scope = EndpointScope(
+            "Side A",
+            0,
+            load_project(project_path).source.sample_count,
+        )
+        construction_barrier = threading.Barrier(2)
+        original_review_server = album_review_server_module.ReviewServer
 
-        def synchronized_wait(child: object) -> None:
-            original_wait(child)  # type: ignore[arg-type]
-            barrier.wait(timeout=5)
+        def synchronized_review_server(*args: object, **kwargs: object) -> object:
+            construction_barrier.wait(timeout=10)
+            return original_review_server(*args, **kwargs)  # type: ignore[arg-type]
 
         with patch.object(
-            self.server,
-            "_wait_for_side_review",
-            side_effect=synchronized_wait,
+            album_review_server_module,
+            "ReviewServer",
+            side_effect=synchronized_review_server,
         ):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
@@ -1416,6 +2033,7 @@ class AlbumReviewServerTests(unittest.TestCase):
                         "A",
                         project_path,
                         identity,
+                        scope,
                     )
                     for _index in range(2)
                 ]
@@ -1639,6 +2257,42 @@ class AlbumReviewServerTests(unittest.TestCase):
         response = connection.getresponse()
         body = response.read()
         self.assertEqual(response.status, 400, body)
+        connection.close()
+
+    def test_get_body_framing_rejection_closes_connection(self) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request(
+            "GET",
+            "/api/ping",
+            body=b"{}",
+            headers={
+                "Authorization": self.server.session_auth.authorization_header,
+                "Host": self.authority,
+                "Content-Length": "2",
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 400, body)
+        self.assertEqual(response.headers["Connection"], "close")
+        self.assertTrue(response.will_close)
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request(
+            "GET",
+            "/api/ping",
+            headers={
+                "Authorization": self.server.session_auth.authorization_header,
+                "Host": self.authority,
+                "Content-Length": "9" * 5_000,
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 400, body)
+        self.assertEqual(response.headers["Connection"], "close")
+        self.assertTrue(response.will_close)
         connection.close()
 
     def test_add_current_project_appends_an_explicitly_unpinned_side(self) -> None:

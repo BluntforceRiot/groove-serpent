@@ -23,6 +23,7 @@ from typing import Any, Literal, Mapping, cast
 from .errors import GrooveSerpentError, ProjectValidationError
 from .models import Project, resolve_source_path
 from .project_io import load_project_with_sha256
+from .publication import same_file_object_stats
 from .restoration import MAX_REPAIR_SAMPLES
 from .restoration_workflow import (
     MAX_PREVIEW_CANDIDATES,
@@ -30,7 +31,9 @@ from .restoration_workflow import (
     RECIPE_SCHEMA,
     REMOVED_SIGNAL_GAIN,
     RENDER_SCHEMA,
+    OWNER_AUTHORITY_PROOF_SCHEMA,
     REPAIR_BACKEND,
+    REVIEW_WORKFLOW_PROOF_SCHEMA,
     SCAN_SCHEMA,
     _detector_manifest,
     _restoration_coverage,
@@ -168,7 +171,14 @@ class RestorationCatalog:
             ]
             return max(candidates, key=_artifact_sort_key, default=None)
 
-        recipe = newest("recipe", (scan.artifact_id,))
+        recipe_candidates = [
+            item
+            for item in self.artifacts
+            if item.kind == "recipe"
+            and item.dependencies
+            and item.dependencies[0].artifact_id == scan.artifact_id
+        ]
+        recipe = max(recipe_candidates, key=_artifact_sort_key, default=None)
         preview = newest("preview", (scan.artifact_id,))
         render = (
             newest("render", (scan.artifact_id, recipe.artifact_id)) if recipe is not None else None
@@ -251,6 +261,12 @@ def _hash_regular_file(
     observed = 0
     try:
         with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not same_file_object_stats(before, opened):
+                raise _invalid(
+                    "file_changed",
+                    "The artifact path changed before its file was opened.",
+                )
             while True:
                 chunk = handle.read(_READ_CHUNK_BYTES)
                 if not chunk:
@@ -262,12 +278,18 @@ def _hash_regular_file(
                         "The artifact file grew beyond its safe size limit.",
                     )
                 digest.update(chunk)
+            closed = os.fstat(handle.fileno())
     except _InvalidArtifact:
         raise
     except OSError as exc:
         raise _invalid("unreadable_file", "The artifact file could not be read.") from exc
     after = _safe_lstat(path, directory=False)
-    if observed != before.st_size or not _same_file_snapshot(before, after):
+    if (
+        observed != before.st_size
+        or not same_file_object_stats(opened, closed)
+        or not same_file_object_stats(closed, after)
+        or not _same_file_snapshot(before, after)
+    ):
         raise _invalid("file_changed", "The artifact file changed while it was verified.")
     return digest.hexdigest(), observed
 
@@ -300,13 +322,26 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], str]:
             "A restoration manifest must contain 1 byte to 50 MB.",
         )
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not same_file_object_stats(before, opened):
+                raise _invalid(
+                    "manifest_changed",
+                    "The restoration manifest path changed before it was opened.",
+                )
+            raw = handle.read(MAX_MANIFEST_BYTES + 1)
+            closed = os.fstat(handle.fileno())
     except OSError as exc:
         raise _invalid(
             "unreadable_manifest", "The restoration manifest could not be read."
         ) from exc
     after = _safe_lstat(path, directory=False)
-    if len(raw) != before.st_size or not _same_file_snapshot(before, after):
+    if (
+        len(raw) != before.st_size
+        or not same_file_object_stats(opened, closed)
+        or not same_file_object_stats(closed, after)
+        or not _same_file_snapshot(before, after)
+    ):
         raise _invalid("manifest_changed", "The restoration manifest changed while read.")
     try:
         payload = json.loads(
@@ -669,6 +704,10 @@ def _validate_recipe_shape(payload: dict[str, Any]) -> None:
         "summary",
         "coverage",
     }
+    if "review_workflow" in payload:
+        allowed.add("review_workflow")
+    if "owner_authority" in payload:
+        allowed.add("owner_authority")
     _exact(payload, allowed, "Restoration recipe")
     _provenance(payload)
     _binding(payload["project"], "Recipe project")
@@ -685,6 +724,84 @@ def _validate_recipe_shape(payload: dict[str, Any]) -> None:
         "Recipe summary",
     )
     _validate_coverage_shape(payload["coverage"])
+    if "review_workflow" in payload:
+        workflow = _exact(
+            payload["review_workflow"],
+            {"schema", "previews"},
+            "Recipe review workflow",
+        )
+        if workflow["schema"] != REVIEW_WORKFLOW_PROOF_SCHEMA:
+            raise _invalid(
+                "invalid_schema", "Recipe preview-workflow schema is unsupported."
+            )
+        previews = workflow["previews"]
+        if type(previews) is not list or len(previews) > 10_000:
+            raise _invalid(
+                "invalid_schema", "Recipe preview bindings must be a bounded array."
+            )
+        normalized: list[tuple[str, str]] = []
+        for raw in previews:
+            binding = _exact(
+                raw,
+                {"token", "bundle", "sha256"},
+                "Recipe preview binding",
+            )
+            digest = _digest(binding["sha256"], "Recipe preview SHA-256")
+            bundle = _basename(binding["bundle"], "Recipe preview bundle")
+            token = _text(binding["token"], "Recipe preview token", maximum=40)
+            if token != f"preview-{digest[:32]}":
+                raise _invalid(
+                    "invalid_schema", "Recipe preview token and SHA-256 disagree."
+                )
+            normalized.append((token, bundle))
+        if (
+            normalized != sorted(normalized)
+            or len({item[0] for item in normalized}) != len(normalized)
+            or len({item[1] for item in normalized}) != len(normalized)
+        ):
+            raise _invalid(
+                "invalid_schema", "Recipe preview bindings are duplicated or unordered."
+            )
+    if "owner_authority" in payload:
+        authority = _exact(
+            payload["owner_authority"],
+            {
+                "schema",
+                "channel",
+                "claim",
+                "decision_journal",
+                "approvals",
+            },
+            "Recipe owner authority",
+        )
+        if (
+            authority["schema"] != OWNER_AUTHORITY_PROOF_SCHEMA
+            or authority["channel"] != "same-origin-owner-cookie"
+            or authority["claim"] != "owner-channel-action-not-human-perception"
+        ):
+            raise _invalid(
+                "invalid_schema", "Recipe owner-authority contract is unsupported."
+            )
+        journal = _exact(
+            authority["decision_journal"],
+            {"token", "sha256", "body_sha256"},
+            "Recipe decision journal",
+        )
+        journal_sha256 = _digest(
+            journal["sha256"], "Recipe decision journal SHA-256"
+        )
+        _digest(
+            journal["body_sha256"], "Recipe decision journal body SHA-256"
+        )
+        if journal["token"] != f"decision-{journal_sha256[:32]}":
+            raise _invalid(
+                "invalid_schema", "Recipe decision journal token and SHA-256 disagree."
+            )
+        approvals = authority["approvals"]
+        if type(approvals) is not list or len(approvals) > 10_000:
+            raise _invalid(
+                "invalid_schema", "Recipe owner approvals must be a bounded array."
+            )
 
 
 def _verify_bundle_contents(bundle: Path, expected: set[str]) -> None:
@@ -1058,6 +1175,20 @@ def _dependency_specs(
     specs: list[tuple[ArtifactKind, str, str]] = [
         ("scan", cast(str, scan["path"]), cast(str, scan["sha256"]))
     ]
+    if kind == "recipe":
+        workflow = payload.get("review_workflow")
+        if type(workflow) is dict:
+            previews = workflow.get("previews")
+            if type(previews) is list:
+                for raw in previews:
+                    if type(raw) is dict:
+                        specs.append(
+                            (
+                                "preview",
+                                cast(str, raw.get("bundle")),
+                                cast(str, raw.get("sha256")),
+                            )
+                        )
     if kind == "render":
         recipe = cast(dict[str, Any], payload["recipe"])
         specs.append(("recipe", cast(str, recipe["path"]), cast(str, recipe["sha256"])))
@@ -1268,6 +1399,38 @@ def _validate_resolved_chain(raw: _Provisional, by_name: Mapping[str, _Provision
             )
         except GrooveSerpentError as exc:
             raise _invalid("invalid_schema", str(exc)) from exc
+        workflow = cast(dict[str, Any], raw.payload.get("review_workflow", {}))
+        bindings = cast(list[Any], workflow.get("previews", []))
+        previewed_candidates: set[str] = set()
+        for binding, dependency in zip(
+            bindings,
+            raw.dependencies[1:],
+            strict=True,
+        ):
+            rendered_binding = cast(dict[str, Any], binding)
+            if (
+                dependency.kind != "preview"
+                or dependency.artifact_id != rendered_binding.get("token")
+            ):
+                raise _invalid(
+                    "dependency_binding_mismatch",
+                    "Recipe preview proof differs from its catalog dependency.",
+                )
+            preview = by_name[dependency.name]
+            previewed_candidates.update(
+                cast(str, cast(dict[str, Any], item)["id"])
+                for item in cast(list[Any], preview.payload["candidates"])
+            )
+        approved = {
+            cast(str, cast(dict[str, Any], item)["candidate_id"])
+            for item in cast(list[Any], raw.payload["decisions"])
+            if cast(dict[str, Any], item)["decision"] == "approved"
+        }
+        if not approved.issubset(previewed_candidates):
+            raise _invalid(
+                "dependency_binding_mismatch",
+                "Recipe preview dependencies do not cover every approved candidate.",
+            )
         return
     if raw.kind == "preview":
         preview_source = cast(dict[str, Any], raw.payload["source"])
@@ -1466,6 +1629,92 @@ def _as_artifact(raw: _Provisional) -> RestorationArtifact:
     )
 
 
+def verify_restoration_preview_bundle(
+    manifest_path: Path | str,
+    *,
+    workspace_path: Path | str,
+    project: Project,
+    project_sha256: str,
+    scan_snapshot_path: Path | str,
+    scan_dependency_name: str,
+    scan_sha256: str,
+) -> RestorationArtifact:
+    """Authenticate one preview bundle against an already-snapshotted scan.
+
+    This is the core recipe/render proof primitive.  It validates the preview
+    schema, hashes every referenced audio file through stable no-follow paths,
+    and proves that the preview candidates are exact members of the named scan.
+    """
+
+    try:
+        _digest(project_sha256, "Current project SHA-256")
+        _digest(scan_sha256, "Current scan SHA-256")
+        dependency_name = _basename(
+            scan_dependency_name,
+            "Preview scan dependency name",
+        )
+        scan_manifest = Path(scan_snapshot_path).expanduser().resolve()
+        scan_raw = _load_provisional("scan", scan_manifest, None)
+        if scan_raw.manifest_sha256 != scan_sha256:
+            raise _invalid(
+                "dependency_hash_mismatch",
+                "The snapshotted scan does not match the requested preview proof.",
+            )
+        scan_project = cast(dict[str, Any], scan_raw.payload.get("project", {}))
+        if scan_project.get("sha256") != project_sha256:
+            raise _invalid(
+                "dependency_binding_mismatch",
+                "The preview scan belongs to a different project state.",
+            )
+
+        declared_workspace = Path(workspace_path).expanduser().absolute()
+        preview_manifest = Path(manifest_path).expanduser().absolute()
+        if preview_manifest.name != "preview.json":
+            raise _invalid(
+                "unsafe_manifest_path",
+                "Preview proof must name an exact preview.json manifest.",
+            )
+        workspace = preview_manifest.parent.parent
+        try:
+            same_workspace = workspace.samefile(declared_workspace)
+        except OSError:
+            same_workspace = False
+        if not same_workspace:
+            raise _invalid(
+                "unsafe_manifest_path",
+                "Preview proof must be inside one direct workspace bundle.",
+            )
+        workspace_before = _safe_lstat(workspace, directory=True)
+        bundle_before = _safe_lstat(preview_manifest.parent, directory=True)
+        preview_raw = _load_provisional(
+            "preview",
+            preview_manifest,
+            preview_manifest.parent,
+        )
+        by_name = {dependency_name: scan_raw}
+        preview_raw.dependencies = _resolve_dependencies(
+            preview_raw,
+            by_name,
+            {scan_raw.artifact_id},
+        )
+        _validate_resolved_chain(preview_raw, by_name)
+        workspace_after = _safe_lstat(workspace, directory=True)
+        bundle_after = _safe_lstat(preview_manifest.parent, directory=True)
+        if (
+            not _same_file_snapshot(workspace_before, workspace_after)
+            or not _same_file_snapshot(bundle_before, bundle_after)
+        ):
+            raise _invalid(
+                "file_changed",
+                "The preview workspace or bundle changed while proof was verified.",
+            )
+        return _as_artifact(preview_raw)
+    except _InvalidArtifact as exc:
+        raise ProjectValidationError(
+            f"Restoration preview proof is invalid: {exc}"
+        ) from exc
+
+
 def discover_restoration_catalog(
     workspace: Path | str,
     project_path: Path | str,
@@ -1573,10 +1822,15 @@ def discover_restoration_catalog(
                 )
             )
     usable = [raw for raw in structurally_valid if raw.artifact_id not in duplicate_ids]
-    by_name = {raw.manifest_path.name: raw for raw in usable if raw.kind in {"scan", "recipe"}}
+    by_name: dict[str, _Provisional] = {}
+    for raw in usable:
+        if raw.kind in {"scan", "recipe"}:
+            by_name[raw.manifest_path.name] = raw
+        elif raw.kind == "preview":
+            by_name[raw.manifest_path.parent.name] = raw
     usable_ids = {raw.artifact_id for raw in usable}
     rejected_ids: set[str] = set()
-    for kind in ("recipe", "preview", "render"):
+    for kind in ("preview", "recipe", "render"):
         for raw in [item for item in usable if item.kind == kind]:
             try:
                 raw.dependencies = _resolve_dependencies(
@@ -1655,4 +1909,5 @@ __all__ = [
     "RestorationFile",
     "RestorationSelection",
     "discover_restoration_catalog",
+    "verify_restoration_preview_bundle",
 ]

@@ -40,7 +40,7 @@ class BuildPublicArchiveTests(unittest.TestCase):
 
     @classmethod
     def _commit(cls, root: Path) -> None:
-        write_public_release_commit(root)
+        write_public_release_commit(root, release_version=build_public_archive.VERSION)
         cls._git(root, "init", "--quiet")
         cls._git(root, "config", "user.name", "Release Test")
         cls._git(root, "config", "user.email", "release-test@example.invalid")
@@ -77,8 +77,8 @@ class BuildPublicArchiveTests(unittest.TestCase):
             second_dir = base / "second"
             first_dir.mkdir()
             second_dir.mkdir()
-            first = first_dir / "groove-serpent-1.0.0-source.zip"
-            second = second_dir / "groove-serpent-1.0.0-source.zip"
+            first = first_dir / f"{build_public_archive.RELEASE_NAME}-source.zip"
+            second = second_dir / f"{build_public_archive.RELEASE_NAME}-source.zip"
             first_manifest = first_dir / "SOURCE_MANIFEST.sha256"
             second_manifest = second_dir / "SOURCE_MANIFEST.sha256"
             first_marker = first_dir / build_public_archive.MARKER_NAME
@@ -109,10 +109,68 @@ class BuildPublicArchiveTests(unittest.TestCase):
                 self.assertEqual(
                     archive.namelist(),
                     [
-                        "groove-serpent-1.0.0/PUBLIC_RELEASE_COMMIT.json",
-                        "groove-serpent-1.0.0/README.md",
-                        "groove-serpent-1.0.0/SOURCE_MANIFEST.sha256",
+                        f"{build_public_archive.RELEASE_NAME}/PUBLIC_RELEASE_COMMIT.json",
+                        f"{build_public_archive.RELEASE_NAME}/README.md",
+                        f"{build_public_archive.RELEASE_NAME}/SOURCE_MANIFEST.sha256",
                     ],
+                )
+
+    def test_candidate_archive_accepts_pr_commit_but_release_mode_rejects_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            source.mkdir()
+            readme = source / "README.md"
+            readme.write_bytes(b"release payload\n")
+            self._commit(source)
+
+            readme.write_bytes(b"ordinary pull-request payload\n")
+            self._git(source, "add", "README.md")
+            self._git(source, "commit", "--quiet", "--message", "PR payload")
+            commit = self._git(source, "rev-parse", "HEAD").stdout.decode().strip()
+
+            archive = base / f"{build_public_archive.RELEASE_NAME}-source.zip"
+            manifest = base / "SOURCE_MANIFEST.sha256"
+            marker = base / build_public_archive.MARKER_NAME
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Public release commit does not match the exact public payload",
+            ):
+                build_public_archive.build_archive(
+                    archive,
+                    manifest,
+                    root=source,
+                    marker_path=marker,
+                )
+
+            build_public_archive.build_archive(
+                archive,
+                manifest,
+                root=source,
+                marker_path=marker,
+                authority_mode="candidate",
+            )
+            build_public_archive.verify_source_archive_commit(
+                marker,
+                archive,
+                manifest,
+                expected_commit=commit,
+                authority_mode="candidate",
+            )
+            candidate_marker = _release_evidence.strict_json_object(
+                marker.read_bytes(),
+                "Candidate source marker",
+            )
+            self.assertEqual(
+                candidate_marker["schema"],
+                build_public_archive.CANDIDATE_MARKER_SCHEMA,
+            )
+            with self.assertRaisesRegex(RuntimeError, "keys are invalid|schema or version"):
+                build_public_archive.verify_source_archive_commit(
+                    marker,
+                    archive,
+                    manifest,
+                    expected_commit=commit,
                 )
 
     def test_git_authority_ignores_inherited_repository_overrides(self) -> None:
@@ -198,7 +256,8 @@ class BuildPublicArchiveTests(unittest.TestCase):
             source = base / "source"
             source.mkdir()
             (source / "README.md").write_bytes(
-                b"diagnostic workspace: X:/" b"HomelabForge/release\n"
+                "/".join(("diagnostic workspace: X:", "Users", "synthetic-owner", "release\n"))
+                .encode("utf-8")
             )
             self._commit(source)
             archive = base / "release.zip"
@@ -210,6 +269,87 @@ class BuildPublicArchiveTests(unittest.TestCase):
             self.assertFalse(archive.exists())
             self.assertFalse(manifest.exists())
             self.assertFalse((base / build_public_archive.MARKER_NAME).exists())
+
+    def test_archive_requires_external_policy_and_rejects_literal_before_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            source.mkdir()
+            canary = "synthetic-owner-recording-privacy-canary.flac"
+            (source / "fixture.py").write_bytes(
+                f"CAPTURE = {canary[:20]!r} {canary[20:]!r}\n".encode("utf-8")
+            )
+            self._commit(source)
+            policy = base / "private-policy.json"
+            policy.write_bytes(_release_evidence.canonical_json_bytes({
+                "schema": _release_evidence.PRIVATE_POLICY_SCHEMA,
+                "forbidden_literals": [canary],
+            }))
+            for mode in ("candidate", "release"):
+                with self.subTest(mode=mode), self.assertRaisesRegex(
+                    RuntimeError, "private material"
+                ):
+                    build_public_archive.build_archive(
+                        base / "release.zip",
+                        base / "SOURCE_MANIFEST.sha256",
+                        root=source,
+                        authority_mode=mode,
+                        private_policy_path=policy,
+                    )
+            self.assertFalse((base / "release.zip").exists())
+            self.assertFalse((base / "SOURCE_MANIFEST.sha256").exists())
+
+    def test_history_bundle_is_not_a_public_source_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            (source / "history.bundle").write_bytes(b"synthetic-git-history")
+            with self.assertRaisesRegex(RuntimeError, "private or generated"):
+                build_public_archive.included_files(source)
+
+    def test_private_output_names_are_rejected_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            source.mkdir()
+            (source / "README.md").write_bytes(b"public source\n")
+            self._commit(source)
+            policy = base / "private-policy.json"
+            canary = "synthetic-private-artifact-name"
+            policy.write_bytes(_release_evidence.canonical_json_bytes({
+                "schema": _release_evidence.PRIVATE_POLICY_SCHEMA,
+                "forbidden_literals": [canary],
+            }))
+            with self.assertRaisesRegex(RuntimeError, "private material"):
+                build_public_archive.build_archive(
+                    base / (canary + ".zip"), base / "SOURCE_MANIFEST.sha256",
+                    root=source, private_policy_path=policy,
+                )
+            self.assertEqual(
+                {path.name for path in base.iterdir()}, {"source", "private-policy.json"}
+            )
+
+    def test_independent_candidate_verifier_applies_private_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            source.mkdir()
+            canary = "synthetic-owner-recording-privacy-canary.flac"
+            (source / "README.md").write_text(canary, encoding="utf-8")
+            self._commit(source)
+            archive = base / "release.zip"
+            manifest = base / "SOURCE_MANIFEST.sha256"
+            build_public_archive.build_archive(
+                archive, manifest, root=source, authority_mode="candidate"
+            )
+            policy = _release_evidence.PrivateContentPolicy("a" * 64, (canary,))
+            with self.assertRaisesRegex(RuntimeError, "private material"):
+                build_public_archive.verify_source_archive_commit(
+                    base / build_public_archive.MARKER_NAME,
+                    archive,
+                    manifest,
+                    authority_mode="candidate",
+                    policy=policy,
+                )
 
     @unittest.skipIf(os.name == "nt", "Control-character filename is POSIX-only")
     def test_control_character_git_member_is_rejected_before_manifest(self) -> None:
@@ -352,6 +492,31 @@ class BuildPublicArchiveTests(unittest.TestCase):
                 )
             self.assertFalse((base / "release.zip").exists())
             self.assertFalse((base / "SOURCE_MANIFEST.sha256").exists())
+
+    def test_ignored_browser_results_do_not_contaminate_git_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            source.mkdir()
+            (source / "README.md").write_bytes(b"reviewed\n")
+            (source / ".gitignore").write_bytes(b".groove-serpent/\n")
+            self._commit(source)
+            browser_results = source / ".groove-serpent" / "browser-test-results"
+            browser_results.mkdir(parents=True)
+            (browser_results / ".last-run.json").write_bytes(b'{"status":"passed"}\n')
+            archive = base / "release.zip"
+            manifest = base / "SOURCE_MANIFEST.sha256"
+
+            build_public_archive.build_archive(
+                archive,
+                manifest,
+                root=source,
+            )
+
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertFalse(
+                    any(".groove-serpent" in name for name in bundle.namelist())
+                )
 
     def test_tracked_generated_path_is_rejected_instead_of_silently_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

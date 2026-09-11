@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import struct
 import sys
 import tempfile
@@ -120,6 +121,27 @@ class PortableReleasePathTests(unittest.TestCase):
                     "Fixture output",
                 )
             self.assertFalse(output.parent.exists())
+
+
+@unittest.skipUnless(os.name == "nt", "Windows creation-time regression")
+class WindowsReleaseFilesystemIncarnationTests(unittest.TestCase):
+    def test_pre312_ctime_or_native_birthtime_is_stable_creation_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            path = parent / "identity.tmp"
+            renamed = parent / "renamed.tmp"
+            path.write_bytes(b"first")
+            initial = path.lstat()
+            source, incarnation = _release_fs._path_incarnation(path, initial)
+
+            self.assertIn(source, {"stat-birthtime", "windows-creation-time"})
+            _release_fs.require_stable_creation_identity(parent, "Fixture output")
+
+            path.write_bytes(b"changed payload")
+            path.rename(renamed)
+            moved = renamed.lstat()
+            moved_source, moved_incarnation = _release_fs._path_incarnation(renamed, moved)
+            self.assertEqual((moved_source, moved_incarnation), (source, incarnation))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux inode-reuse regression")

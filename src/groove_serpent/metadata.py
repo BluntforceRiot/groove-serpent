@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping, cast
 
 from . import __user_agent__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import GrooveSerpentError
 
 
@@ -50,6 +55,18 @@ def _is_reparse(value: os.stat_result) -> bool:
 
 class MetadataLookupError(GrooveSerpentError):
     """A user-facing failure while looking up metadata or cover artwork."""
+
+
+class ArtworkDownloadResult(dict[str, Any]):
+    """Portable artwork metadata with a nonserialized, writer-bound cleanup receipt."""
+
+    __slots__ = ("cleanup_receipt",)
+
+    def __init__(
+        self, values: Mapping[str, Any], *, cleanup_receipt: OwnedFileReceipt
+    ) -> None:
+        super().__init__(values)
+        self.cleanup_receipt = cleanup_receipt
 
 
 def _validate_user_agent(value: str) -> str:
@@ -798,7 +815,7 @@ class CoverArtArchiveClient:
         if not valid:
             raise MetadataLookupError("Artwork data does not match its declared image type.")
 
-    def download_front_art(self, release_id: str, *, size: str = "1200") -> dict[str, Any]:
+    def download_front_art(self, release_id: str, *, size: str = "1200") -> ArtworkDownloadResult:
         """Download front art into ``artwork/`` and return portable file metadata."""
 
         metadata = self.resolve_front_art(release_id)
@@ -806,7 +823,7 @@ class CoverArtArchiveClient:
 
     def download_release_group_front_art(
         self, release_group_id: str, *, size: str = "1200"
-    ) -> dict[str, Any]:
+    ) -> ArtworkDownloadResult:
         """Download release-group fallback art without changing release behavior."""
 
         metadata = self.resolve_release_group_front_art(release_group_id)
@@ -814,7 +831,7 @@ class CoverArtArchiveClient:
 
     def _download_resolved_front_art(
         self, metadata: Mapping[str, Any], *, size: str
-    ) -> dict[str, Any]:
+    ) -> ArtworkDownloadResult:
         """Download a previously resolved release or release-group front cover."""
 
         if size not in {"1200", "500", "original"}:
@@ -838,6 +855,7 @@ class CoverArtArchiveClient:
             raise MetadataLookupError(f"Could not download cover artwork: {reason}") from exc
 
         temporary_path: Path | None = None
+        cleanup_receipt: OwnedFileReceipt | None = None
         try:
             with response:
                 status = getattr(response, "status", 200)
@@ -867,22 +885,41 @@ class CoverArtArchiveClient:
                 digest = hashlib.sha256()
                 total = 0
                 prefix = b""
+                payload = bytearray()
                 with os.fdopen(descriptor, "wb") as output:
-                    while True:
-                        chunk = response.read(min(64 * 1024, self.max_bytes - total + 1))
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > self.max_bytes:
-                            raise MetadataLookupError(
-                                "Cover artwork exceeds the 25 MB download limit."
+                    try:
+                        while True:
+                            chunk = response.read(min(64 * 1024, self.max_bytes - total + 1))
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > self.max_bytes:
+                                raise MetadataLookupError(
+                                    "Cover artwork exceeds the 25 MB download limit."
+                                )
+                            if len(prefix) < 16:
+                                prefix += chunk[: 16 - len(prefix)]
+                            digest.update(chunk)
+                            written = output.write(chunk)
+                            payload.extend(chunk[:written])
+                            if written != len(chunk):
+                                raise OSError("short write while staging cover artwork")
+                        output.flush()
+                        os.fsync(output.fileno())
+                        cleanup_receipt = capture_owned_file_receipt(
+                            temporary_path, bytes(payload), owned_descriptor=output.fileno()
+                        )
+                    except BaseException:
+                        # A failed response can still leave a fully known partial file.
+                        # Never adopt a replacement after the writer has closed.
+                        try:
+                            output.flush()
+                            cleanup_receipt = capture_owned_file_receipt(
+                                temporary_path, bytes(payload), owned_descriptor=output.fileno()
                             )
-                        if len(prefix) < 16:
-                            prefix += chunk[: 16 - len(prefix)]
-                        digest.update(chunk)
-                        output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
+                        except OSError:
+                            pass
+                        raise
                 self._validate_image_signature(mime_type, prefix)
                 storage_id = str(
                     metadata.get("storage_id")
@@ -915,19 +952,22 @@ class CoverArtArchiveClient:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not save cover artwork: {reason}") from exc
         finally:
-            if temporary_path is not None:
+            if temporary_path is not None and cleanup_receipt is not None:
                 try:
-                    temporary_path.unlink(missing_ok=True)
+                    remove_owned_file_if_present(temporary_path, cleanup_receipt)
                 except OSError:
                     pass
 
         relative_path = destination.relative_to(self.project_root).as_posix()
-        return {
-            "relative_path": relative_path,
-            "source_url": source_url,
-            "mime_type": mime_type,
-            "sha256": digest.hexdigest(),
-            "size_bytes": total,
-            "requested_size": size,
-            "selected_size": selected_size,
-        }
+        return ArtworkDownloadResult(
+            {
+                "relative_path": relative_path,
+                "source_url": source_url,
+                "mime_type": mime_type,
+                "sha256": digest.hexdigest(),
+                "size_bytes": total,
+                "requested_size": size,
+                "selected_size": selected_size,
+            },
+            cleanup_receipt=cleanup_receipt,
+        )

@@ -23,7 +23,12 @@ from typing import Any, Callable, Literal, Mapping, Sequence, cast
 
 from . import __file__ as application_module_path
 from . import __version__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import GrooveSerpentError
 from .review_evidence import (
     EVIDENCE_CATEGORIES,
@@ -71,6 +76,28 @@ class EvaluationConfig:
     minimum_paired_benchmarks: int = 3
     minimum_paired_sources: int = 2
     minimum_pair_coverage_basis_points: int = 8_000
+
+    def __post_init__(self) -> None:
+        _digest(self.split_salt_sha256, "Split salt SHA-256")
+        _integer(
+            self.evaluation_basis_points,
+            "Evaluation basis points",
+            minimum=1,
+            maximum=9_999,
+        )
+        for value, label in (
+            (self.minimum_metric_records, "Minimum metric records"),
+            (self.minimum_metric_sources, "Minimum metric sources"),
+            (self.minimum_paired_benchmarks, "Minimum paired benchmarks"),
+            (self.minimum_paired_sources, "Minimum paired sources"),
+        ):
+            _integer(value, label, minimum=1, maximum=4_096)
+        _integer(
+            self.minimum_pair_coverage_basis_points,
+            "Minimum pair coverage basis points",
+            minimum=1,
+            maximum=10_000,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the exact canonical configuration body."""
@@ -1177,22 +1204,23 @@ def _write_new_canonical(path: Path, raw: bytes) -> None:
         dir=parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     temporary = Path(temporary_name)
+    cleanup_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
+            cleanup_receipt = capture_owned_file_receipt(
+                temporary, raw, owned_descriptor=handle.fileno(),
+            )
             os.fsync(handle.fileno())
         rename_no_replace(temporary, path)
     except FileExistsError as exc:
         raise ReviewEvidenceEvaluationError(
             "Evaluation receipt destination appeared."
         ) from exc
-    except BaseException:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    finally:
+        if cleanup_receipt is not None:
+            remove_owned_file_if_present(temporary, cleanup_receipt)
 
 
 def write_review_evidence_evaluation(

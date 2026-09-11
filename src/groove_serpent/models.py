@@ -1619,7 +1619,7 @@ def _source_path_kind(value: str) -> str:
         if (
             len(drive) != 2
             or drive[1] != ":"
-            or not drive[0].isalpha()
+            or not (drive[0].isascii() and drive[0].isalpha())
         ):
             raise ProjectValidationError(
                 "UNC and Windows device-namespace source paths are not supported."
@@ -1681,6 +1681,18 @@ def resolve_source_path(project: Project, project_path: Path) -> Path:
             candidates.append(stored)
     else:
         candidates.append((project_path.parent / stored).resolve())
+        if (
+            os.name != "nt"
+            and "\\" in source_path
+            and "/" not in source_path
+            and "\\" not in project.source.filename
+            and ntpath.basename(source_path) == project.source.filename
+        ):
+            # Older Windows writers used native separators. Keep literal POSIX
+            # names first and translate only the recognized legacy filename
+            # shape, not mixed-separator paths or literal-backslash filenames.
+            portable = Path(source_path.replace("\\", "/"))
+            candidates.append((project_path.parent / portable).resolve())
     candidates.append((project_path.parent / project.source.filename).resolve())
 
     for candidate in candidates:

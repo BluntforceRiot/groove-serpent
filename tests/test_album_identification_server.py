@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -19,8 +20,9 @@ from groove_serpent.album import (
 )
 from groove_serpent.album_publication_policy import speed_correction_details
 from groove_serpent.album_review_server import AlbumReviewServer
+from groove_serpent.atomic_create import capture_owned_file_receipt
 from groove_serpent.audio_snapshot import VerifiedAudioSnapshot
-from groove_serpent.metadata import MetadataLookupError
+from groove_serpent.metadata import ArtworkDownloadResult, MetadataLookupError
 from groove_serpent.models import (
     AnalysisSettings,
     AnalysisSummary,
@@ -143,6 +145,7 @@ class _FakeCoverArtClient:
         self.root = root
         self.calls: list[tuple[str, str]] = []
         self.on_download: Callable[[], None] | None = None
+        self.include_cleanup_receipt = True
 
     def download_front_art(self, release_id: str, *, size: str) -> dict[str, Any]:
         self.calls.append((release_id, size))
@@ -153,18 +156,28 @@ class _FakeCoverArtClient:
             raise MetadataLookupError(
                 "Cover artwork already exists; Groove Serpent will not overwrite it."
             )
-        destination.write_bytes(self.image)
+        with destination.open("xb") as handle:
+            handle.write(self.image)
+            handle.flush()
+            receipt = capture_owned_file_receipt(
+                destination, self.image, owned_descriptor=handle.fileno()
+            )
+            os.fsync(handle.fileno())
         if self.on_download is not None:
             self.on_download()
-        return {
-            "relative_path": relative.as_posix(),
-            "source_url": "https://coverartarchive.org/release/example/front.png",
-            "mime_type": "image/png",
-            "sha256": hashlib.sha256(self.image).hexdigest(),
-            "size_bytes": len(self.image),
-            "requested_size": size,
-            "selected_size": size,
-        }
+        result = ArtworkDownloadResult(
+            {
+                "relative_path": relative.as_posix(),
+                "source_url": "https://coverartarchive.org/release/example/front.png",
+                "mime_type": "image/png",
+                "sha256": hashlib.sha256(self.image).hexdigest(),
+                "size_bytes": len(self.image),
+                "requested_size": size,
+                "selected_size": size,
+            },
+            cleanup_receipt=receipt,
+        )
+        return result if self.include_cleanup_receipt else dict(result)
 
 
 def _release_match() -> RecognitionMatch:
@@ -609,7 +622,7 @@ class AlbumIdentificationServerTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(self.server.release_reviews, {})
 
-    def test_artwork_race_removes_only_new_unbound_review_file(self) -> None:
+    def _reviewed_artwork_request(self) -> dict[str, object]:
         initial = self.state()
         status, scanned = self.request(
             "POST",
@@ -625,12 +638,9 @@ class AlbumIdentificationServerTests(unittest.TestCase):
             ),
         )
         self.assertEqual(status, 200, details)
-        self.cover_art.on_download = lambda: self.album_path.write_bytes(
-            self.album_path.read_bytes() + b"\n"
-        )
         entry = scanned["catalog_entry"]
         proposal = scanned["proposal"]
-        payload = {
+        return {
             **self.mutation_preconditions(scanned["state"]),
             "action": "download-reviewed-candidate-front-artwork",
             "network_reviewed": True,
@@ -640,6 +650,12 @@ class AlbumIdentificationServerTests(unittest.TestCase):
             "release_mbid": RELEASE_MBID,
             "expected_release_review_sha256": details["review"]["review_sha256"],
         }
+
+    def test_artwork_race_removes_only_new_unbound_review_file(self) -> None:
+        payload = self._reviewed_artwork_request()
+        self.cover_art.on_download = lambda: self.album_path.write_bytes(
+            self.album_path.read_bytes() + b"\n"
+        )
         status, _response = self.request(
             "POST", "/api/album/identification/download-artwork", payload=payload
         )
@@ -652,6 +668,45 @@ class AlbumIdentificationServerTests(unittest.TestCase):
         )
         self.assertFalse(destination.exists())
         self.assertEqual(self.server.artwork_previews, {})
+
+    def test_artwork_race_without_writer_receipt_preserves_download(self) -> None:
+        payload = self._reviewed_artwork_request()
+        self.cover_art.include_cleanup_receipt = False
+        self.cover_art.on_download = lambda: self.album_path.write_bytes(
+            self.album_path.read_bytes() + b"\n"
+        )
+        status, response = self.request(
+            "POST", "/api/album/identification/download-artwork", payload=payload
+        )
+        self.assertEqual(status, 409, response)
+        destination = self.directory / "artwork/review" / f"{RELEASE_MBID}-front-1200.png"
+        self.assertEqual(destination.read_bytes(), self.cover_art.image)
+        self.assertEqual(self.server.artwork_previews, {})
+
+    def test_artwork_race_preserves_identical_foreign_replacement(self) -> None:
+        payload = self._reviewed_artwork_request()
+        destination = self.directory / "artwork/review" / f"{RELEASE_MBID}-front-1200.png"
+        retained = destination.with_suffix(".retained")
+        album_before = self.album_path.read_bytes()
+        projects_before = [path.read_bytes() for path in self.side_paths]
+        sources_before = [path.read_bytes() for path in self.source_paths]
+
+        def replace_and_conflict() -> None:
+            destination.rename(retained)
+            destination.write_bytes(self.cover_art.image)
+            self.album_path.write_bytes(album_before + b"\n")
+
+        self.cover_art.on_download = replace_and_conflict
+        status, response = self.request(
+            "POST", "/api/album/identification/download-artwork", payload=payload
+        )
+        self.assertEqual(status, 409, response)
+        self.assertEqual(destination.read_bytes(), self.cover_art.image)
+        self.assertEqual(retained.read_bytes(), self.cover_art.image)
+        self.assertEqual(self.server.artwork_previews, {})
+        self.assertEqual(self.album_path.read_bytes(), album_before + b"\n")
+        self.assertEqual([path.read_bytes() for path in self.side_paths], projects_before)
+        self.assertEqual([path.read_bytes() for path in self.source_paths], sources_before)
 
     def test_scan_uses_snapshots_persists_and_reopens_without_authority(self) -> None:
         state = self.state()

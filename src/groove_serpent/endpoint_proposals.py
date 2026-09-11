@@ -21,10 +21,15 @@ from typing import Any, Literal, Mapping, Sequence
 import numpy as np
 
 from . import __version__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .audio_snapshot import verified_audio_snapshot
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
-from .media import find_tool, probe_audio, tool_version
+from .media import audio_source_descriptor_mismatches, find_tool, probe_audio, tool_version
 from .models import Project, resolve_source_path
 from .portable_names import portable_name_key
 from .project_io import load_project_with_sha256
@@ -41,8 +46,8 @@ from .subprocess_policy import (
 )
 
 
-ENDPOINT_PROPOSAL_SCHEMA = "groove-serpent.endpoint-proposals/1"
-ENDPOINT_ALGORITHM_ID = "groove-serpent.multimodal-endpoints/1"
+ENDPOINT_PROPOSAL_SCHEMA = "groove-serpent.endpoint-proposals/2"
+ENDPOINT_ALGORITHM_ID = "groove-serpent.multimodal-endpoints/2"
 ENDPOINT_MODULE_ID = "groove_serpent.endpoint_proposals"
 _MAX_PROPOSAL_BYTES = 8 * 1024 * 1024
 _MAX_SCOPES = 32
@@ -58,9 +63,7 @@ def _finite(value: Any, label: str, minimum: float, maximum: float) -> float:
         raise ProjectValidationError(f"{label} must be one finite number.")
     result = float(value)
     if not math.isfinite(result) or not minimum <= result <= maximum:
-        raise ProjectValidationError(
-            f"{label} must be between {minimum} and {maximum}."
-        )
+        raise ProjectValidationError(f"{label} must be between {minimum} and {maximum}.")
     return result
 
 
@@ -90,9 +93,7 @@ def _text(value: Any, label: str, *, maximum: int = 512) -> str:
         or len(value) > maximum
         or any(ord(character) < 32 for character in value)
     ):
-        raise ProjectValidationError(
-            f"{label} must be bounded, trimmed, printable text."
-        )
+        raise ProjectValidationError(f"{label} must be bounded, trimmed, printable text.")
     return value
 
 
@@ -126,9 +127,12 @@ class EndpointProposalConfig:
     maximum_quiet_bridge_ms: int = 500
     minimum_quiet_context_ms: int = 750
     maximum_family_spread_ms: int = 5_000
-    needle_confirmation_radius_ms: int = 2_500
+    needle_confirmation_radius_ms: int = 30_000
     transient_sigma: float = 12.0
     minimum_transient_derivative: float = 0.02
+    maximum_groove_centroid_hz: float = 50.0
+    maximum_groove_high_frequency_ratio: float = 0.0015
+    minimum_groove_context_fraction: float = 0.9
 
     def validate(self) -> None:
         _integer(self.window_ms, "Endpoint window length", 50, 2_000)
@@ -139,9 +143,7 @@ class EndpointProposalConfig:
             16_384,
         )
         if fft_size & (fft_size - 1):
-            raise ProjectValidationError(
-                "Endpoint spectral FFT size must be a power of two."
-            )
+            raise ProjectValidationError("Endpoint spectral FFT size must be a power of two.")
         _integer(
             self.spectral_frames_per_window,
             "Endpoint spectral frames per window",
@@ -214,6 +216,24 @@ class EndpointProposalConfig:
             "Minimum transient derivative",
             0.000001,
             2.0,
+        )
+        _finite(
+            self.maximum_groove_centroid_hz,
+            "Maximum groove-context spectral centroid",
+            1.0,
+            1_000.0,
+        )
+        _finite(
+            self.maximum_groove_high_frequency_ratio,
+            "Maximum groove-context high-frequency ratio",
+            0.0,
+            0.25,
+        )
+        _finite(
+            self.minimum_groove_context_fraction,
+            "Minimum groove-context agreement fraction",
+            0.5,
+            1.0,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -313,17 +333,33 @@ class EndpointWindowFeature:
 
 
 @dataclass(frozen=True, slots=True)
+class EndpointBoundaryProposal:
+    """One independently reviewable boundary proposal or abstention."""
+
+    status: Literal["proposed", "abstained"]
+    sample: int | None
+    confidence: float
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "sample": self.sample,
+            "confidence": self.confidence,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class EndpointScopeProposal:
-    """One review-required proposal or explicit abstention."""
+    """Two independent boundary decisions bound to one source scope."""
 
     label: str
     scope_start_sample: int
     scope_end_sample_exclusive: int
-    status: Literal["proposed", "abstained"]
-    proposed_music_start_sample: int | None
-    proposed_music_end_sample_exclusive: int | None
-    confidence: float
-    reasons: tuple[str, ...]
+    status: Literal["proposed", "partial", "abstained"]
+    start: EndpointBoundaryProposal
+    end: EndpointBoundaryProposal
     requires_review: bool
     evidence: dict[str, Any]
 
@@ -333,12 +369,8 @@ class EndpointScopeProposal:
             "scope_start_sample": self.scope_start_sample,
             "scope_end_sample_exclusive": self.scope_end_sample_exclusive,
             "status": self.status,
-            "proposed_music_start_sample": self.proposed_music_start_sample,
-            "proposed_music_end_sample_exclusive": (
-                self.proposed_music_end_sample_exclusive
-            ),
-            "confidence": self.confidence,
-            "reasons": list(self.reasons),
+            "start": self.start.to_dict(),
+            "end": self.end.to_dict(),
             "requires_review": self.requires_review,
             "evidence": self.evidence,
         }
@@ -364,9 +396,7 @@ def _validate_scopes(
             raise ProjectValidationError("Endpoint scope labels must be portable-unique.")
         labels.add(key)
         if index and scope.start_sample < previous_end:
-            raise ProjectValidationError(
-                "Endpoint scopes must be ordered and may not overlap."
-            )
+            raise ProjectValidationError("Endpoint scopes must be ordered and may not overlap.")
         previous_end = scope.end_sample_exclusive
     return values
 
@@ -506,13 +536,35 @@ def _contiguous_quiet_tonal_samples(
     # ordinary broadband floor.  If such structure continues beyond the chosen
     # threshold crossing, cutting is ambiguous and the proposal must abstain.
     tonal_limit = min(0.25, maximum_flatness / 3.0)
-    while (
-        0 <= current < len(features)
-        and features[current].spectral_flatness <= tonal_limit
-    ):
+    while 0 <= current < len(features) and features[current].spectral_flatness <= tonal_limit:
         total += features[current].sample_count
         current += direction
     return total
+
+
+def _quiet_tonal_context_is_groove_like(
+    features: Sequence[EndpointWindowFeature],
+    *,
+    index: int,
+    direction: Literal[-1, 1],
+    config: EndpointProposalConfig,
+) -> bool:
+    """Identify a strongly sub-audible groove signature, never music by itself."""
+
+    tonal_limit = min(0.25, config.maximum_spectral_flatness / 3.0)
+    context: list[EndpointWindowFeature] = []
+    current = index
+    while 0 <= current < len(features) and features[current].spectral_flatness <= tonal_limit:
+        context.append(features[current])
+        current += direction
+    if not context:
+        return False
+    groove_windows = sum(
+        item.spectral_centroid_hz <= config.maximum_groove_centroid_hz
+        and item.high_frequency_ratio <= config.maximum_groove_high_frequency_ratio
+        for item in context
+    )
+    return groove_windows >= math.ceil(len(context) * config.minimum_groove_context_fraction)
 
 
 def _needle_confirmations(
@@ -534,20 +586,17 @@ def _needle_confirmations(
     radius = (sample_rate * config.needle_confirmation_radius_ms + 999) // 1_000
     confirmations: list[dict[str, Any]] = []
     for index, item in enumerate(features):
-        if item.impulse_count == 0 or item.derivative_peak < threshold:
+        full_scale_impulse = (
+            item.peak_dbfs >= -3.0 and item.derivative_peak >= config.minimum_transient_derivative
+        )
+        if item.impulse_count == 0 or (item.derivative_peak < threshold and not full_scale_impulse):
             continue
         before = features[max(0, index - 2) : index]
         after = features[index + 1 : min(len(features), index + 3)]
         before_db = (
-            sum(value.rms_dbfs for value in before) / len(before)
-            if before
-            else item.rms_dbfs
+            sum(value.rms_dbfs for value in before) / len(before) if before else item.rms_dbfs
         )
-        after_db = (
-            sum(value.rms_dbfs for value in after) / len(after)
-            if after
-            else item.rms_dbfs
-        )
+        after_db = sum(value.rms_dbfs for value in after) / len(after) if after else item.rms_dbfs
         sample = item.start_sample
         kind: str | None = None
         anchor = proposed_start
@@ -617,9 +666,7 @@ def _proposal_evidence(
         "transition_context": {
             "quiet_before_start_samples": start_context_samples,
             "quiet_after_end_samples": end_context_samples,
-            "quiet_tonal_before_start_samples": (
-                quiet_tonal_before_start_samples
-            ),
+            "quiet_tonal_before_start_samples": (quiet_tonal_before_start_samples),
             "quiet_tonal_after_end_samples": quiet_tonal_after_end_samples,
         },
         "policy": {
@@ -653,9 +700,7 @@ def propose_scope_endpoints(
     expected_start = scope.start_sample
     for item in values:
         if not isinstance(item, EndpointWindowFeature):
-            raise ProjectValidationError(
-                "Endpoint evidence must use EndpointWindowFeature values."
-            )
+            raise ProjectValidationError("Endpoint evidence must use EndpointWindowFeature values.")
         item.validate(sample_rate=sample_rate)
         if item.start_sample != expected_start:
             raise ProjectValidationError(
@@ -663,9 +708,7 @@ def propose_scope_endpoints(
             )
         expected_start = item.end_sample_exclusive
     if expected_start != scope.end_sample_exclusive:
-        raise ProjectValidationError(
-            "Endpoint feature windows do not reach the exact scope end."
-        )
+        raise ProjectValidationError("Endpoint feature windows do not reach the exact scope end.")
 
     energies = [item.rms_dbfs for item in values]
     # A side is normally music for far more than eighty percent of its scope.
@@ -678,8 +721,7 @@ def propose_scope_endpoints(
     waveform_threshold = noise_floor + settings.waveform_activity_margin_db
     spectral_threshold = noise_floor + settings.spectral_activity_margin_db
     waveform_mask = [
-        item.rms_dbfs >= waveform_threshold
-        and item.peak_dbfs >= waveform_threshold + 2.0
+        item.rms_dbfs >= waveform_threshold and item.peak_dbfs >= waveform_threshold + 2.0
         for item in values
     ]
     spectral_mask = [
@@ -691,14 +733,11 @@ def propose_scope_endpoints(
         for item in values
     ]
     spectral_continuation = [
-        item.rms_dbfs
-        >= noise_floor + max(1.0, settings.spectral_activity_margin_db / 2.0)
+        item.rms_dbfs >= noise_floor + max(1.0, settings.spectral_activity_margin_db / 2.0)
         and item.spectral_flatness <= settings.maximum_spectral_flatness
         for item in values
     ]
-    maximum_gap = (
-        sample_rate * settings.maximum_quiet_bridge_ms + 999
-    ) // 1_000
+    maximum_gap = (sample_rate * settings.maximum_quiet_bridge_ms + 999) // 1_000
     waveform_mask = _bridge_short_gaps(waveform_mask, values, maximum_gap)
     spectral_mask = _bridge_short_gaps(spectral_mask, values, maximum_gap)
     spectral_continuation = _bridge_short_gaps(
@@ -706,9 +745,7 @@ def propose_scope_endpoints(
         values,
         maximum_gap,
     )
-    minimum_active = (
-        sample_rate * settings.minimum_active_run_ms + 999
-    ) // 1_000
+    minimum_active = (sample_rate * settings.minimum_active_run_ms + 999) // 1_000
     waveform_extent = _sustained_extent(waveform_mask, values, minimum_active)
     spectral_extent = _sustained_extent(spectral_mask, values, minimum_active)
     spectral_extent = _extend_extent(spectral_extent, spectral_continuation)
@@ -718,6 +755,34 @@ def propose_scope_endpoints(
         for waveform, spectral in zip(waveform_mask, spectral_mask, strict=True)
     ]
     empty_confirmations: list[dict[str, Any]] = []
+
+    def abstained(reason: str) -> EndpointBoundaryProposal:
+        return EndpointBoundaryProposal("abstained", None, 0.0, (reason,))
+
+    def scope_proposal(
+        start: EndpointBoundaryProposal,
+        end: EndpointBoundaryProposal,
+        evidence: dict[str, Any],
+    ) -> EndpointScopeProposal:
+        proposed_count = sum(boundary.status == "proposed" for boundary in (start, end))
+        status: Literal["proposed", "partial", "abstained"]
+        if proposed_count == 2:
+            status = "proposed"
+        elif proposed_count == 1:
+            status = "partial"
+        else:
+            status = "abstained"
+        return EndpointScopeProposal(
+            scope.label,
+            scope.start_sample,
+            scope.end_sample_exclusive,
+            status,
+            start,
+            end,
+            True,
+            evidence,
+        )
+
     if dynamic_range < settings.minimum_dynamic_range_db:
         evidence = _proposal_evidence(
             values,
@@ -734,16 +799,10 @@ def propose_scope_endpoints(
             quiet_tonal_before_start_samples=0,
             quiet_tonal_after_end_samples=0,
         )
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("silence_or_insufficient_dynamic_range",),
-            True,
+        reason = "silence_or_insufficient_dynamic_range"
+        return scope_proposal(
+            abstained(reason),
+            abstained(reason),
             evidence,
         )
     if waveform_extent is None or spectral_extent is None:
@@ -762,16 +821,10 @@ def propose_scope_endpoints(
             quiet_tonal_before_start_samples=0,
             quiet_tonal_after_end_samples=0,
         )
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("insufficient_cross_family_evidence",),
-            True,
+        reason = "insufficient_cross_family_evidence"
+        return scope_proposal(
+            abstained(reason),
+            abstained(reason),
             evidence,
         )
 
@@ -781,18 +834,14 @@ def propose_scope_endpoints(
     spectral_end = values[spectral_extent[1] - 1].end_sample_exclusive
     start_spread = abs(waveform_start - spectral_start)
     end_spread = abs(waveform_end - spectral_end)
-    maximum_spread = (
-        sample_rate * settings.maximum_family_spread_ms + 999
-    ) // 1_000
+    maximum_spread = (sample_rate * settings.maximum_family_spread_ms + 999) // 1_000
     proposed_start = min(waveform_start, spectral_start)
     proposed_end = max(waveform_end, spectral_end)
     start_index = next(
         index for index, item in enumerate(values) if item.start_sample == proposed_start
     )
     end_index = next(
-        index
-        for index, item in enumerate(values)
-        if item.end_sample_exclusive == proposed_end
+        index for index, item in enumerate(values) if item.end_sample_exclusive == proposed_end
     )
     start_context = _contiguous_context_samples(
         combined_active,
@@ -825,6 +874,32 @@ def propose_scope_endpoints(
         sample_rate=sample_rate,
         config=settings,
     )
+    start_groove_bracketed = (
+        quiet_tonal_before > maximum_gap
+        and _quiet_tonal_context_is_groove_like(
+            values,
+            index=start_index - 1,
+            direction=-1,
+            config=settings,
+        )
+        and any(
+            item["kind"] == "needle_drop_candidate" and item["sample"] <= proposed_start
+            for item in confirmations
+        )
+    )
+    end_groove_bracketed = (
+        quiet_tonal_after > maximum_gap
+        and _quiet_tonal_context_is_groove_like(
+            values,
+            index=end_index + 1,
+            direction=1,
+            config=settings,
+        )
+        and any(
+            item["kind"] == "needle_pickup_candidate" and item["sample"] >= proposed_end
+            for item in confirmations
+        )
+    )
     evidence = _proposal_evidence(
         values,
         sample_rate=sample_rate,
@@ -840,82 +915,74 @@ def propose_scope_endpoints(
         quiet_tonal_before_start_samples=quiet_tonal_before,
         quiet_tonal_after_end_samples=quiet_tonal_after,
     )
-    if start_spread > maximum_spread or end_spread > maximum_spread:
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("contradictory_endpoint_families",),
-            True,
-            evidence,
+    minimum_context = (sample_rate * settings.minimum_quiet_context_ms + 999) // 1_000
+    dynamic_quality = min(1.0, dynamic_range / 36.0)
+
+    def decide_boundary(
+        *,
+        sample: int,
+        spread: int,
+        quiet_tonal_context: int,
+        quiet_context: int,
+        protects_quiet_tonal_extent: bool,
+        confirmation_kind: str,
+        groove_context_bracketed: bool,
+    ) -> EndpointBoundaryProposal:
+        if spread > maximum_spread:
+            return abstained("contradictory_endpoint_families")
+        if quiet_tonal_context > maximum_gap and not groove_context_bracketed:
+            return abstained("quiet_intro_or_tail_transition_ambiguous")
+        if quiet_context < minimum_context:
+            return abstained("scope_boundary_truncated_or_transition_ambiguous")
+        spread_quality = 1.0 - spread / max(1, maximum_spread)
+        confidence = min(
+            0.95,
+            max(0.5, 0.55 + 0.2 * spread_quality + 0.2 * dynamic_quality),
         )
-    if quiet_tonal_before > maximum_gap or quiet_tonal_after > maximum_gap:
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("quiet_intro_or_tail_transition_ambiguous",),
-            True,
-            evidence,
-        )
-    minimum_context = (
-        sample_rate * settings.minimum_quiet_context_ms + 999
-    ) // 1_000
-    if start_context < minimum_context or end_context < minimum_context:
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("scope_boundary_truncated_or_transition_ambiguous",),
-            True,
-            evidence,
-        )
-    if proposed_end <= proposed_start:
-        return EndpointScopeProposal(
-            scope.label,
-            scope.start_sample,
-            scope.end_sample_exclusive,
-            "abstained",
-            None,
-            None,
-            0.0,
-            ("invalid_or_ambiguous_endpoint_order",),
-            True,
-            evidence,
+        reasons = ["cross_family_endpoint_agreement"]
+        if protects_quiet_tonal_extent:
+            reasons.append("quiet_tonal_extent_protected")
+        if any(item["kind"] == confirmation_kind for item in confirmations):
+            reasons.append("needle_morphology_confirms_structural_anchor_only")
+        if groove_context_bracketed:
+            reasons.append("needle_bracketed_low_frequency_groove_context")
+        reasons.append("human_review_required")
+        return EndpointBoundaryProposal(
+            "proposed",
+            sample,
+            _quantized(confidence),
+            tuple(reasons),
         )
 
-    spread_quality = 1.0 - max(start_spread, end_spread) / max(1, maximum_spread)
-    dynamic_quality = min(1.0, dynamic_range / 36.0)
-    confidence = min(0.95, max(0.5, 0.55 + 0.2 * spread_quality + 0.2 * dynamic_quality))
-    reasons = ["cross_family_endpoint_agreement", "human_review_required"]
-    if spectral_start < waveform_start or spectral_end > waveform_end:
-        reasons.insert(1, "quiet_tonal_extent_protected")
-    if confirmations:
-        reasons.insert(-1, "needle_morphology_confirms_structural_anchor_only")
-    return EndpointScopeProposal(
-        scope.label,
-        scope.start_sample,
-        scope.end_sample_exclusive,
-        "proposed",
-        proposed_start,
-        proposed_end,
-        _quantized(confidence),
-        tuple(reasons),
-        True,
-        evidence,
+    start = decide_boundary(
+        sample=proposed_start,
+        spread=start_spread,
+        quiet_tonal_context=quiet_tonal_before,
+        quiet_context=start_context,
+        protects_quiet_tonal_extent=spectral_start < waveform_start,
+        confirmation_kind="needle_drop_candidate",
+        groove_context_bracketed=start_groove_bracketed,
     )
+    end = decide_boundary(
+        sample=proposed_end,
+        spread=end_spread,
+        quiet_tonal_context=quiet_tonal_after,
+        quiet_context=end_context,
+        protects_quiet_tonal_extent=spectral_end > waveform_end,
+        confirmation_kind="needle_pickup_candidate",
+        groove_context_bracketed=end_groove_bracketed,
+    )
+    if (
+        start.status == "proposed"
+        and end.status == "proposed"
+        and start.sample is not None
+        and end.sample is not None
+        and end.sample <= start.sample
+    ):
+        reason = "invalid_or_ambiguous_endpoint_order"
+        start = abstained(reason)
+        end = abstained(reason)
+    return scope_proposal(start, end, evidence)
 
 
 def _feature_from_pcm(
@@ -978,8 +1045,7 @@ def _feature_from_pcm(
     derivative_mad = float(np.median(np.abs(derivative - derivative_median)))
     threshold = max(
         config.minimum_transient_derivative,
-        derivative_median
-        + config.transient_sigma * 1.4826 * max(derivative_mad, 1e-12),
+        derivative_median + config.transient_sigma * 1.4826 * max(derivative_mad, 1e-12),
     )
     candidates = np.flatnonzero(derivative >= threshold)
     suppression = max(1, (sample_rate * 15 + 999) // 1_000)
@@ -1123,9 +1189,7 @@ def _decode_scope_features(
 def _source_identity(project: Project) -> dict[str, Any]:
     source = project.source
     if source.sample_count is None:
-        raise ProjectValidationError(
-            "Endpoint analysis requires an exact source sample count."
-        )
+        raise ProjectValidationError("Endpoint analysis requires an exact source sample count.")
     return {
         "sha256": _digest(source.sha256, "Project source SHA-256"),
         "size_bytes": source.size_bytes,
@@ -1139,16 +1203,7 @@ def _source_identity(project: Project) -> dict[str, Any]:
 
 def _verify_snapshot_geometry(project: Project, snapshot_path: Path) -> None:
     current = probe_audio(snapshot_path, stored_path=snapshot_path.name)
-    expected = project.source
-    if (
-        current.sha256 != expected.sha256
-        or current.size_bytes != expected.size_bytes
-        or current.sample_rate != expected.sample_rate
-        or current.channels != expected.channels
-        or current.bits_per_raw_sample != expected.bits_per_raw_sample
-        or current.sample_count != expected.sample_count
-        or current.codec_name != expected.codec_name
-    ):
+    if audio_source_descriptor_mismatches(project.source, current):
         raise ProjectValidationError(
             "Verified endpoint snapshot geometry differs from the project source."
         )
@@ -1165,9 +1220,7 @@ def analyze_endpoint_proposals(
 
     settings = config or EndpointProposalConfig()
     settings.validate()
-    normalized_project_path = Path(
-        os.path.abspath(os.fspath(project_path.expanduser()))
-    )
+    normalized_project_path = Path(os.path.abspath(os.fspath(project_path.expanduser())))
     project_receipt = capture_file_receipt(
         normalized_project_path,
         label="Endpoint project",
@@ -1581,10 +1634,8 @@ def validate_endpoint_proposal_document(value: Any) -> dict[str, Any]:
                 "scope_start_sample",
                 "scope_end_sample_exclusive",
                 "status",
-                "proposed_music_start_sample",
-                "proposed_music_end_sample_exclusive",
-                "confidence",
-                "reasons",
+                "start",
+                "end",
                 "requires_review",
                 "evidence",
             },
@@ -1611,49 +1662,79 @@ def validate_endpoint_proposal_document(value: Any) -> dict[str, Any]:
             raise ProjectValidationError("Endpoint proposal scopes overlap or are unordered.")
         previous_end = scope_end
         status = raw_scope["status"]
-        if status not in {"proposed", "abstained"}:
+        if status not in {"proposed", "partial", "abstained"}:
             raise ProjectValidationError("Endpoint proposal status is invalid.")
-        proposed_start = _validate_nullable_sample(
-            raw_scope["proposed_music_start_sample"],
-            f"Endpoint scope {label} proposed start",
-            minimum=scope_start,
-            maximum=scope_end - 1,
-        )
-        proposed_end = _validate_nullable_sample(
-            raw_scope["proposed_music_end_sample_exclusive"],
-            f"Endpoint scope {label} proposed end",
-            minimum=scope_start + 1,
-            maximum=scope_end,
-        )
-        confidence = _finite(
-            raw_scope["confidence"],
-            f"Endpoint scope {label} confidence",
-            0.0,
-            1.0,
-        )
-        if status == "proposed":
+
+        boundary_values: dict[str, tuple[str, int | None]] = {}
+        for boundary_name, minimum, maximum in (
+            ("start", scope_start, scope_end - 1),
+            ("end", scope_start + 1, scope_end),
+        ):
+            boundary = raw_scope[boundary_name]
+            if not isinstance(boundary, dict):
+                raise ProjectValidationError(
+                    f"Endpoint scope {label} {boundary_name} decision must be an object."
+                )
+            _strict_keys(
+                boundary,
+                {"status", "sample", "confidence", "reasons"},
+                f"Endpoint scope {label} {boundary_name} decision",
+            )
+            boundary_status = boundary["status"]
+            if boundary_status not in {"proposed", "abstained"}:
+                raise ProjectValidationError(
+                    f"Endpoint scope {label} {boundary_name} status is invalid."
+                )
+            sample = _validate_nullable_sample(
+                boundary["sample"],
+                f"Endpoint scope {label} proposed {boundary_name}",
+                minimum=minimum,
+                maximum=maximum,
+            )
+            confidence = _finite(
+                boundary["confidence"],
+                f"Endpoint scope {label} {boundary_name} confidence",
+                0.0,
+                1.0,
+            )
+            if boundary_status == "proposed":
+                if sample is None or confidence <= 0.0:
+                    raise ProjectValidationError(
+                        "A proposed endpoint boundary requires an exact sample and confidence."
+                    )
+            elif sample is not None or confidence != 0.0:
+                raise ProjectValidationError(
+                    "An abstained endpoint boundary cannot contain a hidden proposal."
+                )
+            reasons = boundary["reasons"]
             if (
-                proposed_start is None
-                or proposed_end is None
-                or proposed_end <= proposed_start
-                or confidence <= 0.0
+                not isinstance(reasons, list)
+                or not 1 <= len(reasons) <= _MAX_REASONS
+                or len(set(reasons)) != len(reasons)
             ):
                 raise ProjectValidationError(
-                    "A proposed endpoint scope requires ordered samples and confidence."
+                    f"Endpoint scope {label} {boundary_name} reasons are invalid."
                 )
-        elif proposed_start is not None or proposed_end is not None or confidence != 0.0:
+            for reason in reasons:
+                _text(reason, "Endpoint proposal reason", maximum=128)
+            boundary_values[boundary_name] = (boundary_status, sample)
+
+        start_status, proposed_start = boundary_values["start"]
+        end_status, proposed_end = boundary_values["end"]
+        proposed_count = sum(item == "proposed" for item in (start_status, end_status))
+        expected_status = (
+            "proposed" if proposed_count == 2 else "partial" if proposed_count == 1 else "abstained"
+        )
+        if status != expected_status:
             raise ProjectValidationError(
-                "An abstained endpoint scope cannot contain a hidden proposal."
+                "Endpoint scope status does not match its independent boundaries."
             )
-        reasons = raw_scope["reasons"]
         if (
-            not isinstance(reasons, list)
-            or not 1 <= len(reasons) <= _MAX_REASONS
-            or len(set(reasons)) != len(reasons)
+            proposed_start is not None
+            and proposed_end is not None
+            and proposed_end <= proposed_start
         ):
-            raise ProjectValidationError("Endpoint proposal reasons are invalid.")
-        for reason in reasons:
-            _text(reason, "Endpoint proposal reason", maximum=128)
+            raise ProjectValidationError("A proposed endpoint scope requires ordered samples.")
         if raw_scope["requires_review"] is not True:
             raise ProjectValidationError("Every endpoint proposal requires human review.")
         _validate_evidence(
@@ -1743,9 +1824,7 @@ def write_endpoint_proposal_document(
     try:
         parent_metadata = destination.parent.lstat()
     except OSError as exc:
-        raise ProjectValidationError(
-            "Endpoint proposal parent directory does not exist."
-        ) from exc
+        raise ProjectValidationError("Endpoint proposal parent directory does not exist.") from exc
     attributes = int(getattr(parent_metadata, "st_file_attributes", 0))
     if (
         stat.S_ISLNK(parent_metadata.st_mode)
@@ -1763,10 +1842,14 @@ def write_endpoint_proposal_document(
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    cleanup_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
+            cleanup_receipt = capture_owned_file_receipt(
+                temporary, raw, owned_descriptor=handle.fileno(),
+            )
             os.fsync(handle.fileno())
         try:
             rename_no_replace(temporary, destination)
@@ -1778,15 +1861,16 @@ def write_endpoint_proposal_document(
         if receipt.size_bytes != len(raw):
             raise ProjectValidationError("Endpoint proposal write was incomplete.")
         return receipt
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    finally:
+        if cleanup_receipt is not None:
+            remove_owned_file_if_present(temporary, cleanup_receipt)
 
 
 __all__ = [
     "ENDPOINT_ALGORITHM_ID",
     "ENDPOINT_PROPOSAL_SCHEMA",
     "EndpointProposalConfig",
+    "EndpointBoundaryProposal",
     "EndpointScope",
     "EndpointScopeProposal",
     "EndpointWindowFeature",

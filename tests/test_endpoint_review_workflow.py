@@ -94,9 +94,9 @@ def _proposal(
     assert isinstance(source, dict)
     proposed = status == "proposed"
     return {
-        "schema": "groove-serpent.endpoint-proposals/1",
+        "schema": "groove-serpent.endpoint-proposals/2",
         "algorithm": {
-            "id": "groove-serpent.multimodal-endpoints/1",
+            "id": "groove-serpent.multimodal-endpoints/2",
             "module": "groove_serpent.endpoint_proposals",
             "module_sha256": "a" * 64,
             "app_version": "test",
@@ -128,10 +128,22 @@ def _proposal(
                 "scope_start_sample": 0,
                 "scope_end_sample_exclusive": 10_000,
                 "status": status,
-                "proposed_music_start_sample": 1_200 if proposed else None,
-                "proposed_music_end_sample_exclusive": 8_700 if proposed else None,
-                "confidence": 0.9 if proposed else None,
-                "reasons": [] if proposed else ["contradictory_endpoint_families"],
+                "start": {
+                    "status": "proposed" if proposed else "abstained",
+                    "sample": 1_200 if proposed else None,
+                    "confidence": 0.9 if proposed else 0.0,
+                    "reasons": [
+                        "human_review_required" if proposed else "contradictory_endpoint_families"
+                    ],
+                },
+                "end": {
+                    "status": "proposed" if proposed else "abstained",
+                    "sample": 8_700 if proposed else None,
+                    "confidence": 0.9 if proposed else 0.0,
+                    "reasons": [
+                        "human_review_required" if proposed else "contradictory_endpoint_families"
+                    ],
+                },
                 "requires_review": True,
                 "evidence": {
                     "family_candidates": {
@@ -158,7 +170,7 @@ def _startup_proposal(state: dict[str, object]) -> dict[str, object]:
     module_path = endpoint_module.__file__
     assert module_path is not None
     proposal["algorithm"] = {
-        "id": "groove-serpent.multimodal-endpoints/1",
+        "id": "groove-serpent.multimodal-endpoints/2",
         "module": "groove_serpent.endpoint_proposals",
         "module_sha256": sha256_file(Path(module_path)),
         "app_version": __version__,
@@ -190,20 +202,33 @@ class EndpointCliTests(unittest.TestCase):
                     {
                         "label": "Side",
                         "status": "proposed",
-                        "proposed_music_start_sample": 1_200,
-                        "proposed_music_end_sample_exclusive": 8_700,
-                        "confidence": 0.9,
+                        "start": {
+                            "status": "proposed",
+                            "sample": 1_200,
+                            "confidence": 0.9,
+                            "reasons": ["human_review_required"],
+                        },
+                        "end": {
+                            "status": "proposed",
+                            "sample": 8_700,
+                            "confidence": 0.9,
+                            "reasons": ["human_review_required"],
+                        },
                     }
                 ],
             }
             stdout = io.StringIO()
-            with mock.patch(
-                "groove_serpent.endpoint_proposals.analyze_endpoint_proposals",
-                return_value=fake,
-            ) as analyze, mock.patch(
-                "groove_serpent.endpoint_proposals.write_endpoint_proposal_document",
-                return_value=SimpleNamespace(sha256="f" * 64),
-            ) as write, redirect_stdout(stdout):
+            with (
+                mock.patch(
+                    "groove_serpent.endpoint_proposals.analyze_endpoint_proposals",
+                    return_value=fake,
+                ) as analyze,
+                mock.patch(
+                    "groove_serpent.endpoint_proposals.write_endpoint_proposal_document",
+                    return_value=SimpleNamespace(sha256="f" * 64),
+                ) as write,
+                redirect_stdout(stdout),
+            ):
                 result = main(
                     [
                         "endpoints",
@@ -223,13 +248,14 @@ class EndpointCliTests(unittest.TestCase):
             write.assert_called_once_with(fake, output_path.absolute())
 
             stdout = io.StringIO()
-            with mock.patch(
-                "groove_serpent.endpoint_proposals.load_endpoint_proposal_document",
-                return_value=fake,
-            ) as load, redirect_stdout(stdout):
-                result = main(
-                    ["endpoints", "load", str(output_path), "--json"]
-                )
+            with (
+                mock.patch(
+                    "groove_serpent.endpoint_proposals.load_endpoint_proposal_document",
+                    return_value=fake,
+                ) as load,
+                redirect_stdout(stdout),
+            ):
+                result = main(["endpoints", "load", str(output_path), "--json"])
             self.assertEqual(result, 0)
             self.assertEqual(json.loads(stdout.getvalue()), fake)
             load.assert_called_once_with(output_path)
@@ -282,7 +308,15 @@ class EndpointReviewServerTests(unittest.TestCase):
         self.source_path = self.root / "side.flac"
         self.source_path.write_bytes(bytes(range(256)) * 8)
         self.project_path = self.root / "side.groove.json"
-        save_project(_project(self.source_path), self.project_path)
+        project = _project(self.source_path)
+        save_project(project, self.project_path)
+        # These endpoint state-machine tests use opaque, non-audio fixture bytes.
+        # Actual snapshot descriptor validation is covered by native-audio tests.
+        self._synthetic_source_probe = mock.patch(
+            "groove_serpent.review_server.probe_audio", return_value=project.source,
+        )
+        self._synthetic_source_probe.start()
+        self.addCleanup(self._synthetic_source_probe.stop)
         self.server = ReviewServer(("127.0.0.1", 0), self.project_path)
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -294,6 +328,7 @@ class EndpointReviewServerTests(unittest.TestCase):
         self.authority = f"{self.server.session_auth.public_host}:{self.port}"
 
     def tearDown(self) -> None:
+        self._synthetic_source_probe.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -376,13 +411,14 @@ class EndpointReviewServerTests(unittest.TestCase):
                 "proposal_sha256": proposal["proposal_sha256"],
                 "decision": "accept",
                 "intent": ENDPOINT_INTENT,
-                "reviewed_start": True,
+                "reviewed_start": False,
                 "reviewed_end": False,
             }
             status, body = self.request("POST", "/api/endpoints/accept", base)
             self.assertEqual(status, 400, body)
             self.assertEqual(self.project_path.read_bytes(), original)
 
+            base["reviewed_start"] = True
             base["reviewed_end"] = True
             status, body = self.request("POST", "/api/endpoints/accept", base)
             self.assertEqual(status, 200, body)
@@ -405,6 +441,104 @@ class EndpointReviewServerTests(unittest.TestCase):
         status, body = self.request("GET", "/api/endpoints/status")
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["state"], "empty")
+
+    def test_partial_proposal_can_apply_only_its_reviewed_end(self) -> None:
+        state = self.state()
+        proposal = _proposal(state)
+        scope = proposal["scopes"][0]
+        assert isinstance(scope, dict)
+        scope["status"] = "partial"
+        scope["start"] = {
+            "status": "abstained",
+            "sample": None,
+            "confidence": 0.0,
+            "reasons": ["contradictory_endpoint_families"],
+        }
+        original = self.project_path.read_bytes()
+        with mock.patch(
+            "groove_serpent.review_server.validate_endpoint_proposal_document",
+            side_effect=lambda value: value,
+        ):
+            status, body, _analyze = self.propose(state, proposal)
+            self.assertEqual(status, 200, body)
+            request = {
+                **self.identity(state),
+                "proposal_sha256": proposal["proposal_sha256"],
+                "decision": "accept",
+                "intent": ENDPOINT_INTENT,
+                "reviewed_start": True,
+                "reviewed_end": False,
+            }
+            status, body = self.request("POST", "/api/endpoints/accept", request)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(self.project_path.read_bytes(), original)
+
+            request["reviewed_start"] = False
+            request["reviewed_end"] = True
+            status, body = self.request("POST", "/api/endpoints/accept", request)
+            self.assertEqual(status, 200, body)
+            accepted = json.loads(body)
+            self.assertIsNone(accepted["accepted_start_sample"])
+            self.assertEqual(accepted["accepted_end_sample_exclusive"], 8_700)
+            self.assertEqual(accepted["resulting_start_sample"], 1_000)
+
+        saved = load_project(self.project_path)
+        self.assertEqual(saved.tracks[0].start_sample, 1_000)
+        self.assertEqual(saved.tracks[-1].end_sample, 8_700)
+
+    def test_review_server_analyzes_and_accepts_only_its_bound_side_scope(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        bound_scope = EndpointScope("Side A", 500, 9_500)
+        self.server = ReviewServer(
+            ("127.0.0.1", 0),
+            self.project_path,
+            endpoint_scope=bound_scope,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        self.thread.start()
+        self.port = self.server.server_port
+        self.authority = f"{self.server.session_auth.public_host}:{self.port}"
+
+        state = self.state()
+        proposal = _proposal(state)
+        scope = proposal["scopes"][0]
+        assert isinstance(scope, dict)
+        scope["scope_start_sample"] = bound_scope.start_sample
+        scope["scope_end_sample_exclusive"] = bound_scope.end_sample_exclusive
+        original = self.project_path.read_bytes()
+        with mock.patch(
+            "groove_serpent.review_server.validate_endpoint_proposal_document",
+            side_effect=lambda value: value,
+        ):
+            status, body, analyze = self.propose(state, proposal)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(analyze.call_args.args[1], (bound_scope,))
+
+            stored = self.server.endpoint_proposal
+            assert stored is not None
+            stored_scope = stored["scopes"][0]
+            assert isinstance(stored_scope, dict)
+            stored_scope["scope_end_sample_exclusive"] = 10_000
+            status, body = self.request(
+                "POST",
+                "/api/endpoints/accept",
+                {
+                    **self.identity(state),
+                    "proposal_sha256": proposal["proposal_sha256"],
+                    "decision": "accept",
+                    "intent": ENDPOINT_INTENT,
+                    "reviewed_start": True,
+                    "reviewed_end": True,
+                },
+            )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.project_path.read_bytes(), original)
 
     def test_reject_is_explicit_non_mutating_and_clears_pending_proposal(self) -> None:
         state = self.state()
@@ -495,9 +629,7 @@ class EndpointReviewServerTests(unittest.TestCase):
         try:
             load.assert_called_once_with(proposal_path)
             self.assertEqual(secondary.endpoint_proposal, proposal)
-            _source, source_receipt = secondary.verify_source(
-                load_project(self.project_path)
-            )
+            _source, source_receipt = secondary.verify_source(load_project(self.project_path))
             self.assertEqual(
                 secondary.endpoint_proposal_source_receipt,
                 source_receipt["receipt"],
@@ -528,14 +660,15 @@ class EndpointReviewServerTests(unittest.TestCase):
 
         different_config = _startup_proposal(state)
         different_config["configuration"]["values"]["window_ms"] += 1
-        cases.append(
-            ("configuration", different_config, "different review configuration")
-        )
+        cases.append(("configuration", different_config, "different review configuration"))
 
         for label, proposal, message in cases:
-            with self.subTest(label=label), mock.patch(
-                "groove_serpent.review_server.load_endpoint_proposal_document",
-                return_value=proposal,
+            with (
+                self.subTest(label=label),
+                mock.patch(
+                    "groove_serpent.review_server.load_endpoint_proposal_document",
+                    return_value=proposal,
+                ),
             ):
                 with self.assertRaisesRegex(ProjectValidationError, message):
                     ReviewServer(

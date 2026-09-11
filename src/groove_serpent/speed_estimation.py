@@ -26,7 +26,12 @@ from statistics import median
 from typing import Any, Literal, cast
 
 from . import __version__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import ProjectValidationError
 from .models import MAX_TRACKS, Project, resolve_source_path, utc_now_iso
 from .project_io import load_project_with_sha256
@@ -2076,14 +2081,19 @@ def _write_new_bytes(payload: bytes, path: Path, *, label: str) -> Path:
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    cleanup_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
+            cleanup_receipt = capture_owned_file_receipt(
+                temporary, payload, owned_descriptor=handle.fileno(),
+            )
             os.fsync(handle.fileno())
         rename_no_replace(temporary, absolute)
     finally:
-        temporary.unlink(missing_ok=True)
+        if cleanup_receipt is not None:
+            remove_owned_file_if_present(temporary, cleanup_receipt)
     return absolute
 
 

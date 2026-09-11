@@ -150,6 +150,7 @@ class AgentSkillContractTests(unittest.TestCase):
             "/api/topology/apply",
             "/api/endpoints/reject",
             "/api/endpoints/accept",
+            "/api/restoration/decision",
             "/api/restoration/recipe",
             "/api/restoration/render",
             "/api/album/repin",

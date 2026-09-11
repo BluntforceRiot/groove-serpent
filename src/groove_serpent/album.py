@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .cache_storage import ensure_free_space
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
 from .exporter import (
@@ -32,6 +37,13 @@ from .exporter import (
 from .media import run_ffmpeg, sha256_file, tool_version
 from .migration_fence import assert_no_pending_migration
 from .models import Project, Track, resolve_source_path, utc_now_iso
+from .owned_directory import (
+    OwnedDirectoryReceipt,
+    assert_owned_directory_receipt,
+    capture_owned_directory_receipt,
+    register_owned_directory,
+    remove_owned_directory_if_present,
+)
 from .portable_names import (
     portable_name_key,
     portable_path_entry_exists,
@@ -935,10 +947,14 @@ def _save_album_project_locked(
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary, text.encode("utf-8"), owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         if original_identity is None:
             if os.path.lexists(path) or _entry_exists(path):
@@ -967,7 +983,8 @@ def _save_album_project_locked(
         album.updated_at = next_updated_at
         album.revision = next_revision
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
         raise
 
 
@@ -1625,19 +1642,16 @@ def _write_continuous_side(
     }
 
 
-def _cleanup_stage(stage: Path, parent: Path) -> None:
+def _cleanup_stage(stage: Path, parent: Path, receipt: OwnedDirectoryReceipt | None) -> None:
     if stage.parent != parent or not (
         stage.name.startswith(_STAGE_PREFIX) and stage.name.endswith(_STAGE_SUFFIX)
     ):
         raise ExportError(
             f"Refusing to remove an unexpected album staging path: {stage}"
         )
-    if not _entry_exists(stage):
-        return
-    if stage.is_symlink() or not stage.is_dir():
-        stage.unlink()
-    else:
-        shutil.rmtree(stage)
+    if receipt is None:
+        raise ExportError(f"Album staging cleanup has no ownership receipt; preserved {stage}")
+    remove_owned_directory_if_present(stage, receipt)
 
 
 def _inventory_file(
@@ -1893,18 +1907,21 @@ def export_album(
 
     stage = output_dir.parent / f"{_STAGE_PREFIX}{uuid.uuid4().hex}{_STAGE_SUFFIX}"
     created = False
+    stage_receipt: OwnedDirectoryReceipt | None = None
     inventory: list[dict[str, Any]] = []
     side_receipts: list[dict[str, Any]] = []
     published_copy_receipts: list[tuple[Path, FileReceipt, str]] = []
     try:
         stage.mkdir()
         created = True
+        stage_receipt = capture_owned_directory_receipt(stage)
         tracks_root = stage / "tracks"
         sides_root = stage / "sides"
         manifests_root = stage / "side-manifests"
         work_root = stage / ".work"
         for directory in (tracks_root, sides_root, manifests_root, work_root):
             directory.mkdir()
+            register_owned_directory(stage_receipt, directory)
 
         published_artwork: dict[str, Any] | None = None
         published_artwork_receipt: FileReceipt | None = None
@@ -1926,6 +1943,7 @@ def export_album(
             )
             artwork_root = stage / "artwork"
             artwork_root.mkdir()
+            register_owned_directory(stage_receipt, artwork_root)
             published_path = artwork_root / f"cover{artwork_path.suffix.casefold()}"
             published_artwork_receipt = stage_verified_copy(
                 artwork_snapshot,
@@ -1977,6 +1995,7 @@ def export_album(
                 )
             virtual_root = work_root / f"input-{side.order:02d}"
             virtual_root.mkdir()
+            register_owned_directory(stage_receipt, virtual_root)
             source_snapshot = virtual_root / (
                 "source" + (source_path.suffix.casefold() or ".audio")
             )
@@ -2015,6 +2034,7 @@ def export_album(
                 source_speed_factor=correction_factor,
                 progress=progress,
             )
+            register_owned_directory(stage_receipt, side_batch)
 
             track_receipts: list[dict[str, Any]] = []
             exported_by_track: dict[int, dict[str, Any]] = {}
@@ -2248,7 +2268,7 @@ def export_album(
                 artwork_snapshot_receipt,
                 label="Staged album artwork snapshot",
             )
-        shutil.rmtree(work_root)
+        remove_owned_directory_if_present(work_root, stage_receipt)
 
         toolchain = {
             "ffmpeg": tool_version("ffmpeg"),
@@ -2390,18 +2410,21 @@ def export_album(
             raise ExportError(
                 "The album output directory was created while staging; nothing was replaced."
             )
+        assert_owned_directory_receipt(stage, stage_receipt)
         rename_no_replace(stage, output_dir)
         created = False
     except BaseException as exc:
         cleanup_error: Exception | None = None
         if created:
             try:
-                _cleanup_stage(stage, output_dir.parent)
+                _cleanup_stage(stage, output_dir.parent, stage_receipt)
             except (
                 Exception
             ) as cleanup_exc:  # pragma: no cover - rare filesystem failure
                 cleanup_error = cleanup_exc
         if not isinstance(exc, Exception):
+            if cleanup_error is not None:
+                exc.add_note(f"Staging cleanup preserved uncertain material: {cleanup_error}")
             raise
         if (
             isinstance(exc, (ExportError, ProjectValidationError))

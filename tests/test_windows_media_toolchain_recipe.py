@@ -409,7 +409,7 @@ fi
             "JOBS": "2",
             "PYTHONPATH": str(python_poison),
             "SHELLOPTS": "noexec",
-            "WSL_DISTRO_NAME": "neuroforge",
+            "WSL_DISTRO_NAME": "synthetic-distro",
         }
     )
 
@@ -447,7 +447,7 @@ def test_launcher_refuses_missing_isolation_or_no_bytecode_before_bash(
     environment = {
         "DIST_DIR": "/tmp/groove-serpent-unisolated-probe-output",
         "JOBS": "2",
-        "WSL_DISTRO_NAME": "neuroforge",
+        "WSL_DISTRO_NAME": "synthetic-distro",
     }
 
     completed = subprocess.run(
@@ -519,11 +519,10 @@ def test_capability_smoke_constructs_wsl_unc_paths_without_wslpath(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "path with spaces" / "capture.flac"
-    monkeypatch.setenv("WSL_DISTRO_NAME", "neuroforge")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "synthetic-distro")
 
-    expected = "\\\\wsl.localhost\\neuroforge\\" + source.resolve().as_posix().removeprefix(
-        "/"
-    ).replace("/", "\\")
+    share = "\\".join(("", "", "wsl.localhost", "synthetic-distro", ""))
+    expected = share + source.resolve().as_posix().removeprefix("/").replace("/", "\\")
     assert SMOKE._tool_path(source) == expected
     assert "wslpath" not in (TOOLCHAIN / "capability_smoke.py").read_text(encoding="utf-8")
 

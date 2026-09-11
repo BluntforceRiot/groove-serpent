@@ -1,6 +1,6 @@
 # Groove Serpent
 
-![Groove Serpent](assets/groove-serpent-hero.png)
+![Groove Serpent](assets/groove-serpent-hero-1.1.png)
 
 Groove Serpent is a local-first, open-source workbench for turning completed vinyl captures into
 reviewed, reproducible digital albums.
@@ -26,7 +26,40 @@ the exact bytes that were inspected. **Your ears are the final authority.**
 
 ![Groove Serpent Album Workbench](assets/groove-serpent-workbench.png)
 
-## 1.0 highlights
+## 1.1 release status
+
+This tree is being prepared as **Groove Serpent 1.1.0** for release; it is not yet published.
+1.1 focuses on source fidelity, trustworthy restoration review, safer recovery, and release
+integrity. A reviewed development candidate is not proof of changed stable-release bytes: consult
+the exact version and artifact hashes in the release's build-cycle receipt before relying on a
+validation claim. See [1.1 release notes](RELEASE_NOTES_1.1.md) and [CHANGELOG.md](CHANGELOG.md).
+
+## What's new in 1.1
+
+- **Full-precision archival checks:** independently probe source bytes and refuse saved descriptors
+  with mismatched bit depth, channels, sample rate, codec, sample format, or frame count. Original
+  audition uses the same source-authority checks. Archival FLAC verification retains low-order
+  24-bit information instead of comparing at a precision selected by the output.
+- **Playback-backed click approval:** the owner browser must play Original, Proposed, and Removed
+  Signal continuously at normal speed through the changed window. Seeking, pausing, stalling, or
+  changing speed does not count as a completed audition. This records a browser action, not proof
+  that a person heard or approved the sound.
+- **Review that survives reopening:** rejected and protected click decisions are saved against the
+  exact project, source, scan, candidate, and preview. Pending approvals still require fresh
+  audition; a partial decision journal never authorizes a render.
+- **Independent music endpoints:** an uncertain intro no longer suppresses a useful ending
+  proposal, or vice versa. Shared-capture side reviews are invalidated when neighboring-side
+  changes make their scope stale. Every proposed edge still needs owner review.
+- **Safer failure handling:** cleanup checks the original writer and staging ownership, preserves
+  substituted files/directories, and retains uncertain artifacts. Track renders refuse existing
+  staging outputs and encoder error diagnostics, including zero-exit no-overwrite refusals.
+  Stricter JSON, request handling,
+  Windows leases, output-path checks, and portable relative paths close additional failure cases.
+- **Clearer release integrity:** ordinary changes can produce deterministic candidate source
+  archives without borrowing a prior release's authority. Public source archives exclude Git
+  history bundles and are checked for private data as well as package contents.
+
+## The complete workbench
 
 - Exact side analysis and marker editing, including split/merge, zoom, audition, undo/redo, history,
   and checkpoints.
@@ -45,8 +78,13 @@ the exact bytes that were inspected. **Your ears are the final authority.**
 
 ## Install
 
-Groove Serpent requires Python 3.11, 3.12, or 3.13, plus FFmpeg and ffprobe. NumPy installs with
-the package.
+The source package accepts Python 3.11, 3.12, or 3.13 and requires FFmpeg and ffprobe on `PATH`.
+NumPy installs with the package. Fixed-speed correction additionally needs FFmpeg's libsoxr support;
+`doctor` reports the available tools and capabilities.
+
+The reviewed 1.1 development evidence covers native Windows with Python 3.11 and 3.13. Native
+Linux/WSL/macOS and Python 3.12 were not rerun for that candidate. The commands below describe
+installation, not a claim of fresh stable-release certification on every platform.
 
 Windows PowerShell:
 
@@ -72,12 +110,24 @@ uv run --frozen groove-serpent doctor --json
 ```
 
 Supported lossless capture formats and workload limits are documented in
-[`SUPPORTED_CAPTURES.md`](SUPPORTED_CAPTURES.md). A deterministic unsigned Windows portable is also
-produced when the corresponding release receipt proves its exact bytes.
+[`SUPPORTED_CAPTURES.md`](SUPPORTED_CAPTURES.md). Start with one FLAC per side when possible;
+bounded click restoration currently requires 16-bit or 24-bit integer FLAC.
+
+A Windows portable builder is included, but this 1.1 handoff contains source and Python packages,
+not a newly certified Windows portable. Only a separately listed, hash-bound release asset
+establishes a portable's availability. Treat
+portable builds as unsigned unless their exact receipt proves otherwise; the historical 1.0
+portable receipt does not validate 1.1. See [Windows delivery policy](WINDOWS_RELEASE_POLICY.md).
 
 ## A complete album loop
 
-Analyze each side:
+Run these commands from the album's working folder, keeping its side projects, captures, and
+artwork within that folder. Replace the example names and track counts with your record's.
+Commands use `groove-serpent` as shorthand: from an unactivated virtual environment, use the full
+path to your installation's `.venv\Scripts\groove-serpent` on Windows or
+`.venv/bin/groove-serpent` on Linux/macOS.
+
+Analyze each side into a new project:
 
 ```powershell
 groove-serpent analyze "Artist - Album - Side A.flac" --tracks 5 --side A
@@ -95,12 +145,18 @@ groove-serpent album create "Artist - Album.album.json" `
 groove-serpent album review "Artist - Album.album.json"
 ```
 
-Plan and publish only after the workbench is ready:
+In the workbench, review track boundaries and music endpoints, enter or explicitly look up
+metadata/artwork, and audition any optional speed or restoration proposal. If a side changes,
+review the drift and explicitly repin that side; repinning is approval, not an automatic refresh.
+
+Inspect readiness, then plan and publish only after the owner has reviewed the exact work:
 
 ```powershell
+groove-serpent album inspect "Artist - Album.album.json" --json
+
 groove-serpent album publication plan "Artist - Album.album.json" `
   "Artist - Album.publication-plan.json" `
-  --profiles archival-source,corrected-lossless,portable
+  --profiles archival-source,corrected-lossless,portable --restoration none
 
 groove-serpent album publication preflight "Artist - Album.publication-plan.json" --json
 groove-serpent album publication execute "Artist - Album.publication-plan.json" `
@@ -108,8 +164,15 @@ groove-serpent album publication execute "Artist - Album.publication-plan.json" 
 groove-serpent album publication verify "exports\Artist - Album" --json
 ```
 
-Existing output directories are refused. Every audio-bearing operation uses a verified immutable
-snapshot and revalidates live inputs before publication.
+This example deliberately applies no restoration. `archival-source` preserves unprocessed source
+audio; `corrected-lossless` uses the selected fixed-speed state; `portable` produces lossy AAC/M4A.
+Reviewed restoration is an explicit alternative, not implied by choosing an output profile.
+
+Existing plan files and output directories are refused. Stop on a stale pin, changed source, or
+failed preflight and review the current state instead of bypassing the check. Every audio-bearing
+operation uses a verified immutable snapshot and live inputs are revalidated before publication.
+Keep the publication receipt; verification and replay can be run later without replacing the
+reviewed batch.
 
 ## Restoration boundaries
 
@@ -118,6 +181,14 @@ provides matched comparison and removed-signal audition, and leaves perceptual a
 Needle drop, pickup, handling, and other structural events can be protected. Continuous hum, rumble,
 hiss, and crackle processing remains proposal/audition-first and cannot silently change a project.
 
+For isolated click repair, scan and preview first, then use the owner browser workbench for
+approve/reject/protect decisions, recipe creation, and rendering. The old `click-recipe` and
+`click-render` CLI commands now refuse execution. Native/Bearer clients may prepare evidence but
+cannot use those owner-only decision and render routes. New recipes bind the full candidate records
+and exact preview audio using `groove-serpent.restoration-recipe/3`; do not hand-edit old recipes to
+appear current. A full `restored.flac` requires complete, untruncated review coverage, and changed
+windows remain bounded to at most 128 source frames per approved candidate channel.
+
 It does not implement live recording, Audacity control, plug-in hosting, generative reconstruction,
 or time-varying wow/flutter correction.
 
@@ -125,7 +196,10 @@ or time-varying wow/flutter correction.
 
 Analysis, review, restoration, and export work offline. Provider calls occur only when requested.
 AcoustID receives a locally computed fingerprint and duration, never source audio. Put an optional
-application key in `GROOVE_SERPENT_ACOUSTID_KEY`; never commit credentials.
+application key in `GROOVE_SERPENT_ACOUSTID_KEY`; never commit credentials. MusicBrainz and
+Cover Art Archive are optional; manual metadata and local artwork remain available. Identification
+also needs a usable Chromaprint backend reported by `doctor`. Local audio checks do not imply a
+successful live provider lookup.
 
 ## Verification and support
 
@@ -138,7 +212,8 @@ acceptance reports. Historical evidence is not reused as proof of changed releas
 - Capture policy: [`SUPPORTED_CAPTURES.md`](SUPPORTED_CAPTURES.md)
 - Windows delivery policy: [`WINDOWS_RELEASE_POLICY.md`](WINDOWS_RELEASE_POLICY.md)
 - Exact Windows portable evidence:
-  [`WINDOWS_PORTABLE_ACCEPTANCE_1.0.md`](WINDOWS_PORTABLE_ACCEPTANCE_1.0.md)
+  [`WINDOWS_PORTABLE_ACCEPTANCE_1.0.md`](WINDOWS_PORTABLE_ACCEPTANCE_1.0.md) (historical 1.0 only)
+- Current 1.1 changes and validation limits: [release notes](RELEASE_NOTES_1.1.md)
 - Security reporting: [`SECURITY.md`](SECURITY.md)
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 

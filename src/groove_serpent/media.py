@@ -25,6 +25,35 @@ from .subprocess_policy import (
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
 
 
+def audio_source_descriptor_mismatches(
+    expected: AudioSource, actual: AudioSource
+) -> tuple[str, ...]:
+    """Compare saved audio authority with an independently probed byte snapshot.
+
+    Paths and modification times intentionally differ for verified copies. Unknown
+    optional stream fields are not wildcards: deleting a saved precision or frame
+    count must not authorize a different decode. Duration keeps the legacy probe
+    rounding tolerance; exact frame counts are compared separately.
+    """
+
+    fields = (
+        "size_bytes", "sample_rate", "channels", "codec_name",
+        "bits_per_raw_sample", "sample_format", "sample_count",
+    )
+    mismatches = [
+        name for name in fields if getattr(expected, name) != getattr(actual, name)
+    ]
+    if not expected.sha256 or expected.sha256.casefold() != actual.sha256.casefold():
+        mismatches.append("sha256")
+    if (
+        not math.isfinite(expected.duration_seconds)
+        or not math.isfinite(actual.duration_seconds)
+        or abs(expected.duration_seconds - actual.duration_seconds) > 0.05
+    ):
+        mismatches.append("duration_seconds")
+    return tuple(mismatches)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -253,6 +282,12 @@ def decode_rms_envelope(
 
 
 def run_ffmpeg(command: Iterable[str]) -> None:
+    """Run an internally constructed, error-only FFmpeg command.
+
+    Every caller uses ``-loglevel error``. Some FFmpeg builds report a refused
+    no-overwrite output on stderr but exit zero, so a zero exit alone cannot
+    authorize verification of whatever file happens to occupy that path.
+    """
     process: subprocess.Popen[bytes] | None = None
     diagnostic_capture: BoundedDiagnostic | None = None
     diagnostic_thread = None
@@ -276,7 +311,7 @@ def run_ffmpeg(command: Iterable[str]) -> None:
         if not completed:
             terminate_and_reap(process)
         join_diagnostic_reader(process, diagnostic_thread)
-    if return_code != 0:
+    if return_code != 0 or diagnostic:
         raise GrooveSerpentError(
             diagnostic or "FFmpeg failed without an error message."
         )

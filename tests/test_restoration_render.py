@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import copy
 from dataclasses import replace
+import hashlib
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, cast
 from unittest import mock
 
 import numpy as np
@@ -20,6 +21,7 @@ from groove_serpent.audio_snapshot import verified_audio_snapshot
 from groove_serpent.errors import GrooveSerpentError
 from groove_serpent.media import probe_audio, sha256_file
 from groove_serpent.models import AnalysisSettings, AnalysisSummary, Project, Track
+from groove_serpent.publication import canonical_json_sha256
 from groove_serpent.project_io import save_project
 from groove_serpent.restoration_workflow import (
     REMOVED_SIGNAL_GAIN,
@@ -46,6 +48,72 @@ def _temporarily_swap_path(live: Path, replacement: Path) -> Iterator[None]:
         live.unlink(missing_ok=True)
         os.replace(backup, live)
         incoming.unlink(missing_ok=True)
+
+
+def _test_owner_authority_proof(
+    scan: dict[str, object],
+    decisions: list[dict[str, object]],
+    preview_manifests: list[Path],
+) -> dict[str, object]:
+    """Create structurally valid server-issued proof data for workflow tests."""
+
+    raw_candidates = scan.get("candidates")
+    if not isinstance(raw_candidates, list):
+        raise AssertionError("Fixture scan has no candidate list.")
+    candidates = {
+        str(candidate["id"]): candidate
+        for candidate in raw_candidates
+        if isinstance(candidate, dict) and isinstance(candidate.get("id"), str)
+    }
+    preview_by_candidate: dict[str, tuple[str, str]] = {}
+    for manifest_path in preview_manifests:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        digest = sha256_file(manifest_path)
+        raw_preview_candidates = manifest.get("candidates")
+        if not isinstance(raw_preview_candidates, list):
+            raise AssertionError("Fixture preview has no candidate list.")
+        for candidate in raw_preview_candidates:
+            if isinstance(candidate, dict) and isinstance(candidate.get("id"), str):
+                preview_by_candidate[candidate["id"]] = (
+                    f"preview-{digest[:32]}",
+                    digest,
+                )
+    approvals: list[dict[str, object]] = []
+    for decision in decisions:
+        if decision.get("decision") != "approved":
+            continue
+        candidate_id = decision.get("candidate_id")
+        if not isinstance(candidate_id, str):
+            raise AssertionError("Fixture approval has no candidate ID.")
+        candidate = candidates.get(candidate_id)
+        preview = preview_by_candidate.get(candidate_id)
+        if candidate is None or preview is None:
+            raise AssertionError("Fixture approval lacks exact preview evidence.")
+        approvals.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_sha256": canonical_json_sha256(candidate),
+                "preview_token": preview[0],
+                "preview_sha256": preview[1],
+                "auditioned_roles": ["before", "proposed", "removed"],
+                "capability_sha256": hashlib.sha256(
+                    f"test-owner-{candidate_id}".encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    journal_sha256 = hashlib.sha256(b"test-owner-decision-journal").hexdigest()
+    body_sha256 = hashlib.sha256(b"test-owner-decision-body").hexdigest()
+    return {
+        "schema": "groove-serpent.owner-authority-proof/1",
+        "channel": "same-origin-owner-cookie",
+        "claim": "owner-channel-action-not-human-perception",
+        "decision_journal": {
+            "token": f"decision-{journal_sha256[:32]}",
+            "sha256": journal_sha256,
+            "body_sha256": body_sha256,
+        },
+        "approvals": sorted(approvals, key=lambda item: str(item["candidate_id"])),
+    }
 
 
 @unittest.skipUnless(
@@ -229,11 +297,27 @@ class RestorationRenderTests(unittest.TestCase):
                     {"candidate_id": candidate["id"], "decision": "rejected"}
                 )
         recipe_path = directory / "recipe.json"
+        preview_bundle = directory / f"preview-{'1' * 32}"
+        create_click_preview(
+            project_path,
+            scan_path,
+            approved["id"],
+            preview_bundle,
+            context_seconds=0.1,
+        )
+        preview_manifest = preview_bundle / "preview.json"
+        owner_authority = _test_owner_authority_proof(
+            scan,
+            decisions,
+            [preview_manifest],
+        )
         create_restoration_recipe(
             project_path,
             scan_path,
             decisions,
             recipe_path,
+            review_preview_manifests=[preview_manifest],
+            owner_authority_proof=owner_authority,
         )
         return {
             "source": source,
@@ -244,6 +328,8 @@ class RestorationRenderTests(unittest.TestCase):
             "protected": protected,
             "decisions": decisions,
             "recipe": recipe_path,
+            "preview_manifest": preview_manifest,
+            "owner_authority": owner_authority,
         }
 
     def test_full_render_changes_only_approved_channels_and_protects_needle_event(
@@ -357,6 +443,73 @@ class RestorationRenderTests(unittest.TestCase):
             )
             self.assertTrue(manifest["audition"]["matched_original_level"])
 
+    def test_core_recipe_and_render_require_untampered_preview_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            fixture = self._fixture(directory)
+            with self.assertRaisesRegex(
+                GrooveSerpentError,
+                "require exact preview manifests",
+            ):
+                create_restoration_recipe(
+                    fixture["project"],
+                    fixture["scan_path"],
+                    fixture["decisions"],
+                    directory / "proof-free-recipe.json",
+                )
+
+            preview_manifest = Path(fixture["preview_manifest"])
+            (preview_manifest.parent / "before.flac").write_bytes(b"tampered")
+            output = directory / "tampered-preview-output"
+            with self.assertRaisesRegex(
+                GrooveSerpentError,
+                "preview proof|output bytes",
+            ):
+                render_restored_side(
+                    fixture["project"],
+                    fixture["scan_path"],
+                    fixture["recipe"],
+                    output,
+                )
+            self.assertFalse(output.exists())
+
+    def test_core_recipe_requires_bound_owner_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            fixture = self._fixture(directory)
+            unauthenticated = directory / "unauthenticated-recipe.json"
+            with self.assertRaisesRegex(
+                GrooveSerpentError,
+                "owner-channel authority proof",
+            ):
+                create_restoration_recipe(
+                    fixture["project"],
+                    fixture["scan_path"],
+                    fixture["decisions"],
+                    unauthenticated,
+                    review_preview_manifests=[fixture["preview_manifest"]],
+                )
+            self.assertFalse(unauthenticated.exists())
+
+            mismatched = copy.deepcopy(fixture["owner_authority"])
+            assert isinstance(mismatched, dict)
+            approvals = mismatched["approvals"]
+            assert isinstance(approvals, list) and approvals
+            assert isinstance(approvals[0], dict)
+            approvals[0]["candidate_sha256"] = "0" * 64
+            with self.assertRaisesRegex(
+                GrooveSerpentError,
+                "invalid owner approval binding",
+            ):
+                create_restoration_recipe(
+                    fixture["project"],
+                    fixture["scan_path"],
+                    fixture["decisions"],
+                    directory / "mismatched-authority-recipe.json",
+                    review_preview_manifests=[fixture["preview_manifest"]],
+                    owner_authority_proof=mismatched,
+                )
+
     def test_full_restored_name_requires_complete_untruncated_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
             directory = Path(directory_value)
@@ -388,11 +541,27 @@ class RestorationRenderTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     recipe_path = directory / f"{label}-recipe.json"
+                    preview_bundle = directory / (
+                        f"preview-{('2' if label == 'partial' else '3') * 32}"
+                    )
+                    create_click_preview(
+                        fixture["project"],
+                        scan_path,
+                        cast(dict[str, object], fixture["approved"])["id"],
+                        preview_bundle,
+                        context_seconds=0.1,
+                    )
                     recipe = create_restoration_recipe(
                         fixture["project"],
                         scan_path,
                         fixture["decisions"],
                         recipe_path,
+                        review_preview_manifests=[preview_bundle / "preview.json"],
+                        owner_authority_proof=_test_owner_authority_proof(
+                            scan_payload,
+                            fixture["decisions"],
+                            [preview_bundle / "preview.json"],
+                        ),
                     )
                     self.assertEqual(
                         recipe["coverage"]["restoration_status"], "partial"
@@ -592,11 +761,36 @@ class RestorationRenderTests(unittest.TestCase):
                     }
                 )
             overlap_recipe = directory / "overlap-recipe.json"
+            first_preview = directory / f"preview-{'4' * 32}"
+            second_preview = directory / f"preview-{'5' * 32}"
+            create_click_preview(
+                fixture["project"],
+                overlap_scan,
+                fixture["approved"]["id"],
+                first_preview,
+                context_seconds=0.1,
+            )
+            create_click_preview(
+                fixture["project"],
+                overlap_scan,
+                base["id"],
+                second_preview,
+                context_seconds=0.1,
+            )
             create_restoration_recipe(
                 fixture["project"],
                 overlap_scan,
                 overlap_decisions,
                 overlap_recipe,
+                review_preview_manifests=[
+                    first_preview / "preview.json",
+                    second_preview / "preview.json",
+                ],
+                owner_authority_proof=_test_owner_authority_proof(
+                    scan,
+                    overlap_decisions,
+                    [first_preview / "preview.json", second_preview / "preview.json"],
+                ),
             )
             with self.assertRaisesRegex(GrooveSerpentError, "overlap or touch"):
                 render_restored_side(
@@ -634,6 +828,8 @@ class RestorationRenderTests(unittest.TestCase):
                     scan_path,
                     decisions,
                     recipe_path,
+                    review_preview_manifests=[fixture["preview_manifest"]],
+                    owner_authority_proof=fixture["owner_authority"],
                 )
 
             self.assertEqual(recipe["source"]["sha256"], source_sha256)
@@ -656,6 +852,8 @@ class RestorationRenderTests(unittest.TestCase):
                         scan_path,
                         decisions,
                         directory / "changed-source-recipe.json",
+                        review_preview_manifests=[fixture["preview_manifest"]],
+                        owner_authority_proof=fixture["owner_authority"],
                     )
             finally:
                 source.write_bytes(original)
@@ -803,6 +1001,88 @@ class RestorationRenderTests(unittest.TestCase):
             self.assertEqual(list(directory.glob(".unrestored-swap.*.partial")), [])
             self.assertEqual(list(directory.glob("groove-serpent-audio-*")), [])
             self.assertEqual(list(directory.glob("groove-serpent-input-*")), [])
+
+    def test_render_rechecks_preview_audio_at_the_commit_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            fixture = self._fixture(directory)
+            preview_manifest = fixture["preview_manifest"]
+            assert isinstance(preview_manifest, Path)
+            before_audio = preview_manifest.parent / "before.flac"
+            real_prepare = restoration_workflow._prepare_repair_patch
+            changed = False
+
+            def mutate_after_initial_proof(*args: object, **kwargs: object) -> object:
+                nonlocal changed
+                result = real_prepare(*args, **kwargs)  # type: ignore[arg-type]
+                if not changed:
+                    before_audio.write_bytes(b"tampered-after-preview-verification")
+                    changed = True
+                return result
+
+            bundle = directory / "proof-drift-render"
+            with mock.patch.object(
+                restoration_workflow,
+                "_prepare_repair_patch",
+                side_effect=mutate_after_initial_proof,
+            ):
+                with self.assertRaisesRegex(GrooveSerpentError, "preview proof"):
+                    render_restored_side(
+                        fixture["project"],
+                        fixture["scan_path"],
+                        fixture["recipe"],
+                        bundle,
+                    )
+
+            self.assertTrue(changed)
+            self.assertFalse(bundle.exists())
+            self.assertEqual(list(directory.glob(".proof-drift-render.*.partial")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction semantics are required")
+    def test_recipe_and_render_reject_preview_bundle_junction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            fixture = self._fixture(directory)
+            preview_manifest = fixture["preview_manifest"]
+            assert isinstance(preview_manifest, Path)
+            bundle = preview_manifest.parent
+            outside_root = Path(tempfile.mkdtemp(prefix="gs-preview-junction-"))
+            outside = outside_root / bundle.name
+            shutil.move(str(bundle), str(outside))
+            completed = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(bundle), str(outside)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                shutil.move(str(outside), str(bundle))
+                shutil.rmtree(outside_root, ignore_errors=True)
+                self.skipTest("Windows could not create the junction regression fixture")
+            try:
+                recipe = directory / "junction-recipe.json"
+                with self.assertRaisesRegex(GrooveSerpentError, "reparse"):
+                    create_restoration_recipe(
+                        fixture["project"],
+                        fixture["scan_path"],
+                        fixture["decisions"],
+                        recipe,
+                        review_preview_manifests=[bundle / "preview.json"],
+                        owner_authority_proof=fixture["owner_authority"],
+                    )
+                output = directory / "junction-render"
+                with self.assertRaisesRegex(GrooveSerpentError, "reparse"):
+                    render_restored_side(
+                        fixture["project"],
+                        fixture["scan_path"],
+                        fixture["recipe"],
+                        output,
+                    )
+                self.assertFalse(recipe.exists())
+                self.assertFalse(output.exists())
+            finally:
+                os.rmdir(bundle)
+                shutil.rmtree(outside_root, ignore_errors=True)
 
     def test_staged_render_failure_leaves_no_visible_or_partial_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:

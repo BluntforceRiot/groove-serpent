@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import re
 import secrets
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Collection, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, Sequence
+from urllib.parse import unquote
 
 from scripts._release_fs import (
     PathIdentity,
@@ -38,14 +41,13 @@ TOOL_AUTHORITY_SCHEMA = "groove-serpent.release-evidence-tool-authority/1"
 RELEASE_TOOL_PATHS = (
     "scripts/_release_evidence.py",
     "scripts/_release_fs.py",
-    "scripts/build_public_release.py",
+    "scripts/build_public_archive.py",
     "scripts/build_python_distributions.py",
-    "scripts/build_release_evidence.py",
-    "scripts/build_handoff.py",
-    "tests/test_build_handoff.py",
-    "tests/test_build_public_release.py",
-    "tests/test_build_release_evidence.py",
+    "tests/_release_evidence_fixtures.py",
+    "tests/test_build_public_archive.py",
+    "tests/test_build_python_distributions.py",
     "tests/test_release_evidence.py",
+    "tests/test_release_fs.py",
 )
 MAX_INDEX_BYTES = 8 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -62,38 +64,26 @@ REQUIRED_GATE_ARTIFACTS = {
         ("scripts/run_real_corpus_acceptance.py", "authority-input"),
     ),
 }
+PRIVATE_POLICY_SCHEMA = "groove-serpent.private-content-policy/1"
+MAX_PRIVATE_POLICY_BYTES = 1024 * 1024
+# Generic syntax only: owner names, source filenames, and private digests belong
+# in an external policy, never in the public scanner or its regression fixtures.
 PUBLIC_FORBIDDEN_CONTENT_PATTERNS = (
-    re.compile(
-        rb"[A-Za-z]:(?:/+|\\+)Users(?:/+|\\+)[^\\/\r\n]+",
-        re.IGNORECASE,
-    ),
-    re.compile(rb"[A-Za-z]:(?:/+|\\+)HomelabForge(?:/+|\\+)", re.IGNORECASE),
-    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
-    re.compile(
-        rb"AF079DFF63DFE4AE725F9197ACC9FBAE"
-        rb"A65FECBFD4C2EA93E50864D01771281E",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        rb"9EAEDFE0464CEC026A9484314FF48F59"
-        rb"A87C8491A16C15C0A17640DE00C2523D",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        rb"fc4e27f1413532c2e2c26c56c679af6"
-        rb"514b3787c0806acebc357e1513b98a14f",
-        re.IGNORECASE,
-    ),
-    re.compile(rb"(?:untitled|mystery)\.flac", re.IGNORECASE),
-    re.compile(rb"the arcacia strain - you are safe from god here\.flac", re.IGNORECASE),
-    re.compile(rb"whitechapel - the valley\.flac", re.IGNORECASE),
-    re.compile(rb"larcenia roe - extraction\.flac", re.IGNORECASE),
-    re.compile(
-        rb"lorna shore - i feel the everblack festering within me\.flac",
-        re.IGNORECASE,
-    ),
+    re.compile(r"[a-z]:/+users/+[^/\s\"'<>]+", re.IGNORECASE),
+    re.compile(r"(?<![\w])/(?:home|users)/+[^/\s\"'<>]+/+", re.IGNORECASE),
+    re.compile(r"(?<![\w])/mnt/+[a-z]/+[^/\s\"'<>]+", re.IGNORECASE),
+    re.compile(r"//+wsl(?:\.localhost|\$)/+[a-z0-9][a-z0-9._-]*(?:/|$)", re.IGNORECASE),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"sk-" r"proj-[A-Za-z0-9_-]+"),
 )
+
+
+@dataclass(frozen=True)
+class PrivateContentPolicy:
+    """An in-memory snapshot of an external, owner-supplied literal denylist."""
+
+    raw_sha256: str
+    forbidden_literals: tuple[str, ...] = dataclass_field(repr=False)
 
 
 class PublicationState(str, Enum):
@@ -211,13 +201,111 @@ def release_tool_authority(
     return sha256_bytes(canonical_json_bytes(value))
 
 
-def assert_public_payload_safe(relative: str, payload: bytes, *, context: str) -> None:
-    relative_payload = relative.encode("utf-8", errors="strict")
-    if any(
-        pattern.search(relative_payload) or pattern.search(payload)
-        for pattern in PUBLIC_FORBIDDEN_CONTENT_PATTERNS
-    ):
-        raise RuntimeError(f"{context} contains private material.")
+def _normalized_public_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", unquote(value)).replace("\\", "/")
+
+
+def load_private_content_policy(path: Path, *, root: Path) -> PrivateContentPolicy:
+    """Load bounded literal policy bytes from outside the publication source tree."""
+
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    root = Path(os.path.abspath(os.fspath(root)))
+    if path.is_relative_to(root) or path.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError("Private content policy must remain outside the source tree.")
+    ensure_plain_ancestry(path, Path(path.anchor), "Private content policy")
+    payload = read_single_link_file(path, MAX_PRIVATE_POLICY_BYTES, "Private content policy")
+    value = strict_json_object(payload, "Private content policy")
+    _exact_keys(value, {"schema", "forbidden_literals"}, "Private content policy")
+    if value["schema"] != PRIVATE_POLICY_SCHEMA:
+        raise RuntimeError("Private content policy schema is invalid.")
+    terms = value["forbidden_literals"]
+    if not isinstance(terms, list) or not terms or len(terms) > 4096:
+        raise RuntimeError("Private content policy requires a bounded nonempty literal list.")
+    normalized: list[str] = []
+    for term in terms:
+        if not isinstance(term, str) or not term.strip() or len(term) > 4096:
+            raise RuntimeError("Private content policy literal is invalid.")
+        normalized.append(_normalized_public_text(term).casefold())
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("Private content policy contains duplicate normalized literals.")
+    return PrivateContentPolicy(sha256_bytes(payload), tuple(normalized))
+
+
+def _constant_public_text(node: ast.AST, depth: int = 0) -> str | bytes | None:
+    if depth > 32:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_public_text(node.left, depth + 1)
+        right = _constant_public_text(node.right, depth + 1)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if isinstance(left, bytes) and isinstance(right, bytes):
+            return left + right
+    return None
+
+
+def _public_text_views(relative: str, payload: bytes) -> Iterator[str]:
+    yield relative
+    # Raw bytes are always inspected, even for binary members. UTF-16 with a BOM
+    # is also decoded; text formats get their literal semantics inspected below.
+    yield payload.decode("utf-8", errors="replace")
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            yield payload.decode("utf-16", errors="strict")
+        except UnicodeDecodeError:
+            pass
+    suffix = Path(relative).suffix.casefold()
+    if suffix in {".py", ".pyi"}:
+        try:
+            syntax = ast.parse(payload)
+        except (SyntaxError, ValueError, RecursionError):
+            raise RuntimeError("Public Python source cannot be privacy-inspected.") from None
+        for node in ast.walk(syntax):
+            value = _constant_public_text(node)
+            if isinstance(value, bytes):
+                yield value.decode("utf-8", errors="replace")
+            elif isinstance(value, str):
+                yield value
+    elif suffix == ".json":
+        try:
+            parsed = json.loads(payload)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise RuntimeError("Public JSON cannot be privacy-inspected.") from None
+        pending = [parsed]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                yield item
+            elif isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+
+
+def assert_public_payload_safe(
+    relative: str,
+    payload: bytes,
+    *,
+    context: str,
+    policy: PrivateContentPolicy | None = None,
+) -> None:
+    """Reject generic leakage plus an optional external owner's literal policy.
+
+    This is a bounded content gate, not a proof that arbitrary encodings, computed
+    strings, Git history, or unknown private identifiers have been sanitized.
+    """
+
+    for view in _public_text_views(relative, payload):
+        normalized = _normalized_public_text(view)
+        if any(pattern.search(normalized) for pattern in PUBLIC_FORBIDDEN_CONTENT_PATTERNS):
+            raise RuntimeError(f"{context} contains private material.")
+        if policy is not None and any(
+            term in normalized.casefold() for term in policy.forbidden_literals
+        ):
+            raise RuntimeError(f"{context} contains private material.")
 
 
 def _reject_constant(value: str) -> None:
@@ -985,9 +1073,12 @@ __all__ = [
     "TOOL_AUTHORITY_SCHEMA",
     "PublicationAttempt",
     "PublicationState",
+    "PrivateContentPolicy",
+    "PRIVATE_POLICY_SCHEMA",
     "PUBLIC_RELEASE_COMMIT_SCHEMA",
     "canonical_json_bytes",
     "assert_public_payload_safe",
+    "load_private_content_policy",
     "marker_artifact",
     "public_release_commit_bytes",
     "product_source_authority",

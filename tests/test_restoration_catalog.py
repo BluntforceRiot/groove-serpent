@@ -20,6 +20,7 @@ from groove_serpent.models import (
     Project,
     Track,
 )
+from groove_serpent.publication import canonical_json_sha256
 from groove_serpent.project_io import load_project, save_project
 from groove_serpent.restoration import MAX_REPAIR_SAMPLES
 from groove_serpent.restoration_catalog import discover_restoration_catalog
@@ -29,6 +30,7 @@ from groove_serpent.restoration_workflow import (
     REMOVED_SIGNAL_GAIN,
     RENDER_SCHEMA,
     REPAIR_BACKEND,
+    REVIEW_WORKFLOW_PROOF_SCHEMA,
     SCAN_SCHEMA,
     _candidate_identifier,
     _detector_manifest,
@@ -308,6 +310,40 @@ class RestorationCatalogTests(unittest.TestCase):
             },
         }
         self._write_json(preview_bundle / "preview.json", preview)
+        preview_token = f"preview-{self._sha(preview_bundle / 'preview.json')[:32]}"
+        recipe["review_workflow"] = {
+            "schema": REVIEW_WORKFLOW_PROOF_SCHEMA,
+            "previews": [
+                {
+                    "token": preview_token,
+                    "bundle": preview_bundle.name,
+                    "sha256": self._sha(preview_bundle / "preview.json"),
+                }
+            ],
+        }
+        journal_sha256 = "e" * 64
+        recipe["owner_authority"] = {
+            "schema": "groove-serpent.owner-authority-proof/1",
+            "channel": "same-origin-owner-cookie",
+            "claim": "owner-channel-action-not-human-perception",
+            "decision_journal": {
+                "token": f"decision-{journal_sha256[:32]}",
+                "sha256": journal_sha256,
+                "body_sha256": "f" * 64,
+            },
+            "approvals": [
+                {
+                    "candidate_id": candidate["id"],
+                    "candidate_sha256": canonical_json_sha256(candidate),
+                    "preview_token": preview_token,
+                    "preview_sha256": self._sha(preview_bundle / "preview.json"),
+                    "auditioned_roles": ["before", "proposed", "removed"],
+                    "capability_sha256": "a" * 64,
+                }
+            ],
+        }
+        self._write_json(recipe_path, recipe)
+        recipe_sha = self._sha(recipe_path)
 
         render_bundle = self.workspace / self.render_name
         render_bundle.mkdir()
@@ -448,7 +484,7 @@ class RestorationCatalogTests(unittest.TestCase):
     def test_tampered_referenced_bytes_are_invalid_not_stale(self) -> None:
         self.paths["proposed"].write_bytes(b"TAMPERED")
         catalog = discover_restoration_catalog(self.workspace, self.project_path)
-        self.assertEqual([item.kind for item in catalog.artifacts], ["scan", "recipe", "render"])
+        self.assertEqual([item.kind for item in catalog.artifacts], ["scan"])
         self.assertEqual(catalog.stale, ())
         self.assertIn("output_hash_mismatch", {issue.code for issue in catalog.invalid})
 
@@ -552,10 +588,7 @@ class RestorationCatalogTests(unittest.TestCase):
         self._write_json(self.paths["preview"], preview)
 
         catalog = discover_restoration_catalog(self.workspace, self.project_path)
-        self.assertEqual(
-            [artifact.kind for artifact in catalog.artifacts],
-            ["scan", "recipe", "render"],
-        )
+        self.assertEqual([artifact.kind for artifact in catalog.artifacts], ["scan"])
         self.assertIn("unsafe_manifest_path", {issue.code for issue in catalog.invalid})
 
     def test_duplicate_keys_nan_and_corrupt_json_are_rejected(self) -> None:
@@ -566,7 +599,7 @@ class RestorationCatalogTests(unittest.TestCase):
         )
         nan_recipe = self.workspace / f"recipe-{'8' * 32}.json"
         nan_recipe.write_text(
-            '{"schema":"groove-serpent.restoration-recipe/1","value":NaN}',
+            '{"schema":"groove-serpent.restoration-recipe/3","value":NaN}',
             encoding="utf-8",
         )
         corrupt_bundle = self.workspace / f"preview-{'6' * 32}"

@@ -49,6 +49,7 @@ if not __package__:
 sys.path.insert(0, str(ROOT / "src"))
 
 from groove_serpent.executable_discovery import find_executable  # noqa: E402
+from scripts._release_evidence import assert_public_payload_safe  # noqa: E402
 from scripts._release_fs import (  # noqa: E402
     PathIdentity,
     canonical_portable_relative_path,
@@ -127,12 +128,6 @@ FORBIDDEN_ENDINGS = {
     ".restoration-recipe.json",
     ".tracklist.json",
 }
-PRIVATE_PATTERNS = (
-    re.compile(rb"[A-Za-z]:[\\/]Users[\\/][^\\/\r\n]+", re.IGNORECASE),
-    re.compile(rb"[A-Za-z]:[\\/]HomelabForge[\\/]", re.IGNORECASE),
-    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(rb"sk-" rb"proj-[A-Za-z0-9_-]+"),
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,10 +436,7 @@ def _safe_relative(value: str, context: str) -> tuple[str, str]:
 
 
 def _audit_payload(relative: str, payload: bytes, context: str) -> None:
-    encoded = relative.encode("utf-8")
-    for pattern in PRIVATE_PATTERNS:
-        if pattern.search(encoded) is not None or pattern.search(payload) is not None:
-            raise RuntimeError(f"{context} contains private material: {relative}")
+    assert_public_payload_safe(relative, payload, context=context)
 
 
 def _constraints(payload: bytes) -> dict[str, object]:
@@ -494,7 +486,7 @@ def _package_metadata(root: Path) -> tuple[str, str, str, str]:
     if (
         name != "groove-serpent"
         or not isinstance(version, str)
-        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version) is None
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}(?:\.dev[0-9]+)?", version) is None
         or set(build) != {"build-backend", "requires"}
         or backend != "setuptools.build_meta"
         or requirements != ["setuptools>=77"]
@@ -790,6 +782,23 @@ def _verify_uv(uv: Path, cwd: Path, environment: dict[str, str]) -> str:
     return text
 
 
+def _uv_local_file_uri(path: Path) -> str:
+    """Return one encoded local file URI for uv's path-valued options.
+
+    uv 0.11.28 on Windows splits a raw `--build-constraints` path containing
+    spaces despite receiving it as one process argument. A file URI preserves
+    the same local bytes while keeping the option parser unambiguous.
+    """
+
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        return absolute.as_uri()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Python build constraints must be an absolute local path: {absolute}"
+        ) from exc
+
+
 def _run_uv_build(
     uv: Path,
     source: Path,
@@ -809,7 +818,7 @@ def _run_uv_build(
         "--out-dir",
         str(output),
         "--build-constraints",
-        str(constraints),
+        _uv_local_file_uri(constraints),
         "--require-hashes",
         "--no-cache",
         "--no-create-gitignore",
@@ -842,7 +851,7 @@ def _run_uv_wheel_from_sdist(
         "--out-dir",
         str(output),
         "--build-constraints",
-        str(constraints),
+        _uv_local_file_uri(constraints),
         "--require-hashes",
         "--no-cache",
         "--no-create-gitignore",

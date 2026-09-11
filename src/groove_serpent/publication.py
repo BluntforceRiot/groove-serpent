@@ -281,7 +281,12 @@ def stage_verified_copy(
     *,
     label: str,
 ) -> FileReceipt:
-    """Copy one already-verified file through a stable open handle."""
+    """Copy one already-verified file through a stable open handle.
+
+    The caller owns the staging directory and its guarded cleanup. On failure,
+    a partial destination may remain: this primitive never unlinks a pathname
+    that might already belong, or have been reassigned, to another file.
+    """
 
     digest = hashlib.sha256()
     try:
@@ -296,18 +301,19 @@ def stage_verified_copy(
             with destination.open("xb") as destination_handle:
                 for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
                     digest.update(chunk)
-                    destination_handle.write(chunk)
+                    written = destination_handle.write(chunk)
+                    if written != len(chunk):
+                        raise OSError("short write while creating immutable snapshot")
                 destination_handle.flush()
                 os.fsync(destination_handle.fileno())
+                destination_after = os.fstat(destination_handle.fileno())
             closed = FileReceipt.from_stat(
                 os.fstat(source_handle.fileno()), expected.sha256
             )
         path_after = FileReceipt.from_stat(source.stat(), expected.sha256)
     except ExportError:
-        destination.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        destination.unlink(missing_ok=True)
         raise ExportError(f"{label} could not be staged safely: {exc}") from exc
 
     if (
@@ -315,13 +321,17 @@ def stage_verified_copy(
         or not closed.same_file_object(path_after)
         or digest.hexdigest() != expected.sha256
     ):
-        destination.unlink(missing_ok=True)
         raise ExportError(
             f"{label} changed while its immutable operation snapshot was being created."
         )
     snapshot = capture_file_receipt(destination, label=f"Staged {label.lower()}")
-    if snapshot.sha256 != expected.sha256 or snapshot.size_bytes != expected.size_bytes:
-        destination.unlink(missing_ok=True)
+    if (
+        snapshot.sha256 != expected.sha256
+        or snapshot.size_bytes != expected.size_bytes
+        or not snapshot.same_file_object(
+            FileReceipt.from_stat(destination_after, snapshot.sha256)
+        )
+    ):
         raise ExportError(f"The staged {label.lower()} snapshot failed verification.")
     return snapshot
 
@@ -341,6 +351,8 @@ def capture_verified_copy(
     digest to both file objects without rereading either complete file.  This is
     the capture primitive for immutable session snapshots; publication paths
     that copy an *existing* receipt continue to use :func:`stage_verified_copy`.
+    Failed partial copies remain for the caller's guarded staging-directory
+    cleanup; this primitive never removes a potentially reassigned pathname.
     """
 
     normalized_expected = None
@@ -355,7 +367,6 @@ def capture_verified_copy(
         raise ExportError(f"{label} has an invalid expected byte length.")
 
     digest = hashlib.sha256()
-    destination_created = False
     try:
         with source.open("rb") as source_handle:
             source_before = os.fstat(source_handle.fileno())
@@ -369,7 +380,6 @@ def capture_verified_copy(
                     f"{label} no longer matches its expected byte length."
                 )
             with destination.open("xb") as destination_handle:
-                destination_created = True
                 for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
                     digest.update(chunk)
                     written = destination_handle.write(chunk)
@@ -391,12 +401,8 @@ def capture_verified_copy(
             label=f"Staged {label.lower()} snapshot",
         )
     except ExportError:
-        if destination_created:
-            destination.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        if destination_created:
-            destination.unlink(missing_ok=True)
         raise ExportError(
             f"{label} could not be captured as an immutable copy: {exc}"
         ) from exc
@@ -414,18 +420,15 @@ def capture_verified_copy(
         )
         or snapshot_receipt.size_bytes != source_receipt.size_bytes
     ):
-        destination.unlink(missing_ok=True)
         raise ExportError(
             f"{label} changed while its immutable operation snapshot was being created."
         )
     if normalized_expected is not None and sha256 != normalized_expected:
-        destination.unlink(missing_ok=True)
         raise ExportError(f"{label} no longer matches its expected SHA-256 identity.")
     if (
         expected_size_bytes is not None
         and source_receipt.size_bytes != expected_size_bytes
     ):
-        destination.unlink(missing_ok=True)
         raise ExportError(f"{label} no longer matches its expected byte length.")
     return VerifiedCopyCapture(
         source_receipt=source_receipt,

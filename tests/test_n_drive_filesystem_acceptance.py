@@ -75,15 +75,15 @@ def test_frozen_environment_marker_is_exact() -> None:
 def test_promotion_versions_require_exact_release_authority() -> None:
     assert acceptance._promotion_versions(
         python_version="3.13.14",
-        app_version="1.0.0",
-    ) == {"python": "3.13.14", "groove_serpent": "1.0.0"}
+        app_version="1.1.0",
+    ) == {"python": "3.13.14", "groove_serpent": "1.1.0"}
 
 
 @pytest.mark.parametrize(
     ("python_version", "app_version", "message"),
     [
-        ("3.13.13", "1.0.0", "requires Python 3.13.14"),
-        ("3.13.14", "1.0.1", "requires Groove Serpent 1.0.0"),
+        ("3.13.13", "1.1.0", "requires Python 3.13.14"),
+        ("3.13.14", "1.1.0.dev1", "requires Groove Serpent 1.1.0"),
     ],
 )
 def test_promotion_versions_reject_any_mismatch(

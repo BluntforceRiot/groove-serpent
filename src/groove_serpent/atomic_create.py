@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
+from .file_identity import stable_creation_time_ns
+
 
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
@@ -39,7 +41,6 @@ class _OwnedProbeIdentity:
 
     @classmethod
     def capture(cls, value: os.stat_result) -> _OwnedProbeIdentity:
-        birth = getattr(value, "st_birthtime_ns", None)
         attributes = getattr(value, "st_file_attributes", None)
         return cls(
             device=int(value.st_dev),
@@ -48,9 +49,17 @@ class _OwnedProbeIdentity:
             link_count=int(value.st_nlink),
             size=int(value.st_size),
             modified_ns=int(value.st_mtime_ns),
-            birth_ns=int(birth) if birth is not None else None,
+            birth_ns=stable_creation_time_ns(value),
             file_attributes=int(attributes) if attributes is not None else None,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedFileReceipt:
+    """Identity and bytes that authorize cleanup of one temporary file."""
+
+    identity: _OwnedProbeIdentity
+    payload: bytes
 
 
 class _WindowsFileDispositionInfo(ctypes.Structure):
@@ -498,6 +507,49 @@ def _remove_owned_probe_path(
     return _remove_owned_probe_path_posix(path, identity, payload)
 
 
+def capture_owned_file_receipt(
+    path: Path, payload: bytes, *, owned_descriptor: int | None = None
+) -> OwnedFileReceipt:
+    """Bind cleanup to exact bytes and, for writers, their still-open object.
+
+    A writer supplies its descriptor after flushing. Matching bytes alone do
+    not establish ownership: a replacement can contain the same payload.
+    """
+
+    writer_identity = (
+        _OwnedProbeIdentity.capture(os.fstat(owned_descriptor))
+        if owned_descriptor is not None else None
+    )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        identity = _OwnedProbeIdentity.capture(os.fstat(descriptor))
+        if (
+            (writer_identity is not None and identity != writer_identity)
+            or not _opened_probe_matches(descriptor, path, identity, payload)
+            or (
+                owned_descriptor is not None
+                and _OwnedProbeIdentity.capture(os.fstat(owned_descriptor)) != identity
+            )
+        ):
+            raise OSError(
+                errno.EBUSY,
+                "Temporary file changed before its cleanup identity was captured.",
+                path,
+            )
+        return OwnedFileReceipt(identity, bytes(payload))
+    finally:
+        os.close(descriptor)
+
+
+def remove_owned_file_if_present(path: Path, receipt: OwnedFileReceipt) -> bool:
+    """Remove only the file bound by ``receipt``; preserve any racing replacement."""
+
+    return _remove_owned_probe_path(path, receipt.identity, receipt.payload)
+
+
 def probe_atomic_no_replace(directory: Path) -> Path:
     """Exercise atomic no-replace on the nearest existing destination parent.
 
@@ -616,4 +668,10 @@ def probe_atomic_no_replace(directory: Path) -> Path:
     return candidate
 
 
-__all__ = ["probe_atomic_no_replace", "rename_no_replace"]
+__all__ = [
+    "OwnedFileReceipt",
+    "capture_owned_file_receipt",
+    "probe_atomic_no_replace",
+    "remove_owned_file_if_present",
+    "rename_no_replace",
+]

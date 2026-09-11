@@ -50,7 +50,7 @@ uv run python scripts/build_windows_portable.py `
     C:\exact-inputs\groove-serpent-windows-media-8.1.2-corresponding-source.zip `
   --windows-media-corresponding-source-sha256 WINDOWS_MEDIA_SOURCE_SHA256 `
   --groove-license LICENSE --groove-license-sha256 GROOVE_LICENSE_SHA256 `
-  --third-party-notices packaging\windows\THIRD_PARTY_NOTICES.txt `
+  --third-party-notices packaging\windows\THIRD-PARTY-NOTICES.txt `
   --third-party-notices-sha256 THIRD_PARTY_SHA256 `
   --portable-verifier scripts\verify_windows_portable.py `
   --portable-verifier-sha256 PORTABLE_VERIFIER_SHA256 `

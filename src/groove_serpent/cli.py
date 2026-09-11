@@ -53,9 +53,10 @@ def _album_entry_path(path: Path, *, create_parent: bool = False) -> Path:
 
 def _stored_source_path(input_path: Path, project_path: Path) -> str:
     try:
-        return os.path.relpath(input_path.resolve(), project_path.resolve().parent)
+        relative = os.path.relpath(input_path.resolve(), project_path.resolve().parent)
+        return Path(relative).as_posix()
     except ValueError:
-        return str(input_path.resolve())
+        return input_path.resolve().as_posix()
 
 
 def _formats(value: str) -> list[str]:
@@ -106,11 +107,12 @@ def _settings_from_args(args: argparse.Namespace) -> AnalysisSettings:
 def _analyze(args: argparse.Namespace) -> int:
     input_path = Path(args.input).expanduser().resolve()
     project_path = (
-        Path(args.project).expanduser().resolve()
+        _absolute_without_resolving(Path(args.project))
         if args.project
         else _default_project_path(input_path)
     )
-    if project_path == input_path:
+    # Compare identities without discarding the output path's redirecting components.
+    if project_path.resolve() == input_path:
         raise GrooveSerpentError(
             "The project path cannot be the source audio file. "
             "Choose a separate .groove.json path."
@@ -190,7 +192,7 @@ def _export(args: argparse.Namespace) -> int:
     project_path = Path(args.project).expanduser().resolve()
     project = load_project(project_path)
     output_dir = (
-        Path(args.output_dir).expanduser().resolve()
+        _absolute_without_resolving(Path(args.output_dir))
         if args.output_dir
         else suggest_output_directory(project, project_path)
     )
@@ -229,7 +231,7 @@ def _click_scan(args: argparse.Namespace) -> int:
     from .restoration_workflow import scan_project_clicks
 
     project_path = Path(args.project).expanduser().resolve()
-    report_path = Path(args.report).expanduser().resolve()
+    report_path = _absolute_without_resolving(Path(args.report))
     report = scan_project_clicks(
         project_path,
         report_path,
@@ -252,7 +254,7 @@ def _click_preview(args: argparse.Namespace) -> int:
 
     project_path = Path(args.project).expanduser().resolve()
     scan_path = Path(args.scan).expanduser().resolve()
-    bundle_dir = Path(args.bundle).expanduser().resolve()
+    bundle_dir = _absolute_without_resolving(Path(args.bundle))
     result = create_click_preview(
         project_path,
         scan_path,
@@ -267,55 +269,19 @@ def _click_preview(args: argparse.Namespace) -> int:
 
 
 def _click_recipe(args: argparse.Namespace) -> int:
-    import json
-
-    from .restoration_workflow import create_restoration_recipe
-
-    decisions_path = Path(args.decisions).expanduser().resolve()
-    try:
-        payload = json.loads(
-            decisions_path.read_text(encoding="utf-8"),
-            parse_constant=_reject_json_constant,
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise GrooveSerpentError(
-            f"Restoration decisions JSON is invalid: {exc}"
-        ) from exc
-    decisions = payload.get("decisions") if isinstance(payload, dict) else payload
-    if not isinstance(decisions, list):
-        raise GrooveSerpentError(
-            "Restoration decisions must be a JSON array or an object with a decisions array."
-        )
-    recipe_path = Path(args.recipe).expanduser().resolve()
-    recipe = create_restoration_recipe(
-        Path(args.project).expanduser().resolve(),
-        Path(args.scan).expanduser().resolve(),
-        decisions,
-        recipe_path,
+    del args
+    raise GrooveSerpentError(
+        "click-recipe is unavailable: restoration decisions and recipes must be "
+        "created through the owner review workbench."
     )
-    summary = recipe["summary"]
-    print(f"Created restoration recipe: {recipe_path}")
-    print(
-        f"Decisions: {summary['approved']} approved, {summary['rejected']} rejected, "
-        f"{summary['protected']} protected."
-    )
-    print("Source audio and project were not changed.")
-    return 0
 
 
 def _click_render(args: argparse.Namespace) -> int:
-    from .restoration_workflow import render_restored_side
-
-    result = render_restored_side(
-        Path(args.project).expanduser().resolve(),
-        Path(args.scan).expanduser().resolve(),
-        Path(args.recipe).expanduser().resolve(),
-        Path(args.bundle).expanduser().resolve(),
+    del args
+    raise GrooveSerpentError(
+        "click-render is unavailable: restoration rendering is an owner-only "
+        "action in the review workbench."
     )
-    print(f"Created restored-side bundle: {result['bundle_path']}")
-    print(f"Applied {len(result['repairs'])} explicitly approved repair(s).")
-    print("Source audio and project were not changed.")
-    return 0
 
 
 def _info(args: argparse.Namespace) -> int:
@@ -476,17 +442,27 @@ def _print_endpoint_summary(proposal: dict[str, object]) -> None:
         if not isinstance(scope, dict):
             raise GrooveSerpentError("Endpoint proposal scope is invalid.")
         label = scope["label"]
-        status = scope["status"]
-        if status == "proposed":
-            print(
-                f"{label}: proposed [{scope['proposed_music_start_sample']}, "
-                f"{scope['proposed_music_end_sample_exclusive']}) "
-                f"at {float(scope['confidence']) * 100:.1f}% confidence"
-            )
-        else:
-            reasons = scope["reasons"]
-            rendered_reasons = ", ".join(str(item) for item in reasons)
-            print(f"{label}: abstained ({rendered_reasons})")
+        rendered: list[str] = []
+        for boundary_name in ("start", "end"):
+            boundary = scope.get(boundary_name)
+            if not isinstance(boundary, dict):
+                raise GrooveSerpentError(
+                    f"Endpoint proposal {boundary_name} decision is invalid."
+                )
+            if boundary.get("status") == "proposed":
+                rendered.append(
+                    f"{boundary_name} proposed at {boundary['sample']} "
+                    f"({float(boundary['confidence']) * 100:.1f}% confidence)"
+                )
+            else:
+                reasons = boundary.get("reasons")
+                if not isinstance(reasons, list):
+                    raise GrooveSerpentError(
+                        f"Endpoint proposal {boundary_name} reasons are invalid."
+                    )
+                rendered_reasons = ", ".join(str(item) for item in reasons)
+                rendered.append(f"{boundary_name} abstained ({rendered_reasons})")
+        print(f"{label}: {'; '.join(rendered)}")
 
 
 def _endpoints_propose(args: argparse.Namespace) -> int:
@@ -779,7 +755,7 @@ def _album_export(args: argparse.Namespace) -> int:
     album_path = _album_entry_path(Path(args.album_project))
     album = load_album_project(album_path)
     output_dir = (
-        Path(args.output_dir).expanduser().resolve()
+        _absolute_without_resolving(Path(args.output_dir))
         if args.output_dir
         else suggest_album_output_directory(album, album_path)
     )
@@ -1575,19 +1551,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     click_recipe_parser = subparsers.add_parser(
         "click-recipe",
-        help="Bind an explicit approve/reject/protect decision to every click candidate",
+        help="Retired: recipes are created only by the owner review workbench",
     )
     click_recipe_parser.add_argument("project")
     click_recipe_parser.add_argument("scan")
     click_recipe_parser.add_argument(
         "--decisions", required=True, help="Strict decisions JSON"
     )
+    click_recipe_parser.add_argument(
+        "--preview-manifest",
+        action="append",
+        default=[],
+        help="Auditioned preview.json proof; repeat for multiple preview bundles",
+    )
     click_recipe_parser.add_argument("--recipe", required=True)
     click_recipe_parser.set_defaults(handler=_click_recipe)
 
     click_render_parser = subparsers.add_parser(
         "click-render",
-        help="Render one full restored side from a reviewed recipe",
+        help="Retired: restoration rendering is owner-only in the review workbench",
     )
     click_render_parser.add_argument("project")
     click_render_parser.add_argument("scan")

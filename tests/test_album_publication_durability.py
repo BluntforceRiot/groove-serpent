@@ -36,6 +36,9 @@ from groove_serpent.project_io import save_project
 
 
 _PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNg+A8AAQIBAEK+vGgAAAAASUVORK5CYII="
+)
+_DAMAGED_PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk/wcAAusB9Wl2nWQAAAAASUVORK5CYII="
 )
 
@@ -253,6 +256,23 @@ class AlbumPublicationDurabilityTests(unittest.TestCase):
                 for item in audio
             )
         )
+
+    def test_damaged_artwork_decode_error_blocks_publication(self) -> None:
+        # The old positive fixture has an invalid compressed PNG scanline.
+        # Keep it as a negative fixture, not silently tolerated success input.
+        with mock.patch(f"{__name__}._PNG_1X1", _DAMAGED_PNG_1X1):
+            plan_path, source = self._fixture(("corrected-lossless",), artwork=True)
+        artwork = self.root / "cover.png"
+        source_before = source.read_bytes()
+        artwork_before = artwork.read_bytes()
+        output = self.root / "published"
+
+        with self.assertRaisesRegex(ExportError, "inflate returned error"):
+            execute_album_publication_plan(plan_path, output)
+
+        self.assertFalse(output.exists())
+        self.assertEqual(source.read_bytes(), source_before)
+        self.assertEqual(artwork.read_bytes(), artwork_before)
 
     def test_duplicate_key_manifest_is_rejected(self) -> None:
         plan_path, _source = self._fixture(("archival-source",))

@@ -77,42 +77,39 @@ def test_macos_ci_pins_libsoxr_enabled_ffmpeg_formula() -> None:
     )
 
 
-def test_ci_uploads_the_source_archive_emitted_by_the_release_builder() -> None:
+def test_ci_uploads_a_candidate_archive_without_claiming_release_authority() -> None:
     text = _ci_workflow_text()
     source_jobs = text.split("\n  source-archive:", maxsplit=1)[1]
 
-    assert "dist/groove-serpent-1.0.0-source.zip" in text
+    assert "dist/groove-serpent-1.1.0-source.zip" in text
     assert "dist/groove-serpent-0.5.0-alpha.1-source.zip" not in text
-    assert "dist/groove-serpent-1.0.0-source.commit.json" in source_jobs
-    build = source_jobs.index("- name: Build normalized source archive")
-    verify = source_jobs.index("- name: Verify source archive commit marker")
+    assert "dist/groove-serpent-1.1.0-source.commit.json" in source_jobs
+    build = source_jobs.index("- name: Build normalized candidate source archive")
+    verify = source_jobs.index("- name: Verify candidate source archive commit marker")
     upload = source_jobs.index("- name: Upload archive, manifest, and commit marker")
     assert build < verify < upload
-    assert "python scripts/build_public_archive.py --verify" in source_jobs
+    assert "python scripts/build_public_archive.py --candidate" in source_jobs
+    assert "python scripts/build_public_archive.py --verify-candidate" in source_jobs
+    assert "python scripts/build_public_archive.py --verify\n" not in source_jobs
     compare = source_jobs.split("\n  compare-source-archives:", maxsplit=1)[1]
     assert "- name: Check out source" in compare
-    assert "- name: Verify every downloaded commit marker" in compare
-    assert "--marker \"$directory/groove-serpent-1.0.0-source.commit.json\"" in compare
+    assert "- name: Verify every downloaded candidate commit marker" in compare
+    assert "python scripts/build_public_archive.py --verify-candidate" in compare
+    assert "--marker \"$directory/groove-serpent-1.1.0-source.commit.json\"" in compare
     assert "Require byte-identical archives, manifests, and markers" in compare
     assert "path: ${{ runner.temp }}/source-comparison" in compare
     assert "path: comparison" not in compare
 
 
 def test_distribution_scanner_rejects_json_escaped_windows_paths() -> None:
+    from scripts._release_evidence import assert_public_payload_safe
+
     text = _ci_workflow_text()
-    body = text.split("          private_patterns = (\n", maxsplit=1)[1].split(
-        "          )\n\n",
-        maxsplit=1,
-    )[0]
-    namespace: dict[str, object] = {"re": re}
-    exec("private_patterns = (\n" + textwrap.dedent(body) + ")\n", namespace)
-    patterns = namespace["private_patterns"]
-    assert isinstance(patterns, tuple)
-    payloads = (
-        b'{"path":"X:' b'\\\\Users\\\\neutral\\\\file"}',
-        b'{"path":"X:' b'\\\\HomelabForge\\\\release"}',
-    )
-    assert all(any(pattern.search(payload) for pattern in patterns) for payload in payloads)
+    assert "from scripts._release_evidence import assert_public_payload_safe" in text
+    assert 'assert_public_payload_safe(name, data, context="CI distribution member")' in text
+    payload = json.dumps({"path": "\\".join(("X:", "Users", "synthetic", "file"))}).encode()
+    with pytest.raises(RuntimeError, match="private material"):
+        assert_public_payload_safe("sample.json", payload, context="CI regression")
 
 
 def test_ci_uses_the_audited_deterministic_python_distribution_builder() -> None:
@@ -139,8 +136,8 @@ def test_ci_uses_the_audited_deterministic_python_distribution_builder() -> None
         "uses: actions/upload-artifact@"
         "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2"
     ) in package_job
-    assert "dist/groove_serpent-1.0.0-py3-none-any.whl" in package_job
-    assert "dist/groove_serpent-1.0.0.tar.gz" in package_job
+    assert "dist/groove_serpent-1.1.0-py3-none-any.whl" in package_job
+    assert "dist/groove_serpent-1.1.0.tar.gz" in package_job
     assert "dist/PYTHON_DISTRIBUTIONS_RECEIPT.json" in package_job
     assert "if-no-files-found: error" in package_job
     assert "retention-days: 7" in package_job
@@ -158,15 +155,15 @@ def test_ci_final_distribution_reconciliation_executes_and_rejects_tampering(
 
     dist = tmp_path / "dist"
     dist.mkdir()
-    wheel_name = "groove_serpent-1.0.0-py3-none-any.whl"
-    sdist_name = "groove_serpent-1.0.0.tar.gz"
+    wheel_name = "groove_serpent-1.1.0-py3-none-any.whl"
+    sdist_name = "groove_serpent-1.1.0.tar.gz"
     payloads = {wheel_name: b"wheel", sdist_name: b"sdist"}
     for name, payload in payloads.items():
         (dist / name).write_bytes(payload)
     receipt = {
         "schema": "groove-serpent/python-distribution-build-receipt/1",
         "result": "passed",
-        "project": {"name": "groove-serpent", "version": "1.0.0"},
+        "project": {"name": "groove-serpent", "version": "1.1.0"},
         "outputs": [
             {
                 "role": role,
@@ -193,7 +190,7 @@ def test_public_bug_template_prompts_for_the_current_release_version() -> None:
     bug_template = WORKFLOWS.parent / "ISSUE_TEMPLATE" / "bug.yml"
     text = bug_template.read_text(encoding="utf-8")
 
-    assert "placeholder: 1.0.0" in text
+    assert "placeholder: 1.1.0" in text
     assert "placeholder: 0.5.0a1" not in text
 
 

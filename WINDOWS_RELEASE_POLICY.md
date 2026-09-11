@@ -70,7 +70,7 @@ live, malformed, unsafe, or uncertain entries rather than guessing that they are
 
 ## Release boundary
 
-An unsigned Windows 1.0 portable may be published when the exact candidate has candidate-specific
+An unsigned Windows portable may be published when the exact candidate has candidate-specific
 reproducible-build and deterministic-ZIP proof, an externally anchored manifest, version and doctor
 checks, representative application/runtime proof, fresh-extraction and removal proof on a supported
 Windows host, exact ZIP and tree Defender scans, an Authenticode inventory, no-replace behavior, and

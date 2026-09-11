@@ -28,7 +28,7 @@ body:
     attributes:
       label: Groove Serpent version or commit
       description: Paste `groove-serpent --version` output or a commit SHA.
-      placeholder: 1.0.0
+      placeholder: 1.1.0
     validations:
       required: true
 

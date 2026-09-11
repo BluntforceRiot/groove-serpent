@@ -663,6 +663,18 @@ def test_receipt_write_is_no_overwrite_canonical_and_recomputed(
         load_review_evidence_evaluation(noncanonical, export_path)
 
 
+def test_invalid_programmatic_config_is_rejected_before_output_creation(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "evaluation.json"
+    with pytest.raises(
+        ReviewEvidenceEvaluationError,
+        match="outside its supported integer range",
+    ):
+        EvaluationConfig(evaluation_basis_points=10_000)
+    assert not output.exists()
+
+
 def test_evidence_evaluate_cli_prints_summary_or_writes_new_json(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

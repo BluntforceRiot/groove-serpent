@@ -421,6 +421,55 @@ def test_atomic_no_overwrite_save_load_and_raw_receipt(tmp_path: Path) -> None:
     assert path.read_bytes() == original
 
 
+def test_successful_plan_commit_preserves_a_racing_temporary_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "album.publication-plan.json"
+    racing_paths: list[Path] = []
+    real_rename = publication_plan_module.rename_no_replace
+
+    def rename_then_race(source: Path, target: Path) -> None:
+        real_rename(source, target)
+        source.write_text("foreign racing file", encoding="utf-8")
+        racing_paths.append(source)
+
+    monkeypatch.setattr(
+        publication_plan_module,
+        "rename_no_replace",
+        rename_then_race,
+    )
+    save_album_publication_plan(representative_plan(), destination)
+
+    assert destination.is_file()
+    assert len(racing_paths) == 1
+    assert racing_paths[0].read_text(encoding="utf-8") == "foreign racing file"
+
+
+def test_plan_commit_rolls_back_when_a_portable_equivalent_races_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "Caf\u00e9.json"
+    racing = tmp_path / "Cafe\u0301.json"
+    real_rename = publication_plan_module.rename_no_replace
+
+    def race_then_rename(source: Path, target: Path) -> None:
+        racing.write_text("foreign racing file", encoding="utf-8")
+        real_rename(source, target)
+
+    monkeypatch.setattr(
+        publication_plan_module,
+        "rename_no_replace",
+        race_then_rename,
+    )
+    with pytest.raises(ProjectValidationError, match="portable-equivalent"):
+        save_album_publication_plan(representative_plan(), destination)
+
+    assert not destination.exists()
+    assert racing.read_text(encoding="utf-8") == "foreign racing file"
+
+
 @pytest.mark.parametrize(
     "reference",
     [

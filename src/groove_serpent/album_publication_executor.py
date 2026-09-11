@@ -18,7 +18,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .album import (
     AlbumProject,
     AlbumSide,
@@ -54,6 +59,7 @@ from .album_publication_policy import (
 )
 from .cache_storage import ensure_free_space
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
+from .file_identity import stable_creation_time_ns
 from .exporter import (
     _complete_decode,
     _decoded_pcm_sha256,
@@ -64,7 +70,7 @@ from .exporter import (
     render_verified_track,
     sanitize_filename,
 )
-from .media import find_tool
+from .media import audio_source_descriptor_mismatches, find_tool, probe_audio
 from .models import Project, Track
 from .portable_names import (
     PortablePathError,
@@ -83,6 +89,7 @@ from .restoration_catalog import (
     discover_restoration_catalog,
 )
 from .subprocess_policy import run_bounded_capture
+from .transaction_lock import exclusive_target_write_lease
 
 
 LEGACY_ALBUM_PUBLICATION_MANIFEST_SCHEMA = "groove-serpent.album-publication-manifest/1"
@@ -292,12 +299,11 @@ def _directory_identity(path: Path, *, label: str) -> _DirectoryIdentity:
         or not stat.S_ISDIR(metadata.st_mode)
     ):
         raise ExportError(f"{label} is not one ordinary directory.")
-    birth_value = getattr(metadata, "st_birthtime_ns", None)
     return _DirectoryIdentity(
         device=int(metadata.st_dev),
         inode=int(metadata.st_ino),
         file_type=stat.S_IFMT(metadata.st_mode),
-        birth_ns=int(birth_value) if birth_value is not None else None,
+        birth_ns=stable_creation_time_ns(metadata),
         file_attributes=attributes,
     )
 
@@ -690,6 +696,13 @@ def _capture_execution_lease(
             raise ExportError(f"Side {planned.label} project changed during inspection.")
         if source_receipt.sha256 != source_sha256:
             raise ExportError(f"Side {planned.label} source changed during inspection.")
+        actual_source = probe_audio(source_path)
+        if audio_source_descriptor_mismatches(project.source, actual_source):
+            raise ExportError(
+                f"Side {planned.label} source stream descriptor differs from its audio. "
+                "Reanalyze the original capture before publication."
+            )
+        assert_file_receipt(source_path, source_receipt, label=f"Side {planned.label} source")
         if project.source.bits_per_raw_sample not in {16, 24}:
             raise ExportError(f"Side {planned.label} must have known 16- or 24-bit PCM precision.")
         identity = _side_identity(
@@ -807,14 +820,19 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
         + "\n"
     )
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary, text.encode("utf-8"), owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 def _write_new_text(path: Path, text: str, *, label: str) -> None:
@@ -956,7 +974,13 @@ def _stage_snapshots(
             source_object.source_receipt,
             label=f"Archival source object {source_object.object_id}",
         )
+        actual_source = probe_audio(source_snapshot)
         for side in source_object.sides:
+            if audio_source_descriptor_mismatches(side.project.source, actual_source):
+                raise ExportError(
+                    f"Side {side.planned.label} snapshot stream descriptor "
+                    "differs from its project."
+                )
             source_snapshots[side.planned.label] = (
                 source_snapshot,
                 source_snapshot_receipt,
@@ -1972,6 +1996,30 @@ def _cleanup_stage(
     _remove_owned_stage(quarantine, expected_identity)
 
 
+def _rollback_committed_output(
+    output: Path,
+    expected_parent: Path,
+    expected_identity: _DirectoryIdentity,
+) -> None:
+    """Quarantine and remove only the output tree committed by this transaction."""
+
+    if output.parent != expected_parent or not os.path.lexists(output):
+        return
+    if _directory_identity(output, label="Committed publication output") != expected_identity:
+        raise ExportError(
+            "The committed publication output was substituted; it was not removed."
+        )
+    quarantine = expected_parent / (
+        f".groove-serpent-album-cleanup-{uuid.uuid4().hex}.partial"
+    )
+    _atomic_no_replace_directory(output, quarantine)
+    if _directory_identity(quarantine, label="Quarantined publication output") != expected_identity:
+        raise ExportError(
+            "The committed publication output changed during rollback."
+        )
+    _remove_owned_stage(quarantine, expected_identity)
+
+
 def preflight_album_publication_plan(
     plan_path: Path,
     *,
@@ -2071,16 +2119,37 @@ def execute_album_publication_plan(
             raise ExportError(
                 "The publication stage was substituted during live-input revalidation."
             )
-        _resolved, now_exists = _resolve_portable_export_path(
-            output,
-            context="album publication directory",
-        )
-        if now_exists or portable_path_entry_exists(output):
-            raise ExportError("Publication output appeared before atomic commit.")
-        if _directory_identity(stage, label="Publication stage") != stage_identity:
-            raise ExportError("The publication stage was substituted before commit.")
-        _inject_fault(fault_injector, "before-commit")
-        _atomic_no_replace_directory(stage, output)
+        with exclusive_target_write_lease(output) as write_lease:
+            write_lease.assert_current()
+            _inject_fault(fault_injector, "before-commit")
+            _resolved, now_exists = _resolve_portable_export_path(
+                output,
+                context="album publication directory",
+            )
+            if now_exists or portable_path_entry_exists(output):
+                raise ExportError("Publication output appeared before atomic commit.")
+            if _directory_identity(stage, label="Publication stage") != stage_identity:
+                raise ExportError("The publication stage was substituted before commit.")
+            _atomic_no_replace_directory(stage, output)
+            try:
+                confirmed, confirmed_exists = _resolve_portable_export_path(
+                    output,
+                    context="committed album publication directory",
+                )
+                if not confirmed_exists or confirmed != output:
+                    raise ExportError(
+                        "Publication output changed during atomic commit."
+                    )
+            except BaseException as exc:
+                try:
+                    _rollback_committed_output(output, output.parent, stage_identity)
+                except BaseException as rollback_error:
+                    exc.add_note(
+                        "The owned output could not be rolled back safely: "
+                        f"{rollback_error}"
+                    )
+                raise
+            write_lease.assert_current()
     except BaseException as exc:
         try:
             _cleanup_stage(stage, output.parent, stage_identity)

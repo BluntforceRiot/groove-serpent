@@ -1,6 +1,10 @@
 # Browser and accessibility acceptance
 
-This report records the checked-in Groove Serpent 1.0 browser gate. It distinguishes automated
+The numerical results below are historical Groove Serpent 1.0 evidence, not a
+1.1 pass. Fresh 1.1 browser commands, engine results, skip inventory, source
+authority, and output hashes belong to its external release build-cycle receipt.
+
+This report records the historical Groove Serpent 1.0 browser gate. It distinguishes automated
 browser evidence from spoken screen-reader and native-platform evidence that has not been obtained.
 
 ## Reproduce

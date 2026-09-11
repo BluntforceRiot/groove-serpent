@@ -19,7 +19,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import stat
 import struct
 import tempfile
@@ -32,7 +31,12 @@ import numpy as np
 
 from . import __version__
 from .album import project_speed_state
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .continuous_noise import (
     CONTINUOUS_NOISE_DOCUMENT_SCHEMA,
@@ -60,6 +64,11 @@ from .crackle_preview import (
     validate_crackle_preview_render_manifest,
 )
 from .errors import GrooveSerpentError, ProjectValidationError
+from .owned_directory import (
+    OwnedDirectoryReceipt,
+    capture_owned_directory_receipt,
+    remove_owned_directory_if_present,
+)
 from .hiss_preview import (
     HISS_PREVIEW_RECEIPT_SCHEMA,
     HISS_PREVIEW_RECIPE_SCHEMA,
@@ -90,7 +99,13 @@ from .hum_preview import (
     validate_hum_preview_receipt,
     validate_hum_preview_render_manifest,
 )
-from .media import find_tool, sha256_file, tool_version
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    probe_audio,
+    sha256_file,
+    tool_version,
+)
 from .models import Project, resolve_source_path, utc_now_iso
 from .project_io import decode_project_json, load_project_with_sha256
 from .publication import canonical_json_sha256
@@ -715,6 +730,18 @@ def _validate_geometry(
         raise ProjectValidationError("Noise references must leave program audio to compare.")
 
 
+def _assert_snapshot_descriptor(snapshot: VerifiedAudioSnapshot, project: Project) -> None:
+    actual = probe_audio(snapshot.path)
+    mismatches = audio_source_descriptor_mismatches(project.source, actual)
+    if mismatches:
+        raise ProjectValidationError(
+            "Continuous-preview source descriptor disagrees with the verified snapshot: "
+            + ", ".join(mismatches)
+            + "."
+        )
+    snapshot.assert_snapshot_unchanged(force=True)
+
+
 def _decode_scope(
     snapshot: VerifiedAudioSnapshot,
     project: Project,
@@ -932,15 +959,29 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> str:
         raise ProjectValidationError("Continuous-preview JSON exceeds its bounded size limit.")
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)
+    cleanup_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
-            handle.write(raw)
+            if handle.write(raw) != len(raw):
+                raise OSError("Short write while staging continuous-preview JSON.")
             handle.flush()
+            cleanup_receipt = capture_owned_file_receipt(
+                temporary, raw, owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         rename_no_replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    except BaseException as primary_error:
+        if cleanup_receipt is not None:
+            try:
+                if not remove_owned_file_if_present(temporary, cleanup_receipt):
+                    primary_error.add_note("Uncertain continuous-preview temporary file preserved.")
+            except OSError as cleanup_error:
+                primary_error.add_note(f"Continuous-preview cleanup was not safe: {cleanup_error}")
+        else:
+            primary_error.add_note(
+                "Continuous-preview temporary preserved without proven ownership."
+            )
+        raise
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -987,6 +1028,7 @@ def propose_continuous_preview(
     try:
         snapshot.assert_snapshot_unchanged(force=True)
         snapshot.assert_live_unchanged(force=True)
+        _assert_snapshot_descriptor(snapshot, project)
         pcm = _decode_scope(snapshot, project, start_sample, end_sample_exclusive)
         scope, local_refs = _local_geometry(start_sample, end_sample_exclusive, refs)
         if kind == "hiss":
@@ -1459,6 +1501,7 @@ def render_continuous_preview(
     try:
         snapshot.assert_snapshot_unchanged(force=True)
         snapshot.assert_live_unchanged(force=True)
+        _assert_snapshot_descriptor(snapshot, project)
         pcm = _decode_scope(snapshot, project, start, end)
         kind = _kind(proposal["kind"])
         original, proposed, removed, recipe, render, foundation_receipt = _preview_result(
@@ -1479,7 +1522,9 @@ def render_continuous_preview(
     workspace = _workspace_for(path)
     destination = _unique_path(workspace, f"preview-{proposal['kind']}", directory=True)
     stage = Path(tempfile.mkdtemp(dir=workspace, prefix=f".{destination.name}."))
+    stage_receipt: OwnedDirectoryReceipt | None = None
     try:
+        stage_receipt = capture_owned_directory_receipt(stage)
         audio: dict[str, Any] = {}
         for role, samples in (
             ("original", original),
@@ -1514,9 +1559,13 @@ def render_continuous_preview(
         receipt = validate_continuous_preview_receipt(receipt)
         _atomic_json(stage / "preview.json", receipt)
         rename_no_replace(stage, destination)
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage)
+    except BaseException as primary_error:
+        if stage_receipt is not None:
+            try:
+                remove_owned_directory_if_present(stage, stage_receipt)
+            except OSError as cleanup_error:
+                primary_error.add_note(f"Continuous-preview stage preserved: {cleanup_error}")
+        raise
     return destination, receipt
 
 

@@ -94,8 +94,8 @@ publication operation uploads source audio.
 ### Restoration
 
 - `restoration.py`: bounded impulse/clipped-run detection and micro-repair primitives.
-- `restoration_workflow.py`: click scan, coverage ledger, preview-v3, decision recipe, restored-side
-  render, and exact PCM proof.
+- `restoration_workflow.py`: click scan, coverage ledger, preview-v3, owner-authorized recipe-v3,
+  restored-side render, and exact PCM proof.
 - `restoration_catalog.py`: restart discovery and current/stale/invalid restoration artifacts.
 - `continuous_noise.py`: proposal-only stationary hum/rumble evidence from declared references.
 - `hum_preview.py`, `rumble_preview.py`, `hiss_preview.py`, `crackle_preview.py`: separate bounded
@@ -214,10 +214,13 @@ The side cockpit’s audio, waveform, spectrogram, playhead, marker, and selecti
 source-sample coordinates. Needle drop/pickup morphology may be shown and protected but does not
 become an automatic repair target.
 
-Endpoint proposals are sealed and proposal-only. Speed estimation requires reference duration
-provenance plus an exact project-bound attestation that every boundary was reviewed with audio and
-visuals independently of those reference durations. Missing, stale, bimodal, inconsistent, or weak
-evidence produces diagnostics and abstention rather than a correction authority.
+Endpoint proposals are sealed and proposal-only. Start and end decisions abstain independently so
+one ambiguous edge cannot suppress evidence for the other. A strongly sub-audible groove signature
+can resolve false "quiet tonal" ambiguity only when needle morphology brackets that context; it is
+still never applied automatically. Speed estimation requires reference duration provenance plus an
+exact project-bound attestation that every boundary was reviewed with audio and visuals
+independently of those reference durations. Missing, stale, bimodal, inconsistent, or weak evidence
+produces diagnostics and abstention rather than a correction authority.
 
 ## Restoration proof model
 
@@ -225,6 +228,15 @@ Isolated-click scan records complete, partial, or exploratory coverage and wheth
 retention was truncated. Preview writes Original, Proposed, Removed Signal, and a receipt. A recipe
 must decide every retained candidate exactly once. `restored.flac` is reserved for complete,
 untruncated coverage of the reviewed music range.
+
+Candidate decisions, recipe creation, and full-side rendering are owner-browser routes. Native
+Bearer clients may scan and construct audition evidence, but receive `403` if they try to decide,
+authorize, or render. Rejected and protected choices live in a strict self-hashed partial-decision
+journal bound to the exact project, source, scan, candidate, and preview. That journal survives a
+restart but is explicitly non-authorizing. Approval additionally needs a fresh one-use in-process
+capability issued only after the browser reports that all three transports crossed the changed
+sample window; this proves an owner-channel action, not human perception. The complete recipe binds
+the exact journal and hashed capability evidence before rendering can begin.
 
 The rendered side preserves rate, channels, integer precision, and exact range length. Output is
 redecoded; approved patch hashes and identity outside approved channel/windows are recomputed.

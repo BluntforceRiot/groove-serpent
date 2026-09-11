@@ -34,7 +34,12 @@ from .album_identification import (
     capture_album_identification_context,
     validate_album_identification_proposal,
 )
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import ExportError, ProjectValidationError
 from .portable_names import PortablePathError, portable_name_key, resolve_portable_path
 from .publication import canonical_json_sha256, capture_file_receipt, same_file_object_stats
@@ -813,16 +818,29 @@ def save_album_identification_proposal(
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
-    temporary_identity: tuple[int | None, ...] | None = None
+    temporary_receipt: OwnedFileReceipt | None = None
     published = False
     try:
         with os.fdopen(descriptor, "wb") as handle:
-            written = handle.write(raw)
-            if written != len(raw):
-                raise OSError("short write while staging identification proposal")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary_identity = _file_identity(temporary.lstat())
+            written = 0
+            try:
+                written = handle.write(raw)
+                if written != len(raw):
+                    raise OSError("short write while staging identification proposal")
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary_receipt = capture_owned_file_receipt(
+                    temporary, raw, owned_descriptor=handle.fileno()
+                )
+            except BaseException:
+                try:
+                    handle.flush()
+                    temporary_receipt = capture_owned_file_receipt(
+                        temporary, raw[:written], owned_descriptor=handle.fileno()
+                    )
+                except OSError:
+                    pass
+                raise
         repeated_context = capture_album_identification_context(canonical)
         repeated_runtime = _runtime_identity(config)
         if repeated_context.sha256 != context.sha256 or repeated_runtime != runtime:
@@ -856,14 +874,9 @@ def save_album_identification_proposal(
             )
         return destination
     finally:
-        if not published and os.path.lexists(temporary):
+        if not published and temporary_receipt is not None:
             try:
-                current = temporary.lstat()
-                if (
-                    temporary_identity is not None
-                    and _file_identity(current) == temporary_identity
-                ):
-                    temporary.unlink()
+                remove_owned_file_if_present(temporary, temporary_receipt)
             except OSError:
                 pass
 

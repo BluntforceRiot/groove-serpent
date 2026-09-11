@@ -1,10 +1,12 @@
-Groove Serpent Windows portable candidate component notice
+Groove Serpent Windows portable component-notice template
 
-This notice describes the exact Groove Serpent 1.0.0 candidate assembled for
-1.0 acceptance. It is evidence for release review, not legal advice or a
-legal-compliance certification.
+This template is prepared for Groove Serpent 1.1.0. The dependency/runtime
+profile below is retained from the historical portable build; this source
+release does not include or certify a newly assembled 1.1 portable. Any future
+portable must check these entries against its actual, hash-bound components.
+This is not legal advice or a legal-compliance certification.
 
-Groove Serpent 1.0.0
+Groove Serpent 1.1.0
 Copyright Groove Serpent contributors.
 Licensed under Apache License 2.0. The complete text is shipped as
 LICENSES/GROOVE-SERPENT-LICENSE.txt.
@@ -55,7 +57,7 @@ These facts do not substitute for legal review of a public distribution.
 
 Code signing and platform acceptance
 
-This candidate is unsigned. It makes no Authenticode, publisher identity,
+This template grants no signing or platform certification. It makes no Authenticode, publisher identity,
 SmartScreen reputation, notarization, general antivirus compatibility, or
 independent clean-machine certification claim. Each requires separate
 candidate-specific validation before making the corresponding claim; none is

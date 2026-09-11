@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from groove_serpent.errors import GrooveSerpentError
-from groove_serpent.media import decode_rms_envelope, tool_version
+from groove_serpent.media import decode_rms_envelope, run_ffmpeg, tool_version
 
 
 class _FakeProcess:
@@ -50,6 +50,30 @@ class _ExplodingStream(io.BytesIO):
 
 
 class MediaTests(unittest.TestCase):
+    def test_error_only_ffmpeg_requires_clean_diagnostics_and_zero_exit(self) -> None:
+        for return_code, diagnostic in (
+            (0, b""),
+            (0, b"File already exists. Exiting.\n"),
+            (1, b"Encoder failed.\n"),
+            (1, b""),
+        ):
+            with self.subTest(return_code=return_code, diagnostic=diagnostic):
+                process = _FakeProcess(
+                    io.BytesIO(), return_code, io.BytesIO(diagnostic)
+                )
+                with mock.patch(
+                    "groove_serpent.media.subprocess.Popen", return_value=process
+                ) as popen:
+                    command = ["ffmpeg", "-loglevel", "error", "-n", "out.m4a"]
+                    if return_code or diagnostic:
+                        with self.assertRaises(GrooveSerpentError):
+                            run_ffmpeg(command)
+                    else:
+                        run_ffmpeg(command)
+                self.assertTrue(process.waited)
+                self.assertIn("-nostdin", popen.call_args.args[0])
+                self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
     def test_analysis_emits_partial_terminal_rms_window(self) -> None:
         samples = [0.25] * 2_000 + [0.5] * 40
         process = _FakeProcess(io.BytesIO(struct.pack("<2040f", *samples)))

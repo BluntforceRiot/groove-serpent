@@ -156,7 +156,11 @@ def write_valid_evidence_index(
     return index
 
 
-def write_public_release_commit(root: Path) -> Path:
+def write_public_release_commit(
+    root: Path,
+    *,
+    release_version: str = "1.0.0",
+) -> Path:
     marker = root / "PUBLIC_RELEASE_COMMIT.json"
     directories: set[str] = set()
     entries: list[dict[str, object]] = []
@@ -186,12 +190,12 @@ def write_public_release_commit(root: Path) -> Path:
             for item in entries
             if item["kind"] == "file"
         ],
-        release_version="1.0.0",
+        release_version=release_version,
     )
     marker.write_bytes(
         public_release_commit_bytes(
-            release_version="1.0.0",
-            release_directory="groove-serpent-1.0.0",
+            release_version=release_version,
+            release_directory=f"groove-serpent-{release_version}",
             candidate_authority=authority,
             candidate_evidence_sha256=TEST_CANDIDATE_EVIDENCE,
             entries=entries,

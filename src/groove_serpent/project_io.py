@@ -5,17 +5,28 @@ import math
 import os
 import stat
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .errors import ProjectValidationError
 from .migration_fence import assert_no_pending_migration
 from .models import MAX_PROJECT_REVISION, Project, utc_now_iso
 from .portable_names import portable_path_entry_exists
-from .transaction_lock import canonical_target_path, exclusive_target_write_lease
+from .transaction_lock import (
+    TargetWriteLease,
+    canonical_target_path,
+    exclusive_target_write_lease,
+    target_lock_path,
+)
 
 MAX_PROJECT_FILE_BYTES = 64 * 1024 * 1024
 
@@ -136,6 +147,7 @@ def save_project(
     expected_existing_sha256: (
         str | None | _AutomaticExpectedProjectState
     ) = _AUTOMATIC_EXPECTED_PROJECT_STATE,
+    held_write_lease: TargetWriteLease | None = None,
 ) -> None:
     """Save with an OS lease and optional caller-boundary compare-and-swap.
 
@@ -148,6 +160,23 @@ def save_project(
     path = _absolute_without_resolving(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path = canonical_target_path(path)
+    write_context: ContextManager[TargetWriteLease]
+    if held_write_lease is None:
+        write_context = exclusive_target_write_lease(path)
+    else:
+        expected_lock = target_lock_path(path)
+        expected_lock_key = os.path.normcase(
+            os.path.normpath(os.fspath(expected_lock))
+        )
+        held_lock_key = os.path.normcase(
+            os.path.normpath(os.fspath(held_write_lease.path))
+        )
+        if held_lock_key != expected_lock_key:
+            raise ProjectValidationError(
+                "The supplied project write lease belongs to a different target."
+            )
+        held_write_lease.assert_current()
+        write_context = nullcontext(held_write_lease)
     project.validate()
     automatic_expectation = (
         expected_existing_sha256 is _AUTOMATIC_EXPECTED_PROJECT_STATE
@@ -191,7 +220,7 @@ def save_project(
             raise ProjectValidationError(
                 "An NFC/case-equivalent project destination already exists."
             )
-    with exclusive_target_write_lease(path) as write_lease:
+    with write_context as write_lease:
         write_lease.assert_current()
         assert_no_pending_migration(path, "project")
         existed = os.path.lexists(path)
@@ -254,12 +283,16 @@ def save_project(
             suffix=".tmp",
         )
         temporary = Path(temporary_name)
+        temporary_receipt: OwnedFileReceipt | None = None
         try:
             with os.fdopen(
                 descriptor, "w", encoding="utf-8", newline="\n"
             ) as handle:
                 handle.write(payload)
                 handle.flush()
+                temporary_receipt = capture_owned_file_receipt(
+                    temporary, payload.encode("utf-8"), owned_descriptor=handle.fileno()
+                )
                 os.fsync(handle.fileno())
             if original_identity is None:
                 if os.path.lexists(path) or portable_path_entry_exists(path):
@@ -283,7 +316,8 @@ def save_project(
             project.revision = next_revision
             project.updated_at = next_updated_at
         except BaseException:
-            temporary.unlink(missing_ok=True)
+            if temporary_receipt is not None:
+                remove_owned_file_if_present(temporary, temporary_receipt)
             raise
 
 

@@ -9,6 +9,7 @@ let dragChanged = false;
 let selectedMarker = null;
 let currentPreviewEnd = null;
 let boundaryLoop = null;
+let cancelPendingBoundaryAudition = null;
 let analyzerBaselineMarkers = [];
 let analyzerBaselineTrackCount = 0;
 let analyzerTopologyCompatible = true;
@@ -46,9 +47,13 @@ let restorationSelectedCandidate = null;
 let restorationActiveRole = "before";
 let restorationEvidenceRequestId = 0;
 let restorationEvidence = { before: null, proposed: null, removed: null };
+let restorationDecisionJournalToken = null;
 const restorationDecisions = new Map();
 const restorationPreviewed = new Set();
+const restorationPreviewTokens = new Map();
 const restorationAuditioned = new Map();
+const restorationApprovalTokens = new Map();
+const restorationPlaybackProgress = new Map();
 const ENDPOINT_REVIEW_INTENT = "end-at-wanted-music-remove-lead-in-and-runout";
 
 const canvas = document.getElementById("waveform");
@@ -288,6 +293,11 @@ function clearBoundaryHistory() {
 }
 
 function stopBoundaryPreview(updateStatus = true) {
+  if (cancelPendingBoundaryAudition) {
+    const cancel = cancelPendingBoundaryAudition;
+    cancelPendingBoundaryAudition = null;
+    cancel();
+  }
   boundaryLoop = null;
   currentPreviewEnd = null;
   audio.pause();
@@ -640,13 +650,13 @@ function restoreSelectedAnalyzerMarker() {
 }
 
 function auditionRange(startSeconds, endSeconds, label, loop = false) {
-  if (providerBusy || selectedMarker === null) return;
+  if (providerBusy || selectedMarker === null) return Promise.resolve(false);
   const exactDuration = sampleToSeconds(sourceSampleCount());
   const start = Math.max(0, Math.min(exactDuration, startSeconds));
   const end = Math.max(start, Math.min(exactDuration, endSeconds));
   if (end - start < 0.01) {
     setStatus("This marker is too close to the source edge for that audition", "error");
-    return;
+    return Promise.resolve(false);
   }
   currentPreviewEnd = end;
   boundaryLoop = loop ? { start, end } : null;
@@ -657,9 +667,48 @@ function auditionRange(startSeconds, endSeconds, label, loop = false) {
   loopButton.textContent = loop ? "Looping across" : "Loop across";
   auditionStatus.textContent = `${label}: ${formatTime(start)} to ${formatTime(end)}${loop ? ", looping" : ""}.`;
   refreshBoundaryControls();
-  audio.play().catch(() => {
-    stopBoundaryPreview(false);
-    setStatus("Browser could not play this source format", "error");
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout = null;
+    const finish = (played) => {
+      if (settled) return;
+      settled = true;
+      audio.removeEventListener("playing", onPlaying);
+      audio.removeEventListener("error", onError);
+      if (timeout !== null) window.clearTimeout(timeout);
+      if (cancelPendingBoundaryAudition === cancel) cancelPendingBoundaryAudition = null;
+      resolve(played);
+    };
+    const cancel = () => finish(false);
+    const onPlaying = () => {
+      const matchesRange = currentPreviewEnd === end
+        && audio.currentTime >= Math.max(0, start - 0.25)
+        && audio.currentTime < end;
+      finish(matchesRange);
+      if (!matchesRange) {
+        stopBoundaryPreview(false);
+        setStatus("Playback did not start in the requested audition range", "error");
+      }
+    };
+    const onError = () => {
+      finish(false);
+      stopBoundaryPreview(false);
+      setStatus("Browser could not play this source format", "error");
+    };
+    if (cancelPendingBoundaryAudition) cancelPendingBoundaryAudition();
+    cancelPendingBoundaryAudition = cancel;
+    audio.addEventListener("playing", onPlaying);
+    audio.addEventListener("error", onError);
+    timeout = window.setTimeout(() => {
+      finish(false);
+      stopBoundaryPreview(false);
+      setStatus("Browser did not start the requested audition", "error");
+    }, 5000);
+    try {
+      Promise.resolve(audio.play()).catch(onError);
+    } catch (_error) {
+      onError();
+    }
   });
 }
 
@@ -1065,6 +1114,14 @@ audio.addEventListener("timeupdate", () => {
   document.getElementById("evidencePlayheadReadout").textContent =
     `${formatTime(audio.currentTime)} · sample ${Math.round(audio.currentTime * (project?.source?.sample_rate || 0)).toLocaleString()}`;
   drawEvidence();
+});
+
+audio.addEventListener("error", () => {
+  if (!endpointReviewedStart && !endpointReviewedEnd) return;
+  endpointReviewedStart = false;
+  endpointReviewedEnd = false;
+  document.getElementById("endpointIntent").checked = false;
+  renderEndpointProposal();
 });
 
 function clearPlaybackPreview(message) {
@@ -1546,27 +1603,33 @@ function endpointCandidateText(candidate) {
   return `${candidate.start_sample.toLocaleString()} – ${candidate.end_sample_exclusive.toLocaleString()}`;
 }
 
+function proposedEndpoint(scope, kind) {
+  const boundary = scope?.[kind];
+  return boundary?.status === "proposed" && Number.isSafeInteger(boundary.sample)
+    ? boundary
+    : null;
+}
+
 function updateEndpointControls() {
   const scope = endpointScope();
-  const proposed = scope?.status === "proposed"
-    && Number.isSafeInteger(scope.proposed_music_start_sample)
-    && Number.isSafeInteger(scope.proposed_music_end_sample_exclusive);
+  const proposedStart = proposedEndpoint(scope, "start");
+  const proposedEnd = proposedEndpoint(scope, "end");
+  const anyReviewed = (proposedStart && endpointReviewedStart)
+    || (proposedEnd && endpointReviewedEnd);
   document.getElementById("analyzeEndpoints").disabled =
     !project || providerBusy || projectConflict;
   document.getElementById("reviewEndpointStart").disabled =
-    providerBusy || !proposed;
+    providerBusy || !proposedStart;
   document.getElementById("reviewEndpointEnd").disabled =
-    providerBusy || !proposed;
+    providerBusy || !proposedEnd;
   document.getElementById("endpointIntent").disabled =
-    providerBusy || !proposed || !endpointReviewedStart || !endpointReviewedEnd;
+    providerBusy || !anyReviewed;
   document.getElementById("rejectEndpoints").disabled =
     providerBusy || !endpointProposal;
   document.getElementById("acceptEndpoints").disabled =
     providerBusy
     || dirty
-    || !proposed
-    || !endpointReviewedStart
-    || !endpointReviewedEnd
+    || !anyReviewed
     || !document.getElementById("endpointIntent").checked;
 }
 
@@ -1593,20 +1656,35 @@ function renderEndpointProposal() {
     return;
   }
   body.classList.remove("hidden");
-  const proposed = scope.status === "proposed";
+  const proposedStart = proposedEndpoint(scope, "start");
+  const proposedEnd = proposedEndpoint(scope, "end");
+  const actionable = Boolean(proposedStart || proposedEnd);
   const badge = document.getElementById("endpointProposalBadge");
-  badge.textContent = proposed ? "SUGGESTION · REVIEW REQUIRED" : "ABSTAINED · DO NOT APPLY";
-  badge.className = `endpoint-badge${proposed ? "" : " abstained"}`;
+  badge.textContent = scope.status === "proposed"
+    ? "TWO SUGGESTIONS · REVIEW REQUIRED"
+    : scope.status === "partial"
+      ? "ONE SUGGESTION · OTHER EDGE ABSTAINED"
+      : "ABSTAINED · DO NOT APPLY";
+  badge.className = `endpoint-badge${scope.status === "proposed" ? "" : " abstained"}`;
   document.getElementById("endpointProposalIdentity").textContent =
     `proposal ${endpointProposal.proposal_sha256}`;
   addEvidenceMetric(metrics, "Scope", `${scope.label} · ${scope.scope_start_sample.toLocaleString()} – ${scope.scope_end_sample_exclusive.toLocaleString()}`);
   addEvidenceMetric(metrics, "Current start", `${project.tracks[0].start_sample.toLocaleString()} · ${formatTime(project.tracks[0].start_seconds)}`);
   addEvidenceMetric(metrics, "Current end", `${project.tracks.at(-1).end_sample.toLocaleString()} · ${formatTime(project.tracks.at(-1).end_seconds)}`);
-  if (proposed) {
-    addEvidenceMetric(metrics, "Proposed music start", `${scope.proposed_music_start_sample.toLocaleString()} · ${formatTime(sampleToSeconds(scope.proposed_music_start_sample))}`);
-    addEvidenceMetric(metrics, "Proposed music end", `${scope.proposed_music_end_sample_exclusive.toLocaleString()} · ${formatTime(sampleToSeconds(scope.proposed_music_end_sample_exclusive))}`);
-    addEvidenceMetric(metrics, "Cross-family confidence", `${Math.round(scope.confidence * 100)}%`);
-  }
+  addEvidenceMetric(
+    metrics,
+    "Proposed music start",
+    proposedStart
+      ? `${proposedStart.sample.toLocaleString()} · ${formatTime(sampleToSeconds(proposedStart.sample))} · ${Math.round(proposedStart.confidence * 100)}%`
+      : "Abstained — keep the current start",
+  );
+  addEvidenceMetric(
+    metrics,
+    "Proposed music end",
+    proposedEnd
+      ? `${proposedEnd.sample.toLocaleString()} · ${formatTime(sampleToSeconds(proposedEnd.sample))} · ${Math.round(proposedEnd.confidence * 100)}%`
+      : "Abstained — keep the current end",
+  );
   const evidence = scope.evidence || {};
   const families = evidence.family_candidates || {};
   addEvidenceMetric(metrics, "Waveform / energy family", endpointCandidateText(families.waveform_energy));
@@ -1614,15 +1692,13 @@ function renderEndpointProposal() {
   const transition = evidence.transition_context || {};
   addEvidenceMetric(metrics, "Quiet context before / after", `${Number(transition.quiet_before_start_samples || 0).toLocaleString()} / ${Number(transition.quiet_after_end_samples || 0).toLocaleString()} samples`);
   addEvidenceMetric(metrics, "Quiet tonal context before / after", `${Number(transition.quiet_tonal_before_start_samples || 0).toLocaleString()} / ${Number(transition.quiet_tonal_after_end_samples || 0).toLocaleString()} samples`);
-  for (const reason of scope.reasons || []) {
-    const item = document.createElement("li");
-    item.textContent = String(reason).replaceAll("_", " ");
-    reasons.append(item);
-  }
-  if (!(scope.reasons || []).length) {
-    const item = document.createElement("li");
-    item.textContent = "Independent waveform and spectral families agree within policy.";
-    reasons.append(item);
+  for (const kind of ["start", "end"]) {
+    const boundary = scope[kind];
+    for (const reason of boundary?.reasons || []) {
+      const item = document.createElement("li");
+      item.textContent = `${kind}: ${String(reason).replaceAll("_", " ")}`;
+      reasons.append(item);
+    }
   }
   for (const event of evidence.needle_confirmations || []) {
     const item = document.createElement("div");
@@ -1640,14 +1716,20 @@ function renderEndpointProposal() {
     empty.textContent = "No protected needle event confirmed near the structural anchors.";
     needle.append(empty);
   }
-  document.getElementById("endpointReviewProgress").textContent = proposed
-    ? `Start ${endpointReviewedStart ? "reviewed" : "pending"} · End ${endpointReviewedEnd ? "reviewed" : "pending"}`
+  const startProgress = proposedStart
+    ? (endpointReviewedStart ? "reviewed" : "pending")
+    : "abstained";
+  const endProgress = proposedEnd
+    ? (endpointReviewedEnd ? "reviewed" : "pending")
+    : "abstained";
+  document.getElementById("endpointReviewProgress").textContent = actionable
+    ? `Start ${startProgress} · End ${endProgress}`
     : "The detector abstained. Keep current endpoints and inspect the stated ambiguity.";
   setEndpointStatus(
-    proposed
-      ? "A project- and source-bound suggestion is ready. It remains unapplied until you review both ends and accept it."
+    actionable
+      ? "Project- and source-bound suggestions are ready. Each edge remains unapplied until you audition and explicitly select it."
       : "Endpoint analysis abstained. No marker can be accepted from this evidence.",
-    proposed ? "" : "error",
+    actionable ? "" : "error",
   );
   updateEndpointControls();
 }
@@ -1701,21 +1783,29 @@ async function analyzeEndpoints() {
   }
 }
 
-function reviewEndpointBoundary(kind) {
+async function reviewEndpointBoundary(kind) {
   const scope = endpointScope();
-  if (!scope || scope.status !== "proposed" || providerBusy) return;
+  const boundary = proposedEndpoint(scope, kind);
+  if (!boundary || providerBusy) return;
   const start = kind === "start";
-  const sample = start
-    ? scope.proposed_music_start_sample
-    : scope.proposed_music_end_sample_exclusive;
+  const sample = boundary.sample;
   if (!Number.isSafeInteger(sample)) return;
   selectMarker(start ? 0 : project.tracks.length);
   focusEvidenceAtSample(Math.max(0, Math.min(sourceSampleCount() - 1, sample)));
-  auditionRange(
+  if (start) endpointReviewedStart = false;
+  else endpointReviewedEnd = false;
+  renderEndpointProposal();
+  const played = await auditionRange(
     sampleToSeconds(sample) - 3,
     sampleToSeconds(sample) + 3,
     `Auditioning proposed music ${kind}`,
   );
+  if (!played) {
+    if (start) endpointReviewedStart = false;
+    else endpointReviewedEnd = false;
+    renderEndpointProposal();
+    return;
+  }
   if (start) endpointReviewedStart = true;
   else endpointReviewedEnd = true;
   renderEndpointProposal();
@@ -1754,7 +1844,7 @@ async function rejectEndpointProposal() {
 async function acceptEndpointProposal() {
   if (!endpointProposal || providerBusy || dirty) return;
   setProviderBusy(true);
-  setEndpointStatus("Applying only the two explicitly reviewed outer markers…", "busy");
+  setEndpointStatus("Applying only the explicitly reviewed outer markers…", "busy");
   try {
     const payload = await postJson("/api/endpoints/accept", {
       ...projectIdentityReceipt(),
@@ -1776,8 +1866,15 @@ async function acceptEndpointProposal() {
     document.getElementById("revisionIdentity").textContent = `REVISION ${project.revision}`;
     document.getElementById("saveIdentity").textContent = "STATE · all changes saved";
     renderEndpointProposal();
+    const applied = [];
+    if (Number.isSafeInteger(payload.accepted_start_sample)) {
+      applied.push(`start ${payload.accepted_start_sample.toLocaleString()}`);
+    }
+    if (Number.isSafeInteger(payload.accepted_end_sample_exclusive)) {
+      applied.push(`end ${payload.accepted_end_sample_exclusive.toLocaleString()}`);
+    }
     setEndpointStatus(
-      `Accepted exact samples ${payload.accepted_start_sample.toLocaleString()} – ${payload.accepted_end_sample_exclusive.toLocaleString()}; the reversible history transition is #${payload.history_sequence}.`,
+      `Accepted ${applied.join(" and ")}; resulting range ${payload.resulting_start_sample.toLocaleString()} – ${payload.resulting_end_sample_exclusive.toLocaleString()}. Reversible history transition #${payload.history_sequence}.`,
       "success",
     );
   } catch (error) {
@@ -1801,10 +1898,10 @@ function speedValues() {
   if (
     !Number.isFinite(capture) || !Number.isFinite(intended) || !Number.isFinite(fine)
     || capture < 10 || capture > 100 || intended < 10 || intended > 100
-    || fine < 0.5 || fine > 2
+    || fine < 0.25 || fine > 4
   ) return null;
   const factor = capture / intended * fine;
-  if (!Number.isFinite(factor) || factor < 0.5 || factor > 2) return null;
+  if (!Number.isFinite(factor) || factor < 0.25 || factor > 2) return null;
   return { capture, intended, fine, factor };
 }
 
@@ -1900,9 +1997,9 @@ function initializeSpeedControls() {
   speedInputs.intended.value = Number.isFinite(intended) && intended >= 10 && intended <= 100
     ? intended.toFixed(6)
     : "33.333333";
-  speedInputs.fine.value = Number.isFinite(fine) && fine >= 0.5 && fine <= 2
+  speedInputs.fine.value = Number.isFinite(fine) && fine >= 0.25 && fine <= 4
     ? fine.toFixed(6)
-    : (Number.isFinite(fallbackFactor) && fallbackFactor >= 0.5 && fallbackFactor <= 2
+    : (Number.isFinite(fallbackFactor) && fallbackFactor >= 0.25 && fallbackFactor <= 2
       ? fallbackFactor.toFixed(6)
       : "1.000000");
   listeningOutput = "archival";
@@ -1998,7 +2095,7 @@ function updateRestorationTransportReadiness() {
     const candidateId = restorationPreview?.candidates?.[0]?.id;
     const heard = candidateId ? restorationAuditionedRoles(candidateId).size : 0;
     restorationTransportStatus.textContent =
-      `Sample-aligned audio + visuals ready · source samples ${Number(alignment.source_start_sample).toLocaleString()}–${Number(alignment.source_end_sample_exclusive).toLocaleString()} · ${heard}/3 signals auditioned.`;
+      `Sample-aligned audio + visuals ready · source samples ${Number(alignment.source_start_sample).toLocaleString()}–${Number(alignment.source_end_sample_exclusive).toLocaleString()} · ${heard}/3 signals played through the changed window.`;
   } else if (audioReady) {
     restorationTransportStatus.textContent =
       "Matched audio geometry is ready; aligned visual evidence is loading.";
@@ -2209,6 +2306,7 @@ function clearRestorationPreview() {
   restorationActiveRole = "before";
   restorationEvidence = { before: null, proposed: null, removed: null };
   restorationAuditioned.clear();
+  restorationPlaybackProgress.clear();
   document.getElementById("restorationPreviewTitle").textContent = "Select a candidate";
   document.getElementById("restorationPreviewProof").textContent =
     "Original and Proposed remain at identical gain. Removed Signal is a declared-gain residue.";
@@ -2238,7 +2336,11 @@ function clearRestorationWorkflow() {
   restorationRecipe = null;
   restorationDecisions.clear();
   restorationPreviewed.clear();
+  restorationPreviewTokens.clear();
   restorationAuditioned.clear();
+  restorationApprovalTokens.clear();
+  restorationPlaybackProgress.clear();
+  restorationDecisionJournalToken = null;
   clearRestorationPreview();
   renderRestorationCandidates();
 }
@@ -2292,6 +2394,94 @@ function restorationApprovalReady(candidateId) {
     && ["before", "proposed", "removed"].every((role) => heard.has(role));
 }
 
+function restorationChangedWindow(candidateId) {
+  const sampleRate = Number(project?.source?.sample_rate);
+  const windows = restorationPreview?.context?.repair_windows;
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || !Array.isArray(windows)) {
+    return null;
+  }
+  const window = windows.find((item) => item?.candidate_id === candidateId);
+  const startFrame = Number(window?.start_in_preview);
+  const endFrame = Number(window?.end_in_preview_exclusive);
+  if (
+    !Number.isInteger(startFrame)
+    || !Number.isInteger(endFrame)
+    || startFrame < 0
+    || endFrame <= startFrame
+  ) return null;
+  return { start: startFrame / sampleRate, end: endFrame / sampleRate };
+}
+
+function restorationPlaybackSource(role, player) {
+  const expected = restorationPreview?.audio?.[role]?.url;
+  const source = player.currentSrc || player.src;
+  return expected && source === new URL(expected, window.location.href).href ? source : null;
+}
+
+function beginRestorationPlaybackProgress(role, player) {
+  const current = Number(player.currentTime);
+  const source = restorationPlaybackSource(role, player);
+  restorationPlaybackProgress.delete(role);
+  if (
+    player.paused || player.ended || player.seeking || player.playbackRate !== 1
+    || !source || !Number.isFinite(current)
+  ) return;
+  restorationPlaybackProgress.set(role, {
+    startTime: current,
+    lastTime: current,
+    lastObserved: performance.now(),
+    source,
+    previewToken: restorationPreview?.token,
+  });
+}
+
+function creditRestorationChangedWindow(role, player) {
+  const candidateId = restorationPreview?.candidates?.[0]?.id;
+  const state = restorationPlaybackProgress.get(role);
+  const current = Number(player.currentTime);
+  if (
+    !candidateId
+    || !restorationPreviewed.has(candidateId)
+    || (player.paused && !(player.ended && current === Number(player.duration)))
+    || player.seeking
+    || player.playbackRate !== 1
+    || !restorationPlaybackSource(role, player)
+    || !Number.isFinite(current)
+  ) {
+    restorationPlaybackProgress.delete(role);
+    return;
+  }
+  if (!state) {
+    beginRestorationPlaybackProgress(role, player);
+    return;
+  }
+  const now = performance.now();
+  const elapsed = (now - state.lastObserved) / 1000;
+  const previous = state.lastTime;
+  // Missing observations or media-time jumps are not proof of uninterrupted listening.
+  // Allow ordinary timer/media-clock jitter, but never bridge a one-second observation gap.
+  if (
+    state.previewToken !== restorationPreview.token
+    || state.source !== restorationPlaybackSource(role, player)
+    || current < previous || elapsed < 0 || elapsed > 1
+    || current - previous > elapsed + 0.05
+  ) {
+    restorationPlaybackProgress.delete(role);
+    return;
+  }
+  state.lastTime = current;
+  state.lastObserved = now;
+  if (current <= previous) return;
+  const changed = restorationChangedWindow(candidateId);
+  if (!changed || state.startTime > changed.start || current < changed.end) return;
+  const heard = restorationAuditionedRoles(candidateId);
+  if (heard.has(role)) return;
+  heard.add(role);
+  restorationAuditioned.set(candidateId, heard);
+  updateRestorationTransportReadiness();
+  renderRestorationCandidates();
+}
+
 function restorationReviewNeedsNoDerivative() {
   const coverage = currentRestorationCoverage();
   return Boolean(
@@ -2323,6 +2513,14 @@ function updateRestorationControls() {
   const coverage = currentRestorationCoverage();
   const completeCoverage = coverage?.restoration_status === "complete";
   const noDerivative = restorationReviewNeedsNoDerivative();
+  const approvalsCurrent = candidates.every((candidate) => {
+    const decision = restorationDecisions.get(candidate.id);
+    return decision?.decision !== "approved"
+      || (
+        restorationApprovalReady(candidate.id)
+        && restorationApprovalTokens.has(candidate.id)
+      );
+  });
   document.getElementById("restorationDecisionSummary").textContent = candidates.length
     ? `${approved} approved · ${rejected} kept original · ${protectedCount} protected · ${pending} pending`
     : noDerivative
@@ -2343,7 +2541,12 @@ function updateRestorationControls() {
   document.getElementById("startRestorationScan").disabled = providerBusy || !project;
   document.getElementById("useEvidenceWindow").disabled = providerBusy || !evidencePayload;
   document.getElementById("saveRestorationRecipe").disabled =
-    providerBusy || !restorationScan || pending !== 0 || candidates.length === 0;
+    providerBusy
+    || !restorationScan
+    || pending !== 0
+    || candidates.length === 0
+    || !restorationDecisionJournalToken
+    || !approvalsCurrent;
   document.getElementById("renderRestoredSide").disabled =
     providerBusy || !restorationRecipe || approved === 0 || !completeCoverage;
   document.getElementById("renderRestoredSide").title = completeCoverage
@@ -2382,21 +2585,95 @@ function renderRestorationSummary() {
   }
 }
 
-function setRestorationDecision(candidate, decision) {
-  restorationRecipe = null;
-  if (decision === "approved" && !restorationApprovalReady(candidate.id)) {
+async function persistRestorationDecision(candidate, decision, classification = "") {
+  const previewToken = restorationPreviewTokens.get(candidate.id);
+  if (!previewToken) {
     setRestorationStatus(
-      "Load the aligned proof and audition Original, Proposed, and Removed Signal before approval",
+      "Create the exact aligned preview before recording an owner decision",
       "error",
     );
     return;
   }
-  restorationDecisions.set(candidate.id, {
-    candidate_id: candidate.id,
-    decision,
-    ...(decision === "protected" ? { classification: "" } : {}),
-  });
-  renderRestorationCandidates();
+  if (decision === "approved" && !restorationApprovalReady(candidate.id)) {
+    setRestorationStatus(
+      "Play Original, Proposed, and Removed Signal through the changed sample window before approval",
+      "error",
+    );
+    return;
+  }
+  const operation = await beginRestorationArtifactOperation();
+  if (!operation) return;
+  setRestorationStatus("Recording the hash-bound owner decisionâ€¦", "busy");
+  try {
+    const ownerDecision = {
+      candidate_id: candidate.id,
+      decision,
+      ...(decision === "protected" ? { classification } : {}),
+      ...(decision === "approved"
+        ? { auditioned_roles: ["before", "proposed", "removed"] }
+        : {}),
+    };
+    const payload = await postJson("/api/restoration/decision", {
+      ...projectIdentityReceipt(),
+      scan_token: restorationScan.token,
+      preview_token: previewToken,
+      decision: ownerDecision,
+    });
+    if (operation.id !== providerOperationId) return;
+    project.source_receipt = payload.source_receipt;
+    restorationRecipe = null;
+    restorationDecisionJournalToken = payload.decision_journal?.token || null;
+    if (decision === "undecided") {
+      restorationDecisions.delete(candidate.id);
+      restorationApprovalTokens.delete(candidate.id);
+    } else {
+      restorationDecisions.set(candidate.id, {
+        candidate_id: candidate.id,
+        decision,
+        ...(decision === "protected" ? { classification } : {}),
+      });
+      if (decision === "approved" && payload.owner_approval_token) {
+        restorationApprovalTokens.set(candidate.id, payload.owner_approval_token);
+      } else {
+        restorationApprovalTokens.delete(candidate.id);
+      }
+    }
+    renderRestorationCandidates();
+    setRestorationStatus(
+      decision === "approved"
+        ? "Owner-channel approval recorded for this browser session"
+        : decision === "undecided"
+          ? "Candidate returned to undecided"
+          : "Owner decision saved and will survive restart",
+      "success",
+    );
+  } catch (error) {
+    if (!handleRestorationError(error)) setRestorationStatus(error.message, "error");
+  } finally {
+    endProviderOperation(operation.id);
+  }
+}
+
+function setRestorationDecision(candidate, decision) {
+  if (decision === "protected") {
+    restorationRecipe = null;
+    restorationApprovalTokens.delete(candidate.id);
+    const current = restorationDecisions.get(candidate.id);
+    const classification = current?.decision === "protected"
+      ? current.classification || ""
+      : "";
+    restorationDecisions.set(candidate.id, {
+      candidate_id: candidate.id,
+      decision,
+      classification,
+    });
+    renderRestorationCandidates();
+    if (classification) {
+      void persistRestorationDecision(candidate, decision, classification);
+    }
+    return;
+  }
+  void persistRestorationDecision(candidate, decision);
 }
 
 function renderRestorationCandidates() {
@@ -2443,11 +2720,12 @@ function renderRestorationCandidates() {
       button.className = `${value === "protected" ? "protected " : ""}${current?.decision === value ? "active" : ""}`.trim();
       const approvalReady = restorationApprovalReady(candidate.id);
       button.disabled = providerBusy
+        || !restorationPreviewed.has(candidate.id)
         || (value === "approved" && (!candidate.repairable || !approvalReady));
-      button.title = value === "approved" && !restorationPreviewed.has(candidate.id)
-        ? "Create and load the aligned lossless proof first"
+      button.title = !restorationPreviewed.has(candidate.id)
+        ? "Create and load the aligned lossless proof before recording a decision"
         : value === "approved" && !approvalReady
-          ? "Play Original, Proposed, and Removed Signal before approval"
+          ? "Play all three roles through the changed sample window before approval"
           : "";
       button.addEventListener("click", () => setRestorationDecision(candidate, value));
       decisions.append(button);
@@ -2472,13 +2750,11 @@ function renderRestorationCandidates() {
     select.value = current?.classification || "";
     select.disabled = providerBusy;
     select.addEventListener("change", () => {
-      restorationRecipe = null;
-      restorationDecisions.set(candidate.id, {
-        candidate_id: candidate.id,
-        decision: "protected",
-        classification: select.value,
-      });
-      updateRestorationControls();
+      if (select.value) {
+        void persistRestorationDecision(candidate, "protected", select.value);
+      } else {
+        void persistRestorationDecision(candidate, "undecided");
+      }
     });
     protection.append(select);
     controls.append(protection);
@@ -2499,14 +2775,16 @@ async function showRestorationPreview(preview) {
   restorationPreview = preview;
   for (const candidate of preview?.candidates || []) {
     restorationAuditioned.set(candidate.id, new Set());
+    restorationApprovalTokens.delete(candidate.id);
   }
+  restorationPlaybackProgress.clear();
   const candidate = preview?.candidates?.[0];
   document.getElementById("restorationPreviewTitle").textContent = candidate
     ? `${candidate.type} at ${formatTime(candidate.peak_frame / project.source.sample_rate)}`
     : "Lossless candidate audition";
   const audition = preview?.audition || {};
   document.getElementById("restorationPreviewProof").textContent =
-    `Original gain ${Number(audition.before_linear_gain ?? 1).toFixed(1)}× · Proposed gain ${Number(audition.proposed_linear_gain ?? 1).toFixed(1)}× · Removed Signal ${Number(audition.removed_linear_gain ?? 1).toFixed(1)}× declared residue gain. Audition all three signals before Apply Proposed becomes available.`;
+    `Original gain ${Number(audition.before_linear_gain ?? 1).toFixed(1)}× · Proposed gain ${Number(audition.proposed_linear_gain ?? 1).toFixed(1)}× · Removed Signal ${Number(audition.removed_linear_gain ?? 1).toFixed(1)}× declared residue gain. Play each signal through the changed sample window before Apply Proposed becomes available.`;
   for (const [role, player] of Object.entries(restorationAudio)) {
     const entry = preview?.audio?.[role];
     if (entry?.url) {
@@ -2556,8 +2834,17 @@ async function loadRestorationStatus() {
     restorationPreview = payload.current_preview?.stale ? null : payload.current_preview;
     restorationDecisions.clear();
     restorationPreviewed.clear();
+    restorationPreviewTokens.clear();
     restorationAuditioned.clear();
+    restorationApprovalTokens.clear();
+    restorationPlaybackProgress.clear();
+    restorationDecisionJournalToken = payload.decision_journal?.current
+      ? payload.decision_journal.token
+      : null;
     restorationSelectedCandidate = null;
+    for (const decision of payload.current_decisions || []) {
+      restorationDecisions.set(decision.candidate_id, { ...decision });
+    }
     for (const decision of restorationRecipe?.decisions || []) {
       restorationDecisions.set(decision.candidate_id, { ...decision });
     }
@@ -2566,6 +2853,7 @@ async function loadRestorationStatus() {
       if (visualsReady) {
         for (const candidate of restorationPreview.candidates || []) {
           restorationPreviewed.add(candidate.id);
+          restorationPreviewTokens.set(candidate.id, restorationPreview.token);
         }
       }
     } else {
@@ -2618,6 +2906,10 @@ document.getElementById("startRestorationScan").addEventListener("click", async 
     restorationRecipe = null;
     restorationDecisions.clear();
     restorationPreviewed.clear();
+    restorationPreviewTokens.clear();
+    restorationApprovalTokens.clear();
+    restorationPlaybackProgress.clear();
+    restorationDecisionJournalToken = null;
     clearRestorationPreview();
     renderRestorationCandidates();
     const coverage = currentRestorationCoverage();
@@ -2660,6 +2952,7 @@ async function previewRestorationCandidate(candidate) {
     const visualsReady = await showRestorationPreview(payload.preview);
     if (!visualsReady || operation.id !== providerOperationId) return;
     restorationPreviewed.add(candidate.id);
+    restorationPreviewTokens.set(candidate.id, payload.preview.token);
     renderRestorationCandidates();
     setRestorationStatus(
       "Preview ready with matched audio and sample-aligned visual evidence",
@@ -2681,14 +2974,26 @@ document.getElementById("saveRestorationRecipe").addEventListener("click", async
     const decisions = restorationScan.candidates.map((candidate) => ({
       ...restorationDecisions.get(candidate.id),
     }));
+    const previewTokens = [...new Set(
+      decisions
+        .filter((decision) => decision.decision === "approved")
+        .map((decision) => restorationPreviewTokens.get(decision.candidate_id))
+        .filter(Boolean),
+    )];
     const payload = await postJson("/api/restoration/recipe", {
       ...projectIdentityReceipt(),
       scan_token: restorationScan.token,
+      preview_tokens: previewTokens,
       decisions,
+      decision_journal_token: restorationDecisionJournalToken,
+      owner_approval_tokens: decisions
+        .filter((decision) => decision.decision === "approved")
+        .map((decision) => restorationApprovalTokens.get(decision.candidate_id)),
     });
     if (operation.id !== providerOperationId) return;
     project.source_receipt = payload.source_receipt;
     restorationRecipe = payload.recipe;
+    restorationApprovalTokens.clear();
     updateRestorationControls();
     setRestorationStatus("Reviewed restoration recipe saved", "success");
   } catch (error) {
@@ -2730,35 +3035,37 @@ for (const [role, player] of Object.entries(restorationAudio)) {
   player.addEventListener("play", () => {
     audio.pause();
     restorationActiveRole = role;
+    restorationPlaybackProgress.delete(role);
     for (const other of Object.values(restorationAudio)) {
       if (other !== player) other.pause();
     }
     restorationPlayPause.textContent = "Pause";
     updateRestorationRoleView();
   });
-  player.addEventListener("playing", () => {
-    const candidateId = restorationPreview?.candidates?.[0]?.id;
-    if (!candidateId || !restorationPreviewed.has(candidateId)) return;
-    const heard = restorationAuditionedRoles(candidateId);
-    heard.add(role);
-    restorationAuditioned.set(candidateId, heard);
-    updateRestorationTransportReadiness();
-    renderRestorationCandidates();
-  });
+  player.addEventListener("playing", () => beginRestorationPlaybackProgress(role, player));
   player.addEventListener("pause", () => {
+    restorationPlaybackProgress.delete(role);
     if (role === restorationActiveRole) restorationPlayPause.textContent = "Play";
   });
   player.addEventListener("timeupdate", () => {
     if (role !== restorationActiveRole) return;
+    creditRestorationChangedWindow(role, player);
     updateRestorationTransportTime();
     drawRestorationEvidence(role);
   });
+  for (const event of [
+    "seeking", "seeked", "ratechange", "waiting", "stalled", "loadstart", "emptied", "abort",
+  ]) {
+    player.addEventListener(event, () => restorationPlaybackProgress.delete(role));
+  }
   player.addEventListener("ended", () => {
+    restorationPlaybackProgress.delete(role);
     if (role !== restorationActiveRole) return;
     restorationPlayPause.textContent = "Play";
     updateRestorationTransportTime(player.duration);
   });
   player.addEventListener("error", () => {
+    restorationPlaybackProgress.delete(role);
     if (!player.getAttribute("src")) return;
     restorationTransportStatus.textContent =
       `The browser could not decode the ${role} lossless preview.`;
@@ -2782,8 +3089,9 @@ restorationPlayPause.addEventListener("click", () => {
 restorationSeek.addEventListener("input", () => {
   const requested = Number(restorationSeek.value);
   if (!Number.isFinite(requested)) return;
-  for (const player of Object.values(restorationAudio)) {
+  for (const [role, player] of Object.entries(restorationAudio)) {
     if (Number.isFinite(Number(player.duration)) && player.duration > 0) {
+      restorationPlaybackProgress.delete(role);
       player.currentTime = Math.min(requested, Math.max(0, player.duration - 0.001));
     }
   }

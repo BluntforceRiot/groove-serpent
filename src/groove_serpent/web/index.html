@@ -219,12 +219,12 @@
         <div class="endpoint-audition" role="group" aria-label="Endpoint evidence audition">
           <button id="reviewEndpointStart" type="button" disabled>Audition + inspect proposed start</button>
           <button id="reviewEndpointEnd" type="button" disabled>Audition + inspect proposed end</button>
-          <span id="endpointReviewProgress" class="quiet">Review both endpoints before acceptance.</span>
+          <span id="endpointReviewProgress" class="quiet">Review each endpoint you want to apply.</span>
         </div>
         <label class="endpoint-intent">
           <input id="endpointIntent" type="checkbox" disabled>
-          I inspected and auditioned both suggestions. End at the final wanted music, remove lead-in
-          and runout, and preserve quiet intros, fades, and musical tails.
+          I inspected and auditioned every endpoint selected for this edit. Apply only those exact
+          samples; preserve any edge where analysis abstained or I did not review it.
         </label>
         <div class="endpoint-decisions">
           <button id="rejectEndpoints" type="button" disabled>Reject suggestion</button>
@@ -245,7 +245,7 @@
         <div class="speed-controls">
           <label>Measured capture RPM<input id="speedCaptureRpm" type="number" min="10" max="100" step="0.000001" inputmode="decimal" value="33.333333"></label>
           <label>Intended RPM<input id="speedIntendedRpm" type="number" min="10" max="100" step="0.000001" inputmode="decimal" value="33.333333"></label>
-          <label>Fine factor<input id="speedFineFactor" type="number" min="0.5" max="2" step="0.000001" inputmode="decimal" value="1.000000"></label>
+          <label>Fine factor<input id="speedFineFactor" type="number" min="0.25" max="4" step="0.000001" inputmode="decimal" value="1.000000"></label>
           <div class="rpm-presets" aria-label="Intended record speed presets">
             <button type="button" data-intended-rpm="16.666667">16⅔ RPM</button>
             <button type="button" data-intended-rpm="33.333333">33⅓ RPM</button>

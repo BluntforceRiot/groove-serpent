@@ -80,6 +80,12 @@ def _stat_incarnation(value: os.stat_result) -> tuple[str, int]:
     birth = getattr(value, "st_birthtime_ns", None)
     if birth is not None:
         return "stat-birthtime", int(birth)
+    # CPython before 3.12 exposes Windows creation time only as st_ctime_ns.
+    # Python 3.12+ takes the branch above. Windows creation time is stable over
+    # ordinary writes and renames and is therefore not the mutable POSIX ctime
+    # fallback rejected by publication paths.
+    if os.name == "nt":
+        return "windows-creation-time", int(value.st_ctime_ns)
     return "ctime-fallback", int(value.st_ctime_ns)
 
 
@@ -132,6 +138,8 @@ def _path_incarnation(path: Path, value: os.stat_result) -> tuple[str, int]:
     native = getattr(value, "st_birthtime_ns", None)
     if native is not None:
         return "stat-birthtime", int(native)
+    if os.name == "nt":
+        return "windows-creation-time", int(value.st_ctime_ns)
     statx_birth = _linux_statx_birthtime(
         _AT_FDCWD,
         os.fsencode(path),
@@ -175,6 +183,8 @@ def _descriptor_incarnation(
     native = getattr(value, "st_birthtime_ns", None)
     if native is not None:
         return "stat-birthtime", int(native)
+    if os.name == "nt":
+        return "windows-creation-time", int(value.st_ctime_ns)
     statx_birth = _linux_statx_birthtime(
         descriptor,
         b"",

@@ -20,16 +20,24 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from . import __version__
-from .atomic_create import rename_no_replace
-from .errors import GrooveSerpentError
-from .errors import ProjectValidationError
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
+from .errors import GrooveSerpentError, ProjectValidationError
+from .file_identity import stable_creation_time_ns
 from .migration_commit import quarantine_path_no_replace, read_plain_bound
+from .strict_json import decode_strict_json
 
 
 SNAPSHOT_LEASE_SCHEMA = "groove-serpent.snapshot-lease/2"
@@ -55,8 +63,19 @@ _LEGACY_CACHE_QUARANTINE_PATTERN = re.compile(
     r"(?:cache-release|cache-cleanup|failed-cache-acquire)-"
     r"[0-9a-f]{32}\.preserved\Z"
 )
+_SNAPSHOT_CACHE_THREAD_LOCK = threading.RLock()
+_WINDOWS_SHARING_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32)
 
 OwnerStatus = Literal["live", "dead", "reused", "unknown"]
+
+
+def _pause_for_windows_sharing_retry(attempt: int) -> bool:
+    """Pause briefly after a transient Windows sharing failure."""
+
+    if os.name != "nt" or attempt >= len(_WINDOWS_SHARING_RETRY_DELAYS):
+        return False
+    time.sleep(_WINDOWS_SHARING_RETRY_DELAYS[attempt])
+    return True
 
 
 def _utc_now_iso() -> str:
@@ -91,15 +110,11 @@ class _WindowsFileTime(ctypes.Structure):
     _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
 
 
-class _WindowsTimeOfDayInformation(ctypes.Structure):
+class _WindowsBootEnvironmentInformation(ctypes.Structure):
     _fields_ = [
-        ("boot_time", ctypes.c_int64),
-        ("current_time", ctypes.c_int64),
-        ("time_zone_bias", ctypes.c_int64),
-        ("current_time_zone_id", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("boot_time_bias", ctypes.c_uint64),
-        ("sleep_time_bias", ctypes.c_uint64),
+        ("boot_identifier", ctypes.c_ubyte * 16),
+        ("firmware_type", ctypes.c_uint32),
+        ("boot_flags", ctypes.c_uint64),
     ]
 
 
@@ -199,7 +214,13 @@ def _windows_machine_guid() -> str | None:
 
 
 def _windows_boot_session_identity() -> str | None:
-    """Return stable current-boot and logon-session material."""
+    """Return stable current-boot and process-session material.
+
+    ``SystemTimeOfDayInformation`` is intentionally not used: Microsoft
+    documents that payload as opaque, and its internal wall-clock boot time can
+    move when Windows corrects the system clock. The boot-environment identifier
+    is queried dynamically and any unavailable or changed interface fails closed.
+    """
 
     loader: Any = getattr(ctypes, "WinDLL", None)
     if loader is None:
@@ -214,17 +235,22 @@ def _windows_boot_session_identity() -> str | None:
             ctypes.POINTER(ctypes.c_uint32),
         ]
         ntdll.NtQuerySystemInformation.restype = ctypes.c_long
-        details = _WindowsTimeOfDayInformation()
+        details = _WindowsBootEnvironmentInformation()
         returned = ctypes.c_uint32()
         status = int(
             ntdll.NtQuerySystemInformation(
-                3,  # SystemTimeOfDayInformation
+                90,  # SystemBootEnvironmentInformation
                 ctypes.byref(details),
                 ctypes.sizeof(details),
                 ctypes.byref(returned),
             )
         )
-        if status != 0 or int(details.boot_time) <= 0:
+        boot_identifier = bytes(details.boot_identifier)
+        if (
+            status != 0
+            or int(returned.value) < 16
+            or not any(boot_identifier)
+        ):
             return None
         kernel32.ProcessIdToSessionId.argtypes = [
             ctypes.c_uint32,
@@ -236,7 +262,10 @@ def _windows_boot_session_identity() -> str | None:
             return None
     except (AttributeError, OSError, TypeError, ValueError):
         return None
-    return f"boot-filetime:{int(details.boot_time)};session:{int(session.value)}"
+    return (
+        f"boot-identifier:{boot_identifier.hex()};"
+        f"session:{int(session.value)}"
+    )
 
 
 def _process_namespace_identity_windows() -> str | None:
@@ -479,33 +508,46 @@ class SnapshotLeaseMetadata:
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with _SNAPSHOT_CACHE_THREAD_LOCK:
+        raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        temporary_receipt: OwnedFileReceipt | None = None
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                temporary_receipt = capture_owned_file_receipt(
+                    temporary, raw, owned_descriptor=handle.fileno()
+                )
+                os.fsync(handle.fileno())
+            for attempt in range(len(_WINDOWS_SHARING_RETRY_DELAYS) + 1):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if not _pause_for_windows_sharing_retry(attempt):
+                        raise
+        finally:
+            if temporary_receipt is not None:
+                remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 def _load_metadata(path: Path) -> SnapshotLeaseMetadata:
     try:
         raw_bytes, _ = read_plain_bound(path, MAX_SNAPSHOT_LEASE_BYTES)
-        raw = raw_bytes.decode("utf-8")
-        value = json.loads(raw)
+        value = decode_strict_json(raw_bytes)
     except (
         OSError,
         ProjectValidationError,
         UnicodeDecodeError,
         json.JSONDecodeError,
+        RecursionError,
+        ValueError,
     ) as exc:
         raise ValueError(f"Snapshot lease could not be read: {exc}") from exc
     return SnapshotLeaseMetadata.from_dict(value)
@@ -578,7 +620,7 @@ class _DirectoryIdentity:
         *,
         include_birth: bool = True,
     ) -> "_DirectoryIdentity":
-        birth = getattr(value, "st_birthtime_ns", None) if include_birth else None
+        birth = stable_creation_time_ns(value) if include_birth else None
         return cls(
             device=int(value.st_dev),
             inode=int(value.st_ino),
@@ -589,12 +631,22 @@ class _DirectoryIdentity:
 
 
 def _windows_remote_path(path: Path) -> bool:
-    """Return whether Windows exposes the path through a remote filesystem."""
+    """Reject Windows remote paths and unsafe device-namespace spellings."""
 
     if os.name != "nt":
         return False
-    rendered = os.fspath(path)
-    if rendered.startswith(("\\\\", "//")):
+    rendered = os.fspath(path).replace("/", "\\")
+    folded = rendered.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        return True
+    if folded.startswith("\\\\?\\"):
+        extended_local = rendered[4:]
+        if re.match(r"[A-Za-z]:\\", extended_local) is None:
+            return True
+        rendered = extended_local
+    elif rendered.startswith("\\\\"):
+        return True
+    if rendered.startswith("\\\\.\\"):
         return True
     loader: Any = getattr(ctypes, "WinDLL", None)
     if loader is None:
@@ -603,7 +655,8 @@ def _windows_remote_path(path: Path) -> bool:
         kernel32: Any = loader("kernel32", use_last_error=True)
         kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
         kernel32.GetDriveTypeW.restype = ctypes.c_uint32
-        return int(kernel32.GetDriveTypeW(path.anchor)) == 4  # DRIVE_REMOTE
+        anchor = Path(rendered).anchor
+        return int(kernel32.GetDriveTypeW(anchor)) == 4  # DRIVE_REMOTE
     except (AttributeError, OSError, TypeError, ValueError):
         return False
 
@@ -670,31 +723,29 @@ def _directory_size(path: Path) -> int:
 def _lease_directory_identity(
     root: Path, directory: Path
 ) -> _DirectoryIdentity | None:
-    try:
-        junction_probe: Any = getattr(directory, "is_junction", None)
-        if junction_probe is not None and bool(junction_probe()):
-            return None
-        value = directory.lstat()
-        attributes = getattr(value, "st_file_attributes", 0)
-        if int(attributes) & 0x400:  # Windows FILE_ATTRIBUTE_REPARSE_POINT
-            return None
-        name_is_owned = _cache_entry_name_is_owned(directory.name)
-        safe = (
-            directory.parent.resolve() == root.resolve()
-            and name_is_owned
-            and not directory.is_symlink()
-            and stat.S_ISDIR(value.st_mode)
-        )
-        return (
-            _DirectoryIdentity.capture(
-                value,
-                include_birth=not _windows_remote_path(directory),
+    for attempt in range(len(_WINDOWS_SHARING_RETRY_DELAYS) + 1):
+        try:
+            junction_probe: Any = getattr(directory, "is_junction", None)
+            if junction_probe is not None and bool(junction_probe()):
+                return None
+            value = directory.lstat()
+            attributes = getattr(value, "st_file_attributes", 0)
+            if int(attributes) & 0x400:  # Windows FILE_ATTRIBUTE_REPARSE_POINT
+                return None
+            name_is_owned = _cache_entry_name_is_owned(directory.name)
+            safe = (
+                directory.parent.resolve() == root.resolve()
+                and name_is_owned
+                and not directory.is_symlink()
+                and stat.S_ISDIR(value.st_mode)
             )
-            if safe
-            else None
-        )
-    except OSError:
-        return None
+            if not safe or _windows_remote_path(directory):
+                return None
+            return _DirectoryIdentity.capture(value)
+        except OSError:
+            if not _pause_for_windows_sharing_retry(attempt):
+                return None
+    return None
 
 
 def _safe_lease_directory(root: Path, directory: Path) -> bool:
@@ -733,13 +784,25 @@ def _quarantine_lease_directory(
 ) -> tuple[Path | None, bool]:
     """Transfer one cache pathname without deleting whichever object is there."""
 
-    if _lease_directory_identity(root, directory) != expected:
+    with _SNAPSHOT_CACHE_THREAD_LOCK:
+        if _lease_directory_identity(root, directory) != expected:
+            return None, False
+        for attempt in range(len(_WINDOWS_SHARING_RETRY_DELAYS) + 1):
+            try:
+                quarantine = quarantine_path_no_replace(directory, purpose=purpose)
+            except FileNotFoundError:
+                return None, False
+            except PermissionError:
+                if (
+                    _lease_directory_identity(root, directory) == expected
+                    and _pause_for_windows_sharing_retry(attempt)
+                ):
+                    continue
+                return None, False
+            except (OSError, ProjectValidationError):
+                return None, False
+            return quarantine, _lease_directory_identity(root, quarantine) == expected
         return None, False
-    try:
-        quarantine = quarantine_path_no_replace(directory, purpose=purpose)
-    except (FileNotFoundError, OSError, ProjectValidationError):
-        return None, False
-    return quarantine, _lease_directory_identity(root, quarantine) == expected
 
 
 def _restore_quarantined_directory(
@@ -760,6 +823,17 @@ def _destroy_owned_quarantine(
     expected: _DirectoryIdentity,
 ) -> bool:
     """Destroy only a random quarantine that still has its owned identity."""
+
+    with _SNAPSHOT_CACHE_THREAD_LOCK:
+        return _destroy_owned_quarantine_locked(root, quarantine, expected)
+
+
+def _destroy_owned_quarantine_locked(
+    root: Path,
+    quarantine: Path,
+    expected: _DirectoryIdentity,
+) -> bool:
+    """Destroy an owned quarantine while the process-local cache lock is held."""
 
     if _lease_directory_identity(root, quarantine) != expected:
         return False
@@ -867,6 +941,13 @@ class CacheStatusReport:
 
 
 def inspect_snapshot_cache(root: Path | str) -> CacheStatusReport:
+    """Inspect direct child leases without racing process-local lease writes."""
+
+    with _SNAPSHOT_CACHE_THREAD_LOCK:
+        return _inspect_snapshot_cache_locked(root)
+
+
+def _inspect_snapshot_cache_locked(root: Path | str) -> CacheStatusReport:
     """Inspect direct child leases without mutating or following links."""
 
     cache_root = Path(root).expanduser().resolve()
@@ -984,6 +1065,13 @@ class CacheCleanupReport:
 
 
 def cleanup_stale_snapshots(root: Path | str) -> CacheCleanupReport:
+    """Remove provably stale leases without racing process-local lease writes."""
+
+    with _SNAPSHOT_CACHE_THREAD_LOCK:
+        return _cleanup_stale_snapshots_locked(root)
+
+
+def _cleanup_stale_snapshots_locked(root: Path | str) -> CacheCleanupReport:
     """Remove only leases whose recorded owner is provably no longer live."""
 
     initial = inspect_snapshot_cache(root)

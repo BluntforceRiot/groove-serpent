@@ -13,21 +13,34 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator, Mapping, Sequence
+from typing import Any, Generator, Mapping, Sequence, cast
 
 import numpy as np
 
 from . import __version__
-from .atomic_create import rename_no_replace
+from .atomic_create import (
+    OwnedFileReceipt,
+    capture_owned_file_receipt,
+    remove_owned_file_if_present,
+    rename_no_replace,
+)
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .cache_storage import ensure_free_space, resolve_cache_root
 from .errors import GrooveSerpentError, ProjectValidationError
-from .media import find_tool, probe_audio, sha256_file, tool_version
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    probe_audio,
+    sha256_file,
+    tool_version,
+)
 from .models import Project, resolve_source_path, utc_now_iso
+from .portable_names import PortablePathError, resolve_portable_path
 from .project_io import load_project
 from .publication import (
     FileReceipt,
     assert_file_receipt,
+    canonical_json_sha256,
     capture_file_receipt,
     stage_verified_copy,
 )
@@ -49,8 +62,10 @@ from .validation import strict_finite_number
 
 SCAN_SCHEMA = "groove-serpent.click-scan/1"
 PREVIEW_SCHEMA = "groove-serpent.click-preview/3"
-RECIPE_SCHEMA = "groove-serpent.restoration-recipe/1"
+RECIPE_SCHEMA = "groove-serpent.restoration-recipe/3"
 RENDER_SCHEMA = "groove-serpent.restoration-render/1"
+REVIEW_WORKFLOW_PROOF_SCHEMA = "groove-serpent.preview-workflow-proof/2"
+OWNER_AUTHORITY_PROOF_SCHEMA = "groove-serpent.owner-authority-proof/1"
 DETECTOR_NAME = "impulse-and-clipping-v1"
 REPAIR_BACKEND = "bidirectional-lpc-hermite-v2"
 MAX_PREVIEW_CANDIDATES = 8
@@ -248,10 +263,14 @@ def _atomic_json(
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    temporary_receipt: OwnedFileReceipt | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
+            temporary_receipt = capture_owned_file_receipt(
+                temporary, raw, owned_descriptor=handle.fileno()
+            )
             os.fsync(handle.fileno())
         if overwrite:
             os.replace(temporary, path)
@@ -263,7 +282,8 @@ def _atomic_json(
                     f"Refusing to replace existing restoration JSON: {path}"
                 ) from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_receipt is not None:
+            remove_owned_file_if_present(temporary, temporary_receipt)
 
 
 def _snapshot_file(path: Path, *, workspace: Path, label: str) -> _FileSnapshot:
@@ -314,15 +334,13 @@ def _validated_source(
         not expected.sha256
         or source_snapshot.sha256.lower() != expected.sha256.lower()
         or source_snapshot.size_bytes != expected.size_bytes
-        or current.sha256.lower() != expected.sha256.lower()
-        or current.size_bytes != expected.size_bytes
-        or current.sample_rate != expected.sample_rate
-        or current.channels != expected.channels
-        or current.sample_count != expected.sample_count
+        or audio_source_descriptor_mismatches(expected, current)
     ):
         raise GrooveSerpentError(
             "The source no longer matches this project; click work was refused."
         )
+    source_snapshot.assert_snapshot_identity()
+    source_snapshot.assert_live_identity()
     if current.codec_name.casefold() != "flac" or source_path.suffix.casefold() != ".flac":
         raise GrooveSerpentError(
             "Click restoration currently accepts lossless FLAC sources only."
@@ -1016,6 +1034,10 @@ def _validate_recipe_payload(
     }
     if "coverage" in recipe:
         recipe_keys.add("coverage")
+    if "review_workflow" in recipe:
+        recipe_keys.add("review_workflow")
+    if "owner_authority" in recipe:
+        recipe_keys.add("owner_authority")
     top = _require_exact_keys(
         recipe,
         recipe_keys,
@@ -1111,7 +1133,253 @@ def _validate_recipe_payload(
             raise GrooveSerpentError(
                 "The restoration recipe has an invalid or stale coverage ledger."
             )
+    approved_candidates = {
+        str(item["candidate_id"])
+        for item in normalized
+        if item["decision"] == "approved"
+    }
+    preview_bindings_by_token: dict[str, str] = {}
+    if expected_summary["approved"] and "review_workflow" not in top:
+        raise GrooveSerpentError(
+            "Approved restoration candidates require immutable preview-workflow proof."
+        )
+    if "review_workflow" in top:
+        workflow = _require_exact_keys(
+            top["review_workflow"],
+            {"schema", "previews"},
+            "The recipe review workflow",
+        )
+        if workflow["schema"] != REVIEW_WORKFLOW_PROOF_SCHEMA:
+            raise GrooveSerpentError(
+                "The restoration recipe has an unsupported review-workflow proof."
+            )
+        previews = workflow["previews"]
+        if (
+            type(previews) is not list
+            or (expected_summary["approved"] > 0 and not previews)
+            or len(previews) > len(candidates)
+        ):
+            raise GrooveSerpentError(
+                "The restoration recipe has invalid preview-workflow bindings."
+            )
+        normalized_bindings: list[dict[str, str]] = []
+        for raw in previews:
+            binding = _require_exact_keys(
+                raw,
+                {"token", "bundle", "sha256"},
+                "Each recipe preview binding",
+            )
+            token = binding["token"]
+            bundle = binding["bundle"]
+            digest = binding["sha256"]
+            if (
+                not _is_sha256(digest)
+                or token != f"preview-{digest[:32]}"
+                or not isinstance(bundle, str)
+                or not bundle
+                or len(bundle) > 255
+                or Path(bundle).name != bundle
+                or bundle in {".", ".."}
+                or "/" in bundle
+                or "\\" in bundle
+            ):
+                raise GrooveSerpentError(
+                    "The restoration recipe has an unsafe preview binding."
+                )
+            normalized_bindings.append(
+                {"token": token, "bundle": bundle, "sha256": digest}
+            )
+            preview_bindings_by_token[token] = digest
+        if (
+            normalized_bindings
+            != sorted(normalized_bindings, key=lambda item: item["token"])
+            or len({item["token"] for item in normalized_bindings})
+            != len(normalized_bindings)
+            or len({item["bundle"] for item in normalized_bindings})
+            != len(normalized_bindings)
+        ):
+            raise GrooveSerpentError(
+                "The restoration recipe preview bindings are duplicated or unordered."
+            )
+    if approved_candidates and "owner_authority" not in top:
+        raise GrooveSerpentError(
+            "Approved restoration candidates require owner-channel authority proof."
+        )
+    if "owner_authority" in top:
+        authority = _require_exact_keys(
+            top["owner_authority"],
+            {
+                "schema",
+                "channel",
+                "claim",
+                "decision_journal",
+                "approvals",
+            },
+            "The recipe owner authority",
+        )
+        if (
+            authority["schema"] != OWNER_AUTHORITY_PROOF_SCHEMA
+            or authority["channel"] != "same-origin-owner-cookie"
+            or authority["claim"] != "owner-channel-action-not-human-perception"
+        ):
+            raise GrooveSerpentError(
+                "The restoration recipe owner-authority contract is unsupported."
+            )
+        journal = _require_exact_keys(
+            authority["decision_journal"],
+            {"token", "sha256", "body_sha256"},
+            "The recipe decision journal binding",
+        )
+        journal_sha256 = journal["sha256"]
+        if (
+            not _is_sha256(journal_sha256)
+            or journal["token"] != f"decision-{journal_sha256[:32]}"
+            or not _is_sha256(journal["body_sha256"])
+        ):
+            raise GrooveSerpentError(
+                "The restoration recipe has an invalid decision-journal binding."
+            )
+        approvals = authority["approvals"]
+        if type(approvals) is not list or len(approvals) > len(candidates):
+            raise GrooveSerpentError(
+                "The restoration recipe owner approvals must be a bounded array."
+            )
+        normalized_approvals: list[dict[str, Any]] = []
+        for raw in approvals:
+            approval = _require_exact_keys(
+                raw,
+                {
+                    "candidate_id",
+                    "candidate_sha256",
+                    "preview_token",
+                    "preview_sha256",
+                    "auditioned_roles",
+                    "capability_sha256",
+                },
+                "Each recipe owner approval",
+            )
+            candidate_id = approval["candidate_id"]
+            preview_sha256 = approval["preview_sha256"]
+            if (
+                not isinstance(candidate_id, str)
+                or candidate_id not in candidates
+                or not _is_sha256(approval["candidate_sha256"])
+                or approval["candidate_sha256"]
+                != canonical_json_sha256(candidates[candidate_id])
+                or not _is_sha256(preview_sha256)
+                or approval["preview_token"] != f"preview-{preview_sha256[:32]}"
+                or preview_bindings_by_token.get(approval["preview_token"])
+                != preview_sha256
+                or approval["auditioned_roles"] != ["before", "proposed", "removed"]
+                or not _is_sha256(approval["capability_sha256"])
+            ):
+                raise GrooveSerpentError(
+                    "The restoration recipe has an invalid owner approval binding."
+                )
+            normalized_approvals.append(dict(approval))
+        if (
+            normalized_approvals
+            != sorted(normalized_approvals, key=lambda item: str(item["candidate_id"]))
+            or len({item["candidate_id"] for item in normalized_approvals})
+            != len(normalized_approvals)
+            or {str(item["candidate_id"]) for item in normalized_approvals}
+            != approved_candidates
+        ):
+            raise GrooveSerpentError(
+                "The recipe owner approvals do not exactly cover approved candidates."
+            )
     return normalized
+
+
+def _verify_review_preview_manifests(
+    manifest_paths: Sequence[Path | str],
+    *,
+    workspace: Path,
+    project: Project,
+    project_sha256: str,
+    scan_snapshot_path: Path,
+    scan_dependency_name: str,
+    scan_sha256: str,
+    approved_candidates: frozenset[str],
+) -> list[dict[str, str]]:
+    """Authenticate exact preview manifests and their lossless audio bytes."""
+
+    if (
+        isinstance(manifest_paths, (str, bytes, bytearray, Mapping))
+        or not isinstance(manifest_paths, Sequence)
+    ):
+        raise GrooveSerpentError(
+            "Restoration preview proof must be an array of preview manifests."
+        )
+    if len(manifest_paths) > 10_000:
+        raise GrooveSerpentError("Restoration preview proof is unreasonably large.")
+    from .restoration_catalog import verify_restoration_preview_bundle
+
+    workspace = workspace.absolute()
+    previewed_candidates: set[str] = set()
+    bindings: list[dict[str, str]] = []
+    for raw_path in manifest_paths:
+        if not isinstance(raw_path, (str, Path)):
+            raise GrooveSerpentError(
+                "Each restoration preview proof must name a preview.json file."
+            )
+        manifest_path = Path(raw_path).expanduser().absolute()
+        try:
+            same_workspace = manifest_path.parent.parent.samefile(workspace)
+        except OSError:
+            same_workspace = False
+        if (
+            manifest_path.name != "preview.json"
+            or not same_workspace
+        ):
+            raise GrooveSerpentError(
+                "Each preview manifest must be inside one direct bundle in the recipe workspace."
+            )
+        artifact = verify_restoration_preview_bundle(
+            manifest_path,
+            workspace_path=workspace,
+            project=project,
+            project_sha256=project_sha256,
+            scan_snapshot_path=scan_snapshot_path,
+            scan_dependency_name=scan_dependency_name,
+            scan_sha256=scan_sha256,
+        )
+        previewed_candidates.update(
+            cast(str, cast(dict[str, Any], item)["id"])
+            for item in cast(list[Any], artifact.payload["candidates"])
+        )
+        bindings.append(
+            {
+                "token": artifact.artifact_id,
+                "bundle": manifest_path.parent.name,
+                "sha256": artifact.manifest_sha256,
+            }
+        )
+    bindings.sort(key=lambda item: item["token"])
+    if (
+        len({item["token"] for item in bindings}) != len(bindings)
+        or len({item["bundle"] for item in bindings}) != len(bindings)
+    ):
+        raise GrooveSerpentError("Restoration preview proof is duplicated.")
+    if not approved_candidates.issubset(previewed_candidates):
+        raise GrooveSerpentError(
+            "Every approved restoration candidate requires exact preview proof."
+        )
+    return bindings
+
+
+def _restoration_output_path(path: Path | str, *, label: str) -> Path:
+    """Validate lexical output ancestry and collisions before input preparation."""
+
+    try:
+        resolution = resolve_portable_path(Path(path))
+        if not resolution.entry_exists:
+            # Canonicalize DOS 8.3 aliases only after checking the lexical path.
+            # Staging and atomic publication compare canonical parent paths.
+            return resolution.path.resolve()
+    except (OSError, PortablePathError, RuntimeError) as exc:
+        raise GrooveSerpentError(f"{label} path is not portable-safe: {exc}") from exc
+    raise GrooveSerpentError(f"{label} already exists: {resolution.path}")
 
 
 def scan_project_clicks(
@@ -1126,9 +1394,7 @@ def scan_project_clicks(
     """Scan exact source PCM and atomically write a review-only candidate report."""
 
     project_path = Path(project_path).expanduser().resolve()
-    report_path = Path(report_path).expanduser().resolve()
-    if report_path.exists():
-        raise GrooveSerpentError(f"Click-scan report already exists: {report_path}")
+    report_path = _restoration_output_path(report_path, label="Click-scan report")
     inputs = _prepare_restoration_inputs(
         project_path,
         workspace=report_path.parent,
@@ -1327,6 +1593,8 @@ def create_restoration_recipe(
     recipe_path: Path | str,
     *,
     source_snapshot: VerifiedAudioSnapshot | None = None,
+    review_preview_manifests: Sequence[Path | str] | None = None,
+    owner_authority_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind one explicit decision to every retained scan candidate."""
 
@@ -1344,7 +1612,13 @@ def create_restoration_recipe(
         source_snapshot=source_snapshot,
     )
     try:
-        return _create_restoration_recipe(inputs, decisions, recipe_path)
+        return _create_restoration_recipe(
+            inputs,
+            decisions,
+            recipe_path,
+            review_preview_manifests=review_preview_manifests,
+            owner_authority_proof=owner_authority_proof,
+        )
     finally:
         inputs.close()
 
@@ -1353,6 +1627,9 @@ def _create_restoration_recipe(
     inputs: _RecipeInputs,
     decisions: Sequence[Mapping[str, Any]],
     recipe_path: Path,
+    *,
+    review_preview_manifests: Sequence[Path | str] | None,
+    owner_authority_proof: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     project_path = inputs.project_path
     project = inputs.project
@@ -1376,6 +1653,41 @@ def _create_restoration_recipe(
     ):
         raise GrooveSerpentError("Recipe decisions must be an array of strict objects.")
     decision_list = [dict(item) for item in decisions]
+    for decision in decision_list:
+        candidate_id = decision.get("candidate_id")
+        if not isinstance(candidate_id, str) or candidate_id not in candidates:
+            raise GrooveSerpentError("A recipe decision has an unknown candidate ID.")
+    approved_candidates = frozenset(
+        str(item.get("candidate_id"))
+        for item in decision_list
+        if item.get("decision") == "approved"
+    )
+    preview_proof_supplied = review_preview_manifests is not None
+    if review_preview_manifests is None:
+        preview_paths: list[Path | str] = []
+    elif (
+        isinstance(review_preview_manifests, (str, bytes, bytearray, Mapping))
+        or not isinstance(review_preview_manifests, Sequence)
+    ):
+        raise GrooveSerpentError(
+            "Restoration preview proof must be an array of preview manifests."
+        )
+    else:
+        preview_paths = list(review_preview_manifests)
+    if approved_candidates and not preview_paths:
+        raise GrooveSerpentError(
+            "Approved restoration candidates require exact preview manifests."
+        )
+    preview_bindings = _verify_review_preview_manifests(
+        preview_paths,
+        workspace=recipe_path.parent,
+        project=project,
+        project_sha256=initial_project_sha256,
+        scan_snapshot_path=scan_snapshot.path,
+        scan_dependency_name=scan_path.name,
+        scan_sha256=initial_scan_sha256,
+        approved_candidates=approved_candidates,
+    )
     protected = {project_path, source_path.resolve(), scan_path}
     if recipe_path in protected:
         raise GrooveSerpentError("The restoration recipe cannot replace an input file.")
@@ -1414,6 +1726,19 @@ def _create_restoration_recipe(
         },
         "coverage": coverage,
     }
+    if preview_proof_supplied:
+        recipe["review_workflow"] = {
+            "schema": REVIEW_WORKFLOW_PROOF_SCHEMA,
+            "previews": preview_bindings,
+        }
+    if owner_authority_proof is not None:
+        recipe["owner_authority"] = json.loads(
+            json.dumps(
+                owner_authority_proof,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
     _validate_recipe_payload(
         recipe,
         project_path=project_path,
@@ -1611,9 +1936,7 @@ def create_click_preview(
 
     project_path = Path(project_path).expanduser().resolve()
     scan_path = Path(scan_path).expanduser().resolve()
-    bundle_dir = Path(bundle_dir).expanduser().resolve()
-    if bundle_dir.exists():
-        raise GrooveSerpentError(f"Preview bundle already exists: {bundle_dir}")
+    bundle_dir = _restoration_output_path(bundle_dir, label="Preview bundle")
     inputs = _prepare_restoration_inputs(
         project_path,
         workspace=bundle_dir.parent,
@@ -2335,9 +2658,7 @@ def render_restored_side(
     project_path = Path(project_path).expanduser().resolve()
     scan_path = Path(scan_path).expanduser().resolve()
     recipe_path = Path(recipe_path).expanduser().resolve()
-    bundle_dir = Path(bundle_dir).expanduser().resolve()
-    if bundle_dir.exists():
-        raise GrooveSerpentError(f"Restoration bundle already exists: {bundle_dir}")
+    bundle_dir = _restoration_output_path(bundle_dir, label="Restoration bundle")
     inputs = _prepare_restoration_inputs(
         project_path,
         workspace=bundle_dir.parent,
@@ -2346,7 +2667,10 @@ def render_restored_side(
         recipe_path=recipe_path,
     )
     try:
-        return _render_restored_side(inputs, bundle_dir)
+        return _render_restored_side(
+            inputs,
+            bundle_dir,
+        )
     finally:
         inputs.close()
 
@@ -2409,6 +2733,33 @@ def _render_restored_side(
     if not approved:
         raise GrooveSerpentError(
             "A restoration render requires at least one explicitly approved candidate."
+        )
+    workflow = recipe.get("review_workflow")
+    preview_bindings = workflow.get("previews") if type(workflow) is dict else None
+    if type(preview_bindings) is not list or not preview_bindings:
+        raise GrooveSerpentError(
+            "A restoration render requires immutable preview-workflow proof."
+        )
+    manifest_paths = [
+        recipe_path.parent / cast(str, cast(dict[str, Any], binding)["bundle"])
+        / "preview.json"
+        for binding in preview_bindings
+    ]
+    observed_preview_bindings = _verify_review_preview_manifests(
+        manifest_paths,
+        workspace=recipe_path.parent,
+        project=project,
+        project_sha256=initial_project_sha256,
+        scan_snapshot_path=scan_snapshot.path,
+        scan_dependency_name=scan_path.name,
+        scan_sha256=initial_scan_sha256,
+        approved_candidates=frozenset(
+            cast(str, item["id"]) for item in approved
+        ),
+    )
+    if observed_preview_bindings != preview_bindings:
+        raise GrooveSerpentError(
+            "The restoration preview proof changed after recipe approval."
         )
     protected_candidates = [
         candidates[candidate_id]
@@ -2621,6 +2972,22 @@ def _render_restored_side(
             },
         }
         _atomic_json(stage / "render.json", receipt)
+        commit_preview_bindings = _verify_review_preview_manifests(
+            manifest_paths,
+            workspace=recipe_path.parent,
+            project=project,
+            project_sha256=initial_project_sha256,
+            scan_snapshot_path=scan_snapshot.path,
+            scan_dependency_name=scan_path.name,
+            scan_sha256=initial_scan_sha256,
+            approved_candidates=frozenset(
+                cast(str, item["id"]) for item in approved
+            ),
+        )
+        if commit_preview_bindings != preview_bindings:
+            raise GrooveSerpentError(
+                "The restoration preview proof changed before render commit."
+            )
         inputs.assert_unchanged()
         if bundle_dir.exists():
             raise GrooveSerpentError(
@@ -2644,6 +3011,8 @@ __all__ = [
     "PREVIEW_SCHEMA",
     "RECIPE_SCHEMA",
     "RENDER_SCHEMA",
+    "REVIEW_WORKFLOW_PROOF_SCHEMA",
+    "OWNER_AUTHORITY_PROOF_SCHEMA",
     "SCAN_SCHEMA",
     "create_click_preview",
     "create_restoration_recipe",

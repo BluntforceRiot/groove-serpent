@@ -29,6 +29,7 @@ from groove_serpent.restoration_workflow import (
     PREVIEW_SCHEMA,
     RECIPE_SCHEMA,
     RENDER_SCHEMA,
+    REVIEW_WORKFLOW_PROOF_SCHEMA,
     SCAN_SCHEMA,
 )
 from groove_serpent.review_server import ReviewServer, _compact_restoration_candidate
@@ -88,6 +89,13 @@ class RestorationServerTests(unittest.TestCase):
         )
         self.project_path = self.directory / "side.groove.json"
         save_project(project, self.project_path)
+        # Synthetic HTTP orchestration uses opaque bytes. The native restart
+        # test below stops this patch before creating and reviewing real audio.
+        self._synthetic_source_probe = patch(
+            "groove_serpent.review_server.probe_audio", return_value=project.source,
+        )
+        self._synthetic_source_probe.start()
+        self.addCleanup(self._synthetic_source_probe.stop)
         self._start_server()
 
     def _start_server(self) -> None:
@@ -101,6 +109,7 @@ class RestorationServerTests(unittest.TestCase):
         self.port = self.server.server_address[1]
         self.authority = f"{self.server.session_auth.public_host}:{self.port}"
         self.base = self.server.session_auth.origin(port=self.port)
+        self._owner_cookie_header: str | None = None
         self._server_running = True
 
     def _stop_server(self) -> None:
@@ -116,8 +125,23 @@ class RestorationServerTests(unittest.TestCase):
         self._start_server()
 
     def tearDown(self) -> None:
+        self._synthetic_source_probe.stop()
         self._stop_server()
         self.temporary_directory.cleanup()
+
+    def test_owner_decision_journal_path_uses_full_project_identity(self) -> None:
+        workspace = self.directory / ".groove-serpent" / "restoration" / "side-a"
+        first = self.directory / "side+a.groove.json"
+        second = self.directory / "side-a.groove.json"
+
+        first_path = ReviewServer._decision_journal_path(workspace, first)
+        second_path = ReviewServer._decision_journal_path(workspace, second)
+
+        self.assertEqual(first_path.parent, workspace)
+        self.assertEqual(second_path.parent, workspace)
+        self.assertNotEqual(first_path, second_path)
+        self.assertTrue(first_path.name.startswith("owner-decisions-"))
+        self.assertTrue(first_path.name.endswith(".json"))
 
     def _state(self) -> dict[str, object]:
         status, _headers, body = self._request("GET", "/api/project")
@@ -143,14 +167,32 @@ class RestorationServerTests(unittest.TestCase):
         payload: dict[str, object] | None = None,
         *,
         headers: dict[str, str] | None = None,
+        authentication: str | None = None,
     ) -> tuple[int, http.client.HTTPMessage, bytes]:
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request_headers = dict(headers or {})
         request_headers.setdefault("Host", self.authority)
-        request_headers.setdefault(
-            "Authorization", self.server.session_auth.authorization_header
-        )
+        if authentication is None:
+            authentication = (
+                "cookie"
+                if method == "POST"
+                and path in {
+                    "/api/restoration/decision",
+                    "/api/restoration/recipe",
+                    "/api/restoration/render",
+                }
+                else "bearer"
+            )
+        if authentication == "bearer":
+            request_headers.setdefault(
+                "Authorization", self.server.session_auth.authorization_header
+            )
+        elif authentication == "cookie":
+            request_headers.setdefault("Cookie", self._owner_cookie())
+            request_headers.setdefault("Origin", self.base)
+        elif authentication != "none":
+            raise AssertionError(f"Unsupported test authentication: {authentication}")
         if payload is not None:
             request_headers.setdefault("Content-Type", "application/json")
         connection.request(method, path, body=body, headers=request_headers)
@@ -159,6 +201,25 @@ class RestorationServerTests(unittest.TestCase):
         result = response.status, response.headers, response_body
         connection.close()
         return result
+
+    def _owner_cookie(self) -> str:
+        if self._owner_cookie_header is not None:
+            return self._owner_cookie_header
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        connection.request(
+            "GET",
+            self.server.session_auth.bootstrap_path,
+            headers={"Host": self.authority},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 303, body)
+        set_cookie = response.headers.get("Set-Cookie")
+        self.assertIsNotNone(set_cookie)
+        assert set_cookie is not None
+        self._owner_cookie_header = set_cookie.split(";", 1)[0]
+        connection.close()
+        return self._owner_cookie_header
 
     @staticmethod
     def _wait_for_next_utc_second() -> None:
@@ -345,10 +406,23 @@ class RestorationServerTests(unittest.TestCase):
         recipe_path: Path,
         *,
         source_snapshot: VerifiedAudioSnapshot,
+        review_preview_manifests: list[Path] | None = None,
+        owner_authority_proof: dict[str, object] | None = None,
     ) -> dict[str, object]:
         self.assertTrue(self.server.operation_lock.locked())
         self.assertEqual(source_snapshot.live_path, self.source_path.resolve())
         self.assertNotEqual(source_snapshot.path, self.source_path.resolve())
+        preview_bindings = []
+        for manifest_path in review_preview_manifests or []:
+            digest = sha256_file(manifest_path)
+            preview_bindings.append(
+                {
+                    "token": f"preview-{digest[:32]}",
+                    "bundle": manifest_path.parent.name,
+                    "sha256": digest,
+                }
+            )
+        preview_bindings.sort(key=lambda item: item["token"])
         recipe = {
             "schema": RECIPE_SCHEMA,
             "created_at": "2026-07-11T12:02:00Z",
@@ -359,7 +433,13 @@ class RestorationServerTests(unittest.TestCase):
                 "rejected": sum(item["decision"] == "rejected" for item in decisions),
                 "protected": sum(item["decision"] == "protected" for item in decisions),
             },
+            "review_workflow": {
+                "schema": REVIEW_WORKFLOW_PROOF_SCHEMA,
+                "previews": preview_bindings,
+            },
         }
+        if owner_authority_proof is not None:
+            recipe["owner_authority"] = owner_authority_proof
         Path(recipe_path).write_text(json.dumps(recipe), encoding="utf-8")
         return recipe
 
@@ -417,6 +497,267 @@ class RestorationServerTests(unittest.TestCase):
             )
         self.assertEqual(status, 200, body)
         return json.loads(body)["scan"]
+
+    def _record_owner_decisions(
+        self,
+        receipt: dict[str, object],
+        scan: dict[str, object],
+        preview: dict[str, object],
+        decisions: list[dict[str, object]],
+    ) -> dict[str, object]:
+        approval_tokens: list[str] = []
+        journal_token: str | None = None
+        for decision in decisions:
+            owner_decision = dict(decision)
+            if owner_decision["decision"] == "approved":
+                owner_decision["auditioned_roles"] = [
+                    "before",
+                    "proposed",
+                    "removed",
+                ]
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/decision",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "preview_token": preview["token"],
+                    "decision": owner_decision,
+                },
+            )
+            self.assertEqual(status, 200, body)
+            response = json.loads(body)
+            journal_token = response["decision_journal"]["token"]
+            if response["owner_approval_token"] is not None:
+                approval_tokens.append(response["owner_approval_token"])
+        self.assertIsNotNone(journal_token)
+        return {
+            "decision_journal_token": journal_token,
+            "owner_approval_tokens": approval_tokens,
+        }
+
+    def test_render_revalidates_bound_preview_audio_bytes(self) -> None:
+        scan = self._create_scan()
+        receipt = self._receipt()
+        with patch(
+            "groove_serpent.review_server.create_click_preview",
+            side_effect=self._fake_preview,
+        ):
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/preview",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "candidate_ids": ["clk-one", "clk-two"],
+                },
+            )
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)["preview"]
+        decisions = [
+            {"candidate_id": "clk-one", "decision": "approved"},
+            {"candidate_id": "clk-two", "decision": "rejected"},
+        ]
+        owner_authority = self._record_owner_decisions(
+            receipt, scan, preview, decisions
+        )
+        with patch(
+            "groove_serpent.review_server.create_restoration_recipe",
+            side_effect=self._fake_recipe,
+        ):
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "preview_tokens": [preview["token"]],
+                    "decisions": decisions,
+                    **owner_authority,
+                },
+            )
+        self.assertEqual(status, 200, body)
+        recipe = json.loads(body)["recipe"]
+        before_token = preview["audio"]["before"]["token"]
+        before_path = Path(self.server.restoration_audio[before_token]["path"])
+        before_path.write_bytes(b"tampered-after-recipe")
+        with patch(
+            "groove_serpent.review_server.render_restored_side",
+            side_effect=self._fake_render,
+        ) as renderer:
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/render",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "recipe_token": recipe["token"],
+                },
+            )
+        self.assertEqual(status, 400, body)
+        self.assertIn("preview", json.loads(body)["error"].lower())
+        renderer.assert_not_called()
+
+    def test_bearer_cannot_authorize_decide_recipe_or_render(self) -> None:
+        scan = self._create_scan()
+        receipt = self._receipt()
+        with patch(
+            "groove_serpent.review_server.create_click_preview",
+            side_effect=self._fake_preview,
+        ):
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/preview",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "candidate_ids": ["clk-one", "clk-two"],
+                },
+            )
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)["preview"]
+        status, headers, body = self._request(
+            "POST",
+            "/api/restoration/decision",
+            {
+                **receipt,
+                "scan_token": scan["token"],
+                "preview_token": preview["token"],
+                "decision": {
+                    "candidate_id": "clk-one",
+                    "decision": "rejected",
+                },
+            },
+            authentication="bearer",
+        )
+        self.assertEqual(status, 403, body)
+        self.assertEqual(headers["Connection"], "close")
+        self.assertFalse(self.server.restoration_decision_path.exists())
+
+        decisions = [
+            {"candidate_id": "clk-one", "decision": "approved"},
+            {"candidate_id": "clk-two", "decision": "rejected"},
+        ]
+        owner_authority = self._record_owner_decisions(
+            receipt, scan, preview, decisions
+        )
+        recipe_payload = {
+            **receipt,
+            "scan_token": scan["token"],
+            "preview_tokens": [preview["token"]],
+            "decisions": decisions,
+            **owner_authority,
+        }
+        with patch(
+            "groove_serpent.review_server.create_restoration_recipe",
+            side_effect=self._fake_recipe,
+        ) as recipe_workflow:
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                recipe_payload,
+                authentication="bearer",
+            )
+            self.assertEqual(status, 403, body)
+            recipe_workflow.assert_not_called()
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                recipe_payload,
+            )
+        self.assertEqual(status, 200, body)
+        recipe = json.loads(body)["recipe"]
+        with patch("groove_serpent.review_server.create_restoration_recipe") as replay:
+            status, _headers, replay_body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                recipe_payload,
+            )
+        self.assertEqual(status, 400, replay_body)
+        self.assertIn("consumed", json.loads(replay_body)["error"])
+        replay.assert_not_called()
+        render_payload = {
+            **receipt,
+            "scan_token": scan["token"],
+            "recipe_token": recipe["token"],
+        }
+        with patch(
+            "groove_serpent.review_server.render_restored_side",
+            side_effect=self._fake_render,
+        ) as render_workflow:
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/render",
+                render_payload,
+                authentication="bearer",
+            )
+            self.assertEqual(status, 403, body)
+            render_workflow.assert_not_called()
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/render",
+                render_payload,
+            )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(render_workflow.call_count, 1)
+
+    def test_recipe_rejects_approved_candidates_without_matching_preview_evidence(
+        self,
+    ) -> None:
+        scan = self._create_scan()
+        receipt = self._receipt()
+        decisions = [
+            {"candidate_id": "clk-one", "decision": "approved"},
+            {"candidate_id": "clk-two", "decision": "rejected"},
+        ]
+        with patch("groove_serpent.review_server.create_restoration_recipe") as recipe:
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "preview_tokens": [],
+                    "decisions": decisions,
+                    "decision_journal_token": "decision-" + ("0" * 32),
+                    "owner_approval_tokens": [],
+                },
+            )
+        self.assertEqual(status, 400, body)
+        self.assertIn("preview evidence", json.loads(body)["error"])
+        recipe.assert_not_called()
+
+        with patch(
+            "groove_serpent.review_server.create_click_preview",
+            side_effect=self._fake_preview,
+        ):
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/preview",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "candidate_ids": ["clk-two"],
+                },
+            )
+        self.assertEqual(status, 200, body)
+        wrong_preview = json.loads(body)["preview"]
+        with patch("groove_serpent.review_server.create_restoration_recipe") as recipe:
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/recipe",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "preview_tokens": [wrong_preview["token"]],
+                    "decisions": decisions,
+                    "decision_journal_token": "decision-" + ("0" * 32),
+                    "owner_approval_tokens": [],
+                },
+            )
+        self.assertEqual(status, 400, body)
+        self.assertIn("preview evidence", json.loads(body)["error"])
+        recipe.assert_not_called()
 
     def test_complete_review_first_workflow_dispatch_and_registered_audio(self) -> None:
         original_project = self.project_path.read_bytes()
@@ -485,17 +826,44 @@ class RestorationServerTests(unittest.TestCase):
                     "classification": "needle-pickup",
                 },
             ]
+            owner_authority = self._record_owner_decisions(
+                receipt, scan_response, preview_response, decisions
+            )
             status, _headers, body = self._request(
                 "POST",
                 "/api/restoration/recipe",
                 {
                     **receipt,
                     "scan_token": scan_response["token"],
+                    "preview_tokens": [preview_response["token"]],
                     "decisions": decisions,
+                    **owner_authority,
                 },
             )
             self.assertEqual(status, 200, body)
             recipe_response = json.loads(body)["recipe"]
+            self.assertEqual(
+                recipe_response["preview_tokens"],
+                [preview_response["token"]],
+            )
+            recipe_entry = self.server.restoration_artifacts[recipe_response["token"]]
+            self.assertEqual(
+                recipe_entry["payload"]["review_workflow"],
+                {
+                    "schema": REVIEW_WORKFLOW_PROOF_SCHEMA,
+                    "previews": [
+                        {
+                            "token": preview_response["token"],
+                            "bundle": Path(
+                                self.server.restoration_artifacts[
+                                    preview_response["token"]
+                                ]["path"]
+                            ).parent.name,
+                            "sha256": preview_response["sha256"],
+                        }
+                    ],
+                },
+            )
 
             status, _headers, body = self._request(
                 "POST",
@@ -541,7 +909,19 @@ class RestorationServerTests(unittest.TestCase):
         )
         self.assertEqual(workflow_calls["preview"][2], ["clk-one", "clk-two"])
         self.assertEqual(workflow_kwargs["preview"], {"context_seconds": 3.5})
-        self.assertEqual(workflow_kwargs["recipe"], {})
+        self.assertEqual(
+            workflow_kwargs["recipe"],
+            {
+                "review_preview_manifests": [
+                    Path(
+                        self.server.restoration_artifacts[
+                            preview_response["token"]
+                        ]["path"]
+                    )
+                ],
+                "owner_authority_proof": recipe_response["owner_authority"],
+            },
+        )
         self.assertEqual(workflow_kwargs["render"], {})
         self.assertEqual(workflow_calls["recipe"][2], decisions)
         self.assertEqual(
@@ -598,6 +978,7 @@ class RestorationServerTests(unittest.TestCase):
     ) -> None:
         workspace = self.server.restoration_workspace
         self._stop_server()
+        self._synthetic_source_probe.stop()
         if workspace.exists():
             shutil.rmtree(workspace)
 
@@ -688,12 +1069,46 @@ class RestorationServerTests(unittest.TestCase):
             {
                 **receipt,
                 "scan_token": scan["token"],
-                "candidate_ids": [approved_id],
+                "candidate_ids": [
+                    candidate["id"] for candidate in scan["candidates"]
+                ],
                 "context_seconds": 0.1,
             },
         )
         self.assertEqual(status, 200, body)
         preview = json.loads(body)["preview"]
+        partial = self._record_owner_decisions(
+            receipt,
+            scan,
+            preview,
+            [{"candidate_id": approved_id, "decision": "rejected"}],
+        )
+        self.assertTrue(partial["decision_journal_token"])
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        self.assertEqual(status, 200, body)
+        partial_status = json.loads(body)
+        self.assertEqual(
+            partial_status["current_decisions"],
+            [{"candidate_id": approved_id, "decision": "rejected"}],
+        )
+        self.assertIsNone(partial_status["current_recipe"])
+        source_before_partial_restart = self.source_path.read_bytes()
+        project_before_partial_restart = self.project_path.read_bytes()
+        self._restart_server()
+        self.assertEqual(self.source_path.read_bytes(), source_before_partial_restart)
+        self.assertEqual(self.project_path.read_bytes(), project_before_partial_restart)
+        status, _headers, body = self._request("GET", "/api/restoration/status")
+        self.assertEqual(status, 200, body)
+        reopened = json.loads(body)
+        self.assertEqual(
+            reopened["current_decisions"],
+            [{"candidate_id": approved_id, "decision": "rejected"}],
+        )
+        self.assertTrue(reopened["decision_journal"]["current"])
+        self.assertFalse(reopened["decision_journal"]["authorizing"])
+        self.assertIsNone(reopened["current_recipe"])
+        self.assertIsNone(reopened["current_render"])
+        receipt = self._receipt()
         decisions = [
             {
                 "candidate_id": candidate["id"],
@@ -701,13 +1116,18 @@ class RestorationServerTests(unittest.TestCase):
             }
             for candidate in scan["candidates"]
         ]
+        owner_authority = self._record_owner_decisions(
+            receipt, scan, preview, decisions
+        )
         status, _headers, body = self._request(
             "POST",
             "/api/restoration/recipe",
             {
                 **receipt,
                 "scan_token": scan["token"],
+                "preview_tokens": [preview["token"]],
                 "decisions": decisions,
+                **owner_authority,
             },
         )
         self.assertEqual(status, 200, body)
@@ -755,6 +1175,10 @@ class RestorationServerTests(unittest.TestCase):
         restarted = json.loads(body)
         self.assertEqual(restarted["current_scan"]["token"], scan["token"])
         self.assertEqual(restarted["current_recipe"]["token"], recipe["token"])
+        self.assertEqual(
+            restarted["current_recipe"]["preview_tokens"],
+            [preview["token"]],
+        )
         self.assertEqual(restarted["current_preview"]["token"], preview["token"])
         self.assertEqual(restarted["current_render"]["token"], render["token"])
         self.assertEqual(
@@ -1017,7 +1441,10 @@ class RestorationServerTests(unittest.TestCase):
                     {
                         **receipt,
                         "scan_token": scan["token"],
+                        "preview_tokens": [],
                         "decisions": decisions,
+                        "decision_journal_token": "decision-" + ("0" * 32),
+                        "owner_approval_tokens": [],
                     },
                 )
                 self.assertEqual(status, 400)
@@ -1032,6 +1459,24 @@ class RestorationServerTests(unittest.TestCase):
             {"candidate_id": "clk-two", "decision": "rejected"},
         ]
         with patch(
+            "groove_serpent.review_server.create_click_preview",
+            side_effect=self._fake_preview,
+        ):
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/preview",
+                {
+                    **receipt,
+                    "scan_token": scan["token"],
+                    "candidate_ids": ["clk-one", "clk-two"],
+                },
+            )
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)["preview"]
+        owner_authority = self._record_owner_decisions(
+            receipt, scan, preview, valid
+        )
+        with patch(
             "groove_serpent.review_server.create_restoration_recipe",
             side_effect=self._fake_recipe,
         ) as workflow:
@@ -1041,7 +1486,9 @@ class RestorationServerTests(unittest.TestCase):
                 {
                     **receipt,
                     "scan_token": scan["token"],
+                    "preview_tokens": [],
                     "decisions": valid,
+                    **owner_authority,
                 },
             )
         self.assertEqual(status, 200, body)
@@ -1108,9 +1555,11 @@ class RestorationServerTests(unittest.TestCase):
             )
         self.assertEqual(status, 400, body)
         self.assertEqual(self.server.restoration_audio, {})
-        self.assertEqual(list(self.server.restoration_workspace.glob("preview-*")), [])
+        self.assertEqual(len(list(self.server.restoration_workspace.glob("preview-*"))), 1)
+        self.assertIn(b"Unregistered restoration output was preserved", body)
+        self.assertEqual(outside.read_bytes(), b"outside")
 
-    def test_failed_postcommit_source_lease_removes_unregistered_scan(self) -> None:
+    def test_failed_postcommit_source_lease_preserves_unregistered_scan(self) -> None:
         generated: list[Path] = []
 
         def changed_source_after_scan(*args, **kwargs):
@@ -1127,7 +1576,8 @@ class RestorationServerTests(unittest.TestCase):
 
         self.assertEqual(status, 400, body)
         self.assertEqual(len(generated), 1)
-        self.assertFalse(generated[0].exists())
+        self.assertTrue(generated[0].exists())
+        self.assertIn(b"Unregistered restoration output was preserved", body)
         self.assertEqual(self.server.restoration_artifacts, {})
 
 

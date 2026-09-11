@@ -6,19 +6,31 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import socket
+import stat
 import sys
 import threading
+import time
 import uuid
 import webbrowser
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, TypedDict, cast
-from urllib.parse import urlparse, urlsplit
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    ContextManager,
+    Iterator,
+    Mapping,
+    Sequence,
+    TypedDict,
+    cast,
+)
+from urllib.parse import urlsplit
 
 from . import __version__, endpoint_proposals as endpoint_proposal_module
 from .album import project_speed_state
@@ -57,10 +69,10 @@ from .metadata import (
     MusicBrainzClient,
     find_track_selections,
 )
-from .media import sha256_file
+from .media import audio_source_descriptor_mismatches, probe_audio, sha256_file
 from .models import AudioSource, Project, ProjectState, Track, resolve_source_path
 from .project_io import load_project, load_project_with_sha256, save_project
-from .publication import FileReceipt, same_file_object_stats
+from .publication import FileReceipt, canonical_json_sha256, same_file_object_stats
 from .recognition import (
     RECOGNITION_SPEED_TRANSFORM,
     AcoustIDRecognitionProvider,
@@ -70,6 +82,12 @@ from .restoration_catalog import (
     RestorationArtifact,
     RestorationCatalog,
     discover_restoration_catalog,
+)
+from .restoration_decisions import (
+    decision_journal_token,
+    read_decision_journal,
+    seal_decision_journal,
+    write_decision_journal,
 )
 from .restoration_workflow import (
     MAX_PREVIEW_CANDIDATES,
@@ -87,7 +105,9 @@ from .session_auth import (
     SessionAuthentication,
     request_target_is_exact,
 )
+from .strict_json import decode_strict_json
 from .topology import propose_topology_refit, tracks_from_topology_proposal
+from .transaction_lock import TargetWriteLease
 from .validation import strict_finite_number
 
 
@@ -584,12 +604,54 @@ def _read_restoration_json(path: Path, schema: str) -> dict[str, Any]:
 class ReviewServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    @staticmethod
+    def _decision_journal_path(
+        restoration_workspace: Path,
+        project_path: Path,
+    ) -> Path:
+        """Return a per-project journal path without trusting a display-safe stem."""
+
+        normalized = os.path.normcase(str(project_path.expanduser().resolve()))
+        identity = hashlib.sha256(os.fsencode(normalized)).hexdigest()[:24]
+        return restoration_workspace / f"owner-decisions-{identity}.json"
+
+    @staticmethod
+    def _raw_restoration_candidates(
+        scan: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Return exact scan records rather than their browser-safe projections."""
+
+        payload = scan.get("payload")
+        raw_candidates = payload.get("candidates") if type(payload) is dict else None
+        if type(raw_candidates) is not list:
+            raise ProjectValidationError(
+                "The registered restoration scan has no exact candidates."
+            )
+        candidates: dict[str, dict[str, Any]] = {}
+        for candidate in raw_candidates:
+            if type(candidate) is not dict or not isinstance(candidate.get("id"), str):
+                raise ProjectValidationError(
+                    "The registered restoration scan has an invalid exact candidate."
+                )
+            candidate_id = candidate["id"]
+            if candidate_id in candidates:
+                raise ProjectValidationError(
+                    "The registered restoration scan has duplicate exact candidates."
+                )
+            candidates[candidate_id] = candidate
+        return candidates
+
     def __init__(
         self,
         address: tuple[str, int],
         project_path: Path,
         *,
         endpoint_proposal_path: Path | None = None,
+        endpoint_scope: EndpointScope | None = None,
+        endpoint_scope_validator: Callable[[], EndpointScope] | None = None,
+        endpoint_transaction_factory: (
+            Callable[[], ContextManager[TargetWriteLease | None]] | None
+        ) = None,
     ):
         host, port = address
         loopback_addresses = _loopback_addresses(host)
@@ -632,6 +694,14 @@ class ReviewServer(ThreadingHTTPServer):
         self.latest_restoration_recipe: str | None = None
         self.latest_restoration_preview: str | None = None
         self.latest_restoration_render: str | None = None
+        self.restoration_decision_path = self._decision_journal_path(
+            self.restoration_workspace,
+            self.project_path,
+        )
+        self.restoration_decision_journal: dict[str, Any] | None = None
+        self.restoration_decision_file_sha256: str | None = None
+        self.restoration_decision_diagnostic: str | None = None
+        self.restoration_owner_approvals: dict[str, dict[str, Any]] = {}
         self.restoration_catalog_diagnostics: dict[str, Any] = {
             "stale": {"count": 0, "by_kind": {}, "by_reason": {}},
             "invalid": {"count": 0, "by_kind": {}, "by_code": {}},
@@ -644,6 +714,33 @@ class ReviewServer(ThreadingHTTPServer):
         self.endpoint_proposal: dict[str, Any] | None = None
         self.endpoint_proposal_source_receipt: str | None = None
         project, project_sha256 = load_project_with_sha256(self.project_path)
+        source_sample_count = project.source.sample_count
+        if type(source_sample_count) is not int or source_sample_count <= 0:
+            raise ProjectValidationError(
+                "Endpoint review requires an exact positive source sample count."
+            )
+        raw_side_label = str(project.metadata.get("side", "")).strip()
+        default_scope_label = (
+            f"Side {raw_side_label}"
+            if raw_side_label and len(raw_side_label) <= 59
+            else "Side"
+        )
+        selected_scope = endpoint_scope or EndpointScope(
+            default_scope_label,
+            0,
+            source_sample_count,
+        )
+        selected_scope.validate(source_sample_count)
+        if (
+            selected_scope.start_sample > project.tracks[0].start_sample
+            or selected_scope.end_sample_exclusive < project.tracks[-1].end_sample
+        ):
+            raise ProjectValidationError(
+                "The endpoint review scope must contain every reviewed track."
+            )
+        self.endpoint_scope = selected_scope
+        self.endpoint_scope_validator = endpoint_scope_validator
+        self.endpoint_transaction_factory = endpoint_transaction_factory
         source = resolve_source_path(project, self.project_path).resolve()
         snapshot_workspace = resolve_cache_root(project_path=self.project_path)
         self.source_snapshot_workspace = snapshot_workspace
@@ -659,6 +756,12 @@ class ReviewServer(ThreadingHTTPServer):
             # completed snapshot once as well, at session startup, so later browser
             # range requests can rely exclusively on its lease and file identity.
             self.source_snapshot.assert_snapshot_unchanged(force=True)
+            actual_source = probe_audio(self.source_snapshot.path, stored_path=source.name)
+            # Own the independently observed fields, never a mutable caller's
+            # descriptor. Every later project revision must match this capture.
+            self._verified_source_descriptor = replace(actual_source)
+            self._assert_source_descriptor(project)
+            self.source_snapshot.assert_snapshot_identity()
             self._seed_source_verification_cache(project)
             _source, source_receipt = self.verify_source(project)
             catalog = discover_restoration_catalog(
@@ -671,6 +774,10 @@ class ReviewServer(ThreadingHTTPServer):
                 project,
                 project_sha256,
                 source_receipt,
+            )
+            self._restore_restoration_decisions(
+                project,
+                project_sha256,
             )
             if endpoint_proposal_path is not None:
                 self._load_initial_endpoint_proposal(
@@ -693,6 +800,34 @@ class ReviewServer(ThreadingHTTPServer):
         self.musicbrainz_client = MusicBrainzClient()
         self.cover_art_client = CoverArtArchiveClient(project_path.parent)
         self.recognition_provider: RecognitionProvider = AcoustIDRecognitionProvider()
+
+    def validate_endpoint_scope(self) -> EndpointScope:
+        """Fail closed when a parent album changed this child's physical scope."""
+
+        validator = self.endpoint_scope_validator
+        if validator is None:
+            return self.endpoint_scope
+        current = validator()
+        if current != self.endpoint_scope:
+            raise ProjectValidationError(
+                "The physical-side endpoint scope changed; close this review and reopen it."
+            )
+        return current
+
+    @contextmanager
+    def endpoint_accept_transaction(self) -> Iterator[TargetWriteLease | None]:
+        """Hold parent/cohort authority through final validation and commit."""
+
+        factory = self.endpoint_transaction_factory
+        outer = nullcontext(None) if factory is None else factory()
+        # Every ordinary child mutation takes the child operation lock before
+        # acquiring its target-write lease.  Endpoint acceptance must preserve
+        # that same order before it expands into the parent/cohort transaction;
+        # taking cohort leases first lets /api/save hold this lock while waiting
+        # for a lease held by the accept path.
+        with self.operation_lock:
+            with outer as held_write_lease:
+                yield held_write_lease
 
     def _load_initial_endpoint_proposal(
         self,
@@ -744,16 +879,18 @@ class ReviewServer(ThreadingHTTPServer):
                 "The sealed endpoint proposal uses a different review configuration."
             )
         scopes = proposal["scopes"]
-        sample_count = project.source.sample_count
+        expected_scope = self.endpoint_scope
         if (
             len(scopes) != 1
-            or scopes[0]["scope_start_sample"] != 0
-            or scopes[0]["scope_end_sample_exclusive"] != sample_count
+            or scopes[0]["label"] != expected_scope.label
+            or scopes[0]["scope_start_sample"] != expected_scope.start_sample
+            or scopes[0]["scope_end_sample_exclusive"]
+            != expected_scope.end_sample_exclusive
         ):
             raise ProjectValidationError(
-                "Side review requires one full-source sealed endpoint scope."
+                "Side review requires its exact sealed physical-side endpoint scope."
             )
-        if scopes[0]["status"] != "proposed":
+        if scopes[0]["status"] == "abstained":
             raise ProjectValidationError(
                 "The sealed endpoint analysis abstained and cannot be loaded for acceptance."
             )
@@ -936,6 +1073,16 @@ class ReviewServer(ThreadingHTTPServer):
                 decisions = [
                     dict(item) for item in cast(list[dict[str, Any]], artifact.payload["decisions"])
                 ]
+                workflow = artifact.payload.get("review_workflow")
+                preview_tokens = (
+                    [
+                        cast(str, cast(dict[str, Any], item)["token"])
+                        for item in cast(list[Any], workflow["previews"])
+                    ]
+                    if type(workflow) is dict
+                    and type(workflow.get("previews")) is list
+                    else None
+                )
                 public = {
                     "token": token,
                     "sha256": artifact.manifest_sha256,
@@ -945,7 +1092,19 @@ class ReviewServer(ThreadingHTTPServer):
                     "decisions": decisions,
                     "coverage": dict(cast(dict[str, Any], artifact.payload["coverage"])),
                 }
-                base.update({"scan_token": scan_token, "public": public})
+                if type(artifact.payload.get("owner_authority")) is dict:
+                    public["owner_authority"] = dict(
+                        cast(dict[str, Any], artifact.payload["owner_authority"])
+                    )
+                if preview_tokens is not None:
+                    public["preview_tokens"] = preview_tokens
+                base.update(
+                    {
+                        "scan_token": scan_token,
+                        "preview_tokens": preview_tokens,
+                        "public": public,
+                    }
+                )
                 self.restoration_artifacts[token] = base
                 continue
 
@@ -1052,6 +1211,280 @@ class ReviewServer(ThreadingHTTPServer):
         )
         self.latest_restoration_render = selection.render.artifact_id if selection.render else None
 
+    def _decision_project_binding(
+        self,
+        project: Project,
+        project_sha256: str,
+    ) -> dict[str, Any]:
+        return {
+            "path": self.project_path.name,
+            "revision": project.revision,
+            "state_sha256": project.state_sha256,
+            "sha256": project_sha256,
+        }
+
+    @staticmethod
+    def _decision_source_binding(
+        project: Project,
+    ) -> dict[str, Any]:
+        return {
+            "path": Path(project.source.path).name,
+            "sha256": project.source.sha256,
+            "size_bytes": project.source.size_bytes,
+            "sample_rate": project.source.sample_rate,
+            "channels": project.source.channels,
+            "bits_per_raw_sample": project.source.bits_per_raw_sample,
+            "sample_count": project.source.sample_count,
+            "codec_name": project.source.codec_name,
+        }
+
+    def _validate_current_decision_journal(
+        self,
+        journal: Mapping[str, Any],
+        project: Project,
+        project_sha256: str,
+    ) -> None:
+        scan_token = self.latest_restoration_scan
+        scan = self.restoration_artifacts.get(scan_token or "")
+        if scan_token is None or scan is None or scan.get("kind") != "scan":
+            raise ProjectValidationError(
+                "The restoration decision journal has no current registered scan."
+            )
+        if journal.get("project") != self._decision_project_binding(
+            project, project_sha256
+        ):
+            raise ProjectValidationError(
+                "The restoration decision journal belongs to an older project revision."
+            )
+        if journal.get("source") != self._decision_source_binding(project):
+            raise ProjectValidationError(
+                "The restoration decision journal belongs to an older source receipt."
+            )
+        if journal.get("scan") != {
+            "token": scan_token,
+            "sha256": scan.get("sha256"),
+        }:
+            raise ProjectValidationError(
+                "The restoration decision journal belongs to a different click scan."
+            )
+        candidates = self._raw_restoration_candidates(scan)
+        decisions = journal.get("decisions")
+        if type(decisions) is not list:
+            raise ProjectValidationError(
+                "The restoration decision journal has invalid entries."
+            )
+        for decision in decisions:
+            if type(decision) is not dict:
+                raise ProjectValidationError(
+                    "The restoration decision journal has an invalid entry."
+                )
+            candidate_id = decision.get("candidate_id")
+            candidate = candidates.get(str(candidate_id))
+            if candidate is None or decision.get("candidate_sha256") != (
+                canonical_json_sha256(candidate)
+            ):
+                raise ProjectValidationError(
+                    "A restoration decision no longer matches its exact candidate."
+                )
+            preview_binding = decision.get("preview")
+            if type(preview_binding) is not dict:
+                raise ProjectValidationError(
+                    "A restoration decision has no exact preview binding."
+                )
+            preview_token = preview_binding.get("token")
+            preview = self.restoration_artifacts.get(str(preview_token))
+            preview_public = preview.get("public") if preview is not None else None
+            if (
+                preview is None
+                or preview.get("kind") != "preview"
+                or preview.get("scan_token") != scan_token
+                or preview.get("sha256") != preview_binding.get("sha256")
+                or type(preview_public) is not dict
+                or not any(
+                    type(item) is dict and item.get("id") == candidate_id
+                    for item in preview_public.get(
+                        "candidates", []
+                    )
+                )
+            ):
+                raise ProjectValidationError(
+                    "A restoration decision no longer matches its exact preview."
+                )
+
+    def _restore_restoration_decisions(
+        self,
+        project: Project,
+        project_sha256: str,
+    ) -> None:
+        self.restoration_decision_journal = None
+        self.restoration_decision_file_sha256 = None
+        self.restoration_decision_diagnostic = None
+        self.restoration_owner_approvals.clear()
+        if not os.path.lexists(self.restoration_decision_path):
+            return
+        try:
+            journal, file_sha256 = read_decision_journal(
+                self.restoration_decision_path
+            )
+        except (OSError, ProjectValidationError) as exc:
+            self.restoration_decision_diagnostic = str(exc)[:500]
+            return
+        self.restoration_decision_file_sha256 = file_sha256
+        try:
+            self._validate_current_decision_journal(
+                journal,
+                project,
+                project_sha256,
+            )
+        except ProjectValidationError as exc:
+            self.restoration_decision_diagnostic = str(exc)[:500]
+            return
+        self.restoration_decision_journal = journal
+        if self.latest_restoration_recipe is not None:
+            recipe = self.restoration_artifacts.get(self.latest_restoration_recipe)
+            if recipe is None or not self.restoration_recipe_matches_owner_authority(
+                recipe
+            ):
+                self.latest_restoration_recipe = None
+                self.latest_restoration_render = None
+
+    def persist_restoration_decisions(
+        self,
+        project: Project,
+        project_sha256: str,
+        scan: Mapping[str, Any],
+        decisions: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        journal = seal_decision_journal(
+            project=self._decision_project_binding(project, project_sha256),
+            source=self._decision_source_binding(project),
+            scan={"token": scan["public"]["token"], "sha256": scan["sha256"]},
+            decisions=decisions,
+        )
+        file_sha256 = write_decision_journal(
+            self.restoration_decision_path,
+            journal,
+            expected_file_sha256=self.restoration_decision_file_sha256,
+        )
+        self._validate_current_decision_journal(
+            journal,
+            project,
+            project_sha256,
+        )
+        self.restoration_decision_journal = journal
+        self.restoration_decision_file_sha256 = file_sha256
+        self.restoration_decision_diagnostic = None
+        return self.restoration_decision_public()
+
+    def restoration_decision_public(self) -> dict[str, Any]:
+        journal = self.restoration_decision_journal
+        file_sha256 = self.restoration_decision_file_sha256
+        if journal is None or file_sha256 is None:
+            return {
+                "current": False,
+                "authorizing": False,
+                "diagnostic": self.restoration_decision_diagnostic,
+                "decisions": [],
+            }
+        return {
+            "current": True,
+            "authorizing": False,
+            "token": decision_journal_token(file_sha256),
+            "sha256": file_sha256,
+            "body_sha256": journal["body_sha256"],
+            "updated_at": journal["updated_at"],
+            "authority": dict(cast(dict[str, Any], journal["authority"])),
+            "decisions": [
+                dict(cast(dict[str, Any], item))
+                for item in cast(list[Any], journal["decisions"])
+            ],
+        }
+
+    def discard_restoration_approvals(self, candidate_ids: set[str]) -> None:
+        for token, approval in list(self.restoration_owner_approvals.items()):
+            if approval.get("candidate_id") in candidate_ids:
+                self.restoration_owner_approvals.pop(token, None)
+
+    def restoration_recipe_matches_owner_authority(
+        self,
+        recipe: Mapping[str, Any],
+    ) -> bool:
+        journal = self.restoration_decision_journal
+        file_sha256 = self.restoration_decision_file_sha256
+        payload = recipe.get("payload")
+        authority = payload.get("owner_authority") if type(payload) is dict else None
+        if journal is None or file_sha256 is None or type(authority) is not dict:
+            return False
+        payload_dict = cast(dict[str, Any], payload)
+        if authority.get("decision_journal") != {
+            "token": decision_journal_token(file_sha256),
+            "sha256": file_sha256,
+            "body_sha256": journal.get("body_sha256"),
+        }:
+            return False
+        recipe_decisions = payload_dict.get("decisions")
+        journal_decisions = journal.get("decisions")
+        if type(recipe_decisions) is not list or type(journal_decisions) is not list:
+            return False
+        approvals = authority.get("approvals")
+        if type(approvals) is not list:
+            return False
+        expected: dict[str, tuple[str, str | None]] = {}
+        journal_by_candidate: dict[str, dict[str, Any]] = {}
+        for item in journal_decisions:
+            if type(item) is not dict:
+                return False
+            decision = item.get("decision")
+            if decision == "pending-approval":
+                rendered = "approved"
+            elif decision in {"rejected", "protected"}:
+                rendered = cast(str, decision)
+            else:
+                return False
+            expected[str(item.get("candidate_id"))] = (
+                rendered,
+                cast(str | None, item.get("classification")),
+            )
+            journal_by_candidate[str(item.get("candidate_id"))] = item
+        observed = {
+            str(item.get("candidate_id")): (
+                str(item.get("decision")),
+                cast(str | None, item.get("classification")),
+            )
+            for item in recipe_decisions
+            if type(item) is dict
+        }
+        if observed != expected:
+            return False
+        approved_candidates = {
+            candidate_id
+            for candidate_id, (decision, _classification) in observed.items()
+            if decision == "approved"
+        }
+        approvals_by_candidate: dict[str, dict[str, Any]] = {}
+        for approval in approvals:
+            if type(approval) is not dict:
+                return False
+            candidate_id = approval.get("candidate_id")
+            if not isinstance(candidate_id, str) or candidate_id in approvals_by_candidate:
+                return False
+            journal_entry = journal_by_candidate.get(candidate_id)
+            preview = journal_entry.get("preview") if journal_entry is not None else None
+            if (
+                journal_entry is None
+                or journal_entry.get("decision") != "pending-approval"
+                or type(preview) is not dict
+                or approval.get("candidate_sha256")
+                != journal_entry.get("candidate_sha256")
+                or approval.get("preview_token") != preview.get("token")
+                or approval.get("preview_sha256") != preview.get("sha256")
+                or approval.get("auditioned_roles")
+                != ["before", "proposed", "removed"]
+            ):
+                return False
+            approvals_by_candidate[candidate_id] = approval
+        return set(approvals_by_candidate) == approved_candidates
+
     def new_restoration_path(
         self,
         kind: str,
@@ -1114,19 +1547,14 @@ class ReviewServer(ThreadingHTTPServer):
         return resolved
 
     def discard_restoration_path(self, path: Path) -> None:
-        """Remove one unregistered server-owned artifact after a failed final lease."""
+        """Preserve unregistered outputs without original-writer cleanup authority.
 
-        resolved = self.checked_restoration_path(path, must_exist=False)
-        if not resolved.exists():
-            return
-        if resolved.is_file():
-            resolved.unlink()
-        elif resolved.is_dir():
-            shutil.rmtree(resolved)
-        else:
-            raise ProjectValidationError(
-                "An unregistered restoration artifact has an unsafe file type."
-            )
+        Allocating a name does not own the object later found there. Workflow writers
+        clean their own staging; the server cannot adopt a returned file/tree for
+        destructive cleanup by inspecting its pathname or matching its content.
+        """
+
+        return
 
     def begin_evidence_request(self) -> _EvidenceRequestLease:
         """Cancel prior evidence work and return the newest request generation."""
@@ -1147,9 +1575,21 @@ class ReviewServer(ThreadingHTTPServer):
             if self._active_evidence_request is request:
                 self._active_evidence_request = None
 
+    def _assert_source_descriptor(self, project: Project) -> None:
+        mismatches = audio_source_descriptor_mismatches(
+            project.source, self._verified_source_descriptor,
+        )
+        if mismatches:
+            raise ProjectValidationError(
+                "Review source descriptor disagrees with the verified snapshot: "
+                + ", ".join(mismatches)
+                + ". Reanalyze the original capture before review."
+            )
+
     def _seed_source_verification_cache(self, project: Project) -> None:
         """Trust the one-pass session capture and seed cheap review checks."""
 
+        self._assert_source_descriptor(project)
         source = resolve_source_path(project, self.project_path).resolve()
         self.source_snapshot.assert_live_identity()
         try:
@@ -1204,6 +1644,7 @@ class ReviewServer(ThreadingHTTPServer):
         this exact open handle.
         """
 
+        self._assert_source_descriptor(project)
         source = resolve_source_path(project, self.project_path).resolve()
         expected_sha256 = str(project.source.sha256 or "").strip().lower()
         if not expected_sha256:
@@ -1375,6 +1816,42 @@ class ReviewServer(ThreadingHTTPServer):
             )
 
 
+def _drain_rejected_request_body(handler: BaseHTTPRequestHandler, maximum: int) -> None:
+    """Boundedly drain a fixed body so Windows can deliver an error before close."""
+
+    if handler.headers.get_all("Transfer-Encoding", []):
+        return
+    lengths = handler.headers.get_all("Content-Length", [])
+    if (
+        len(lengths) != 1 or len(lengths[0]) > 20
+        or not lengths[0].isascii() or not lengths[0].isdigit()
+    ):
+        return
+    remaining = int(lengths[0])
+    if not 0 < remaining <= min(maximum, 64 * 1024):
+        return
+    prior_timeout = handler.connection.gettimeout()
+    deadline = time.monotonic() + 0.25
+    try:
+        while remaining:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return
+            handler.connection.settimeout(timeout)
+            chunk = handler.rfile.read1(min(16 * 1024, remaining))
+            if not chunk:
+                return
+            remaining -= len(chunk)
+    except OSError:
+        # An incomplete, disconnected, or slow body never gains processing authority.
+        return
+    finally:
+        try:
+            handler.connection.settimeout(prior_timeout)
+        except OSError:
+            pass
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     server: ReviewServer
     protocol_version = "HTTP/1.1"
@@ -1395,6 +1872,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._validated_authority = authority
         if not self._request_has_session_access():
             self.close_connection = True
+            self._discard_declared_request_body()
             self._unauthorized()
             return False
         return True
@@ -1506,19 +1984,45 @@ class ReviewHandler(BaseHTTPRequestHandler):
         return True
 
     def _discard_declared_request_body(self) -> None:
-        """Drain a small fixed body so Windows can deliver the error before close."""
+        _drain_rejected_request_body(self, _MAX_REQUEST_BODY)
 
+    def _require_owner_restoration_channel(self) -> bool:
+        """Reserve restoration decisions and derivatives for the browser owner."""
+
+        if self._session_authentication == "cookie":
+            return True
+        self._discard_declared_request_body()
+        self.close_connection = True
+        self._error(
+            HTTPStatus.FORBIDDEN,
+            "This restoration action requires the same-origin owner browser session.",
+        )
+        return False
+
+    def _validate_get_framing(self) -> bool:
+        """Reject body-bearing GET requests and close their connection."""
+
+        if self.headers.get_all("Transfer-Encoding", []):
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "GET does not accept Transfer-Encoding.")
+            return False
         lengths = self.headers.get_all("Content-Length", [])
-        if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
-            return
-        remaining = int(lengths[0])
-        if remaining < 0 or remaining > _MAX_REQUEST_BODY:
-            return
-        while remaining:
-            chunk = self.rfile.read(min(64 * 1024, remaining))
-            if not chunk:
-                return
-            remaining -= len(chunk)
+        if not lengths:
+            return True
+        if (
+            len(lengths) != 1
+            or not lengths[0].isascii()
+            or not lengths[0].isdigit()
+            or len(lengths[0]) > 20
+        ):
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "Invalid GET Content-Length header.")
+            return False
+        if int(lengths[0]) != 0:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "GET request bodies are not supported.")
+            return False
+        return True
 
     def _json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1526,10 +2030,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _error(self, status: int, message: str) -> None:
+        if getattr(self, "_restoration_output_preserved", False):
+            message += (
+                " Unregistered restoration output was preserved because original-writer "
+                "cleanup ownership could not be proved."
+            )
         self._json({"ok": False, "error": message}, status=status)
 
     def _unauthorized(self) -> None:
@@ -1560,7 +2071,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
             self.close_connection = True
             raise ProjectValidationError("Invalid Content-Length header.")
-        length = int(lengths[0])
+        try:
+            length = int(lengths[0])
+        except ValueError as exc:
+            self.close_connection = True
+            raise ProjectValidationError("Invalid Content-Length header.") from exc
         if length <= 0 or length > _MAX_REQUEST_BODY:
             self.close_connection = True
             raise ProjectValidationError("Request body is missing or too large.")
@@ -1569,8 +2084,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise ProjectValidationError("Request body is incomplete.")
         try:
-            payload = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            payload = decode_strict_json(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
             self.close_connection = True
             raise ProjectValidationError("Request body is not valid JSON.") from exc
         if not isinstance(payload, dict):
@@ -1589,10 +2104,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._validate_get_framing():
+            return
         if self.server.session_auth.is_bootstrap_target(self.path):
             self._bootstrap_session()
             return
-        parsed_request = urlparse(self.path)
+        parsed_request = urlsplit(self.path)
         path = parsed_request.path
         try:
             if (
@@ -1601,6 +2118,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     parsed_request.query or parsed_request.fragment
                 )
             ):
+                self.close_connection = True
                 raise ProjectValidationError(
                     "Review workflow endpoints do not accept query parameters."
                 )
@@ -1793,9 +2311,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             remaining -= len(chunk)
 
     def do_POST(self) -> None:  # noqa: N802
-        parsed_request = urlparse(self.path)
+        parsed_request = urlsplit(self.path)
         path = parsed_request.path
         self._pending_restoration_path: Path | None = None
+        self._restoration_output_preserved = False
         try:
             if not self._validate_post_headers():
                 return
@@ -1805,6 +2324,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     parsed_request.query or parsed_request.fragment
                 )
             ):
+                self.close_connection = True
                 raise ProjectValidationError(
                     "Review workflow endpoints do not accept query parameters."
                 )
@@ -1838,6 +2358,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._restoration_scan()
             elif path == "/api/restoration/preview":
                 self._restoration_preview()
+            elif path == "/api/restoration/decision":
+                self._restoration_decision()
             elif path == "/api/restoration/recipe":
                 self._restoration_recipe()
             elif path == "/api/restoration/render":
@@ -1853,6 +2375,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif path == "/api/restoration/continuous/open":
                 self._continuous_preview_open()
             else:
+                self.close_connection = True
+                self._discard_declared_request_body()
                 self._error(HTTPStatus.NOT_FOUND, "Not found")
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             self._discard_pending_restoration()
@@ -1877,6 +2401,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if pending is None:
             return
         self.server.discard_restoration_path(pending)
+        if os.path.lexists(pending):
+            self._restoration_output_preserved = True
         self._pending_restoration_path = None
 
     def _restoration_request_state(
@@ -1943,6 +2469,142 @@ class ReviewHandler(BaseHTTPRequestHandler):
             raise ProjectValidationError(f"The registered {kind} changed after it was created.")
         return artifact
 
+    def _verify_restoration_preview_audio(
+        self,
+        preview_token: str,
+        preview: Mapping[str, Any],
+    ) -> None:
+        """Re-open and authenticate every audio file bound by one preview."""
+
+        manifest_path = self.server.checked_restoration_path(
+            Path(str(preview.get("path", ""))), suffix=".json"
+        )
+        bundle = manifest_path.parent.resolve()
+        payload = preview.get("payload")
+        files_payload = payload.get("files") if type(payload) is dict else None
+        if type(files_payload) is not dict or set(files_payload) != {
+            "before",
+            "proposed",
+            "removed",
+        }:
+            raise ProjectValidationError("The registered preview audio binding is invalid.")
+        registered = {
+            str(entry.get("role")): entry
+            for entry in self.server.restoration_audio.values()
+            if entry.get("preview_token") == preview_token
+        }
+        if set(registered) != {"before", "proposed", "removed"}:
+            raise ProjectValidationError(
+                "The registered preview does not have exactly three audition files."
+            )
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        for role in ("before", "proposed", "removed"):
+            binding = files_payload[role]
+            if type(binding) is not dict or set(binding) != {"path", "sha256"}:
+                raise ProjectValidationError("A preview audio binding is invalid.")
+            relative = binding.get("path")
+            expected_sha256 = binding.get("sha256")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+                or not isinstance(expected_sha256, str)
+                or len(expected_sha256) != 64
+            ):
+                raise ProjectValidationError("A preview audio binding is unsafe.")
+            audio_path = self.server.checked_restoration_path(
+                bundle / relative, suffix=".flac"
+            )
+            try:
+                audio_path.relative_to(bundle)
+            except ValueError as exc:
+                raise ProjectValidationError(
+                    "A preview audio file left its exact bundle."
+                ) from exc
+            entry = registered[role]
+            registered_path = Path(str(entry.get("path", ""))).resolve()
+            if (
+                registered_path != audio_path
+                or entry.get("sha256") != expected_sha256
+                or type(entry.get("size_bytes")) is not int
+            ):
+                raise ProjectValidationError(
+                    "The preview audio registry differs from its manifest."
+                )
+            try:
+                before = os.lstat(audio_path)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or bool(getattr(before, "st_file_attributes", 0) & reparse_flag)
+                ):
+                    raise ProjectValidationError(
+                        "A preview audio path is not a regular no-follow file."
+                    )
+                with audio_path.open("rb") as handle:
+                    opened = os.fstat(handle.fileno())
+                    if not same_file_object_stats(before, opened):
+                        raise ProjectValidationError(
+                            "A preview audio file changed before verification."
+                        )
+                    observed_sha256 = _sha256_handle(handle)
+                    closed = os.fstat(handle.fileno())
+                after = os.lstat(audio_path)
+            except ProjectValidationError:
+                raise
+            except OSError as exc:
+                raise ProjectValidationError(
+                    "A preview audio file could not be verified."
+                ) from exc
+            if (
+                not same_file_object_stats(opened, closed)
+                or not same_file_object_stats(closed, after)
+                or observed_sha256 != expected_sha256
+                or after.st_size != entry["size_bytes"]
+            ):
+                raise ProjectValidationError(
+                    "A preview audio file changed after it was reviewed."
+                )
+
+    def _verify_restoration_preview_workflow(
+        self,
+        preview_tokens: Sequence[str],
+        approved_candidates: frozenset[str],
+        *,
+        scan_token: str,
+        project_sha256: str,
+        source_receipt: _SourceReceipt,
+    ) -> None:
+        """Validate candidate coverage and immutable preview bytes."""
+
+        previewed_candidates: set[str] = set()
+        for preview_token in preview_tokens:
+            preview = self._restoration_artifact(
+                preview_token,
+                prefix="preview",
+                kind="preview",
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
+            if preview.get("scan_token") != scan_token:
+                raise ProjectValidationError(
+                    "A recipe preview token belongs to a different scan."
+                )
+            self._verify_restoration_preview_audio(preview_token, preview)
+            public = preview.get("public")
+            candidates = public.get("candidates", []) if type(public) is dict else []
+            if type(candidates) is not list:
+                raise ProjectValidationError("A preview candidate binding is invalid.")
+            previewed_candidates.update(
+                str(item["id"])
+                for item in candidates
+                if type(item) is dict and isinstance(item.get("id"), str)
+            )
+        if not approved_candidates.issubset(previewed_candidates):
+            raise ProjectValidationError(
+                "Every approved candidate requires current scan-bound preview evidence."
+            )
+
     @staticmethod
     def _restoration_response_state(
         project: Project,
@@ -1971,6 +2633,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     or entry.get("source_receipt") != source_receipt["receipt"]
                     or entry.get("source_sha256") != source_receipt["sha256"]
                 )
+                if not stale and entry.get("kind") == "recipe":
+                    stale = not self.server.restoration_recipe_matches_owner_authority(
+                        entry
+                    )
+                if not stale and entry.get("kind") == "render":
+                    recipe = self.server.restoration_artifacts.get(
+                        str(entry.get("recipe_token", ""))
+                    )
+                    stale = recipe is None or not (
+                        self.server.restoration_recipe_matches_owner_authority(recipe)
+                    )
                 if stale:
                     return {
                         "token": token,
@@ -1981,6 +2654,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 public["stale"] = False
                 return public
 
+            decision_journal = self.server.restoration_decision_public()
+            current_decisions = [
+                {
+                    key: value
+                    for key, value in cast(dict[str, Any], item).items()
+                    if key in {"candidate_id", "decision", "classification"}
+                }
+                for item in cast(list[Any], decision_journal.get("decisions", []))
+                if type(item) is dict
+                and item.get("decision") in {"rejected", "protected"}
+            ]
             payload = {
                 "ok": True,
                 "persistence_scope": "verified-project-workspace",
@@ -2000,6 +2684,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "current_recipe": current_public(self.server.latest_restoration_recipe),
                 "current_preview": current_public(self.server.latest_restoration_preview),
                 "current_render": current_public(self.server.latest_restoration_render),
+                "decision_journal": decision_journal,
+                "current_decisions": current_decisions,
                 **self._restoration_response_state(project, project_sha256, source_receipt),
             }
         self._json(payload)
@@ -2706,6 +3392,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.server.latest_restoration_recipe = None
             self.server.latest_restoration_preview = None
             self.server.latest_restoration_render = None
+            self.server.restoration_decision_journal = None
+            self.server.restoration_decision_diagnostic = (
+                "A new scan requires a new owner decision journal."
+            )
+            self.server.restoration_owner_approvals.clear()
             response = {
                 "ok": True,
                 "scan": public,
@@ -2891,6 +3582,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             }
             self._pending_restoration_path = None
             self.server.latest_restoration_preview = preview_token
+            self.server.discard_restoration_approvals(set(candidate_ids))
             response = {
                 "ok": True,
                 "preview": public,
@@ -2898,14 +3590,215 @@ class ReviewHandler(BaseHTTPRequestHandler):
             }
         self._json(response)
 
-    def _restoration_recipe(self) -> None:
+    def _restoration_decision(self) -> None:
+        if not self._require_owner_restoration_channel():
+            return
         payload = self._read_json()
         required = {
             "expected_revision",
             "expected_project_sha256",
             "expected_source_receipt",
             "scan_token",
+            "preview_token",
+            "decision",
+        }
+        _strict_json_object(
+            payload,
+            allowed=required,
+            required=required,
+            label="Restoration owner decision request",
+        )
+        raw_decision = payload["decision"]
+        if type(raw_decision) is not dict:
+            raise ProjectValidationError(
+                "A restoration owner decision must be a strict JSON object."
+            )
+        decision_value = raw_decision.get("decision")
+        decision_keys = {"candidate_id", "decision"}
+        if decision_value == "protected":
+            decision_keys.add("classification")
+        if decision_value == "approved":
+            decision_keys.add("auditioned_roles")
+        if set(raw_decision) != decision_keys:
+            raise ProjectValidationError(
+                "The restoration owner decision has unsupported or missing fields."
+            )
+        if decision_value not in {
+            "approved",
+            "rejected",
+            "protected",
+            "undecided",
+        }:
+            raise ProjectValidationError(
+                "The owner decision must be approved, rejected, protected, or undecided."
+            )
+        with self.server.operation_lock:
+            project, project_sha256, _source_snapshot, source_receipt = (
+                self._restoration_request_state(payload)
+            )
+            scan = self._restoration_artifact(
+                payload["scan_token"],
+                prefix="scan",
+                kind="scan",
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
+            preview = self._restoration_artifact(
+                payload["preview_token"],
+                prefix="preview",
+                kind="preview",
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
+            if preview.get("scan_token") != payload["scan_token"]:
+                raise ProjectValidationError(
+                    "The owner decision preview belongs to a different scan."
+                )
+            candidate_id = raw_decision.get("candidate_id")
+            candidates = {
+                item["id"]: item for item in scan["public"]["candidates"]
+            }
+            if not isinstance(candidate_id, str) or candidate_id not in candidates:
+                raise ProjectValidationError(
+                    "The owner decision has an unknown candidate ID."
+                )
+            previewed = {
+                item["id"] for item in preview["public"].get("candidates", [])
+            }
+            if candidate_id not in previewed:
+                raise ProjectValidationError(
+                    "The owner decision is not bound to a preview of that candidate."
+                )
+            self._verify_restoration_preview_audio(
+                cast(str, payload["preview_token"]),
+                preview,
+            )
+            candidate = candidates[candidate_id]
+            exact_candidate = self.server._raw_restoration_candidates(scan).get(
+                candidate_id
+            )
+            if exact_candidate is None:
+                raise ProjectValidationError(
+                    "The owner decision has no exact registered candidate."
+                )
+            if decision_value == "approved":
+                if candidate.get("repairable") is not True:
+                    raise ProjectValidationError(
+                        "A non-repairable candidate cannot be approved."
+                    )
+                if raw_decision.get("auditioned_roles") != [
+                    "before",
+                    "proposed",
+                    "removed",
+                ]:
+                    raise ProjectValidationError(
+                        "Owner approval requires all three changed-window audition roles."
+                    )
+            if decision_value == "protected" and raw_decision.get(
+                "classification"
+            ) not in _RESTORATION_PROTECTED_CLASSIFICATIONS:
+                raise ProjectValidationError(
+                    "A protected owner decision needs a structural classification."
+                )
+
+            existing = {
+                str(item["candidate_id"]): dict(item)
+                for item in cast(
+                    list[dict[str, Any]],
+                    (self.server.restoration_decision_journal or {}).get(
+                        "decisions", []
+                    ),
+                )
+            }
+            journal_decision = (
+                "pending-approval" if decision_value == "approved" else decision_value
+            )
+            entry: dict[str, Any] = {
+                "candidate_id": candidate_id,
+                "candidate_sha256": canonical_json_sha256(exact_candidate),
+                "decision": journal_decision,
+                "preview": {
+                    "token": payload["preview_token"],
+                    "sha256": preview["sha256"],
+                },
+            }
+            if decision_value == "protected":
+                entry["classification"] = raw_decision["classification"]
+            existing[candidate_id] = entry
+            self._assert_restoration_inputs_unchanged(
+                revision=project.revision,
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
+            journal_public = self.server.persist_restoration_decisions(
+                project,
+                project_sha256,
+                scan,
+                list(existing.values()),
+            )
+            try:
+                self._assert_restoration_inputs_unchanged(
+                    revision=project.revision,
+                    project_sha256=project_sha256,
+                    source_receipt=source_receipt,
+                )
+            except BaseException:
+                self.server.restoration_decision_journal = None
+                self.server.restoration_decision_file_sha256 = None
+                self.server.restoration_decision_diagnostic = (
+                    "Project or source changed after the decision journal commit."
+                )
+                self.server.restoration_owner_approvals.clear()
+                raise
+            self.server.discard_restoration_approvals({candidate_id})
+            approval_token: str | None = None
+            if decision_value == "approved":
+                approval_token = self.server._new_session_token(
+                    "owner", self.server.restoration_owner_approvals
+                )
+                self.server.restoration_owner_approvals[approval_token] = {
+                    "candidate_id": candidate_id,
+                    "candidate_sha256": canonical_json_sha256(exact_candidate),
+                    "project_sha256": project_sha256,
+                    "source_receipt": source_receipt["receipt"],
+                    "scan_token": payload["scan_token"],
+                    "preview_token": payload["preview_token"],
+                    "preview_sha256": preview["sha256"],
+                    "auditioned_roles": ["before", "proposed", "removed"],
+                    "capability_sha256": hashlib.sha256(
+                        approval_token.encode("ascii")
+                    ).hexdigest(),
+                }
+            self.server.latest_restoration_recipe = None
+            self.server.latest_restoration_render = None
+            response = {
+                "ok": True,
+                "decision": dict(raw_decision),
+                "decision_journal": journal_public,
+                "owner_approval_token": approval_token,
+                "authority_claim": (
+                    "This records an owner-channel browser action; it does not "
+                    "prove human perception."
+                ),
+                **self._restoration_response_state(
+                    project, project_sha256, source_receipt
+                ),
+            }
+        self._json(response)
+
+    def _restoration_recipe(self) -> None:
+        if not self._require_owner_restoration_channel():
+            return
+        payload = self._read_json()
+        required = {
+            "expected_revision",
+            "expected_project_sha256",
+            "expected_source_receipt",
+            "scan_token",
+            "preview_tokens",
             "decisions",
+            "decision_journal_token",
+            "owner_approval_tokens",
         }
         _strict_json_object(
             payload,
@@ -2975,6 +3868,174 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 raise ProjectValidationError(
                     "The recipe must decide every retained scan candidate exactly once."
                 )
+            preview_tokens_raw = payload["preview_tokens"]
+            if (
+                type(preview_tokens_raw) is not list
+                or len(preview_tokens_raw) > len(candidates)
+                or any(
+                    not isinstance(value, str) or len(value) > 160
+                    for value in preview_tokens_raw
+                )
+                or len(set(preview_tokens_raw)) != len(preview_tokens_raw)
+            ):
+                raise ProjectValidationError(
+                    "Recipe preview tokens must be a bounded unique JSON array."
+                )
+            previewed_candidates: set[str] = set()
+            for preview_token in preview_tokens_raw:
+                preview = self._restoration_artifact(
+                    preview_token,
+                    prefix="preview",
+                    kind="preview",
+                    project_sha256=project_sha256,
+                    source_receipt=source_receipt,
+                )
+                if preview.get("scan_token") != payload["scan_token"]:
+                    raise ProjectValidationError(
+                        "A recipe preview token belongs to a different scan."
+                    )
+                previewed_candidates.update(
+                    item["id"] for item in preview["public"].get("candidates", [])
+                )
+            approved_candidates = {
+                item["candidate_id"]
+                for item in decisions
+                if item["decision"] == "approved"
+            }
+            if not approved_candidates.issubset(previewed_candidates):
+                raise ProjectValidationError(
+                    "Every approved candidate requires current scan-bound preview evidence."
+                )
+
+            self._verify_restoration_preview_workflow(
+                tuple(preview_tokens_raw),
+                frozenset(approved_candidates),
+                scan_token=cast(str, payload["scan_token"]),
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
+            decision_journal = self.server.restoration_decision_journal
+            decision_file_sha256 = self.server.restoration_decision_file_sha256
+            if decision_journal is None or decision_file_sha256 is None:
+                raise ProjectValidationError(
+                    "A complete current owner decision journal is required."
+                )
+            expected_journal_token = decision_journal_token(
+                decision_file_sha256
+            )
+            if payload["decision_journal_token"] != expected_journal_token:
+                raise ProjectValidationError(
+                    "The decision journal changed; reload before saving the recipe."
+                )
+            journal_entries = {
+                str(item["candidate_id"]): item
+                for item in cast(
+                    list[dict[str, Any]], decision_journal["decisions"]
+                )
+            }
+            if set(journal_entries) != set(candidates):
+                raise ProjectValidationError(
+                    "Every retained candidate needs a current owner-channel decision."
+                )
+            for decision in decisions:
+                journal_entry = journal_entries[decision["candidate_id"]]
+                expected_value = (
+                    "pending-approval"
+                    if decision["decision"] == "approved"
+                    else decision["decision"]
+                )
+                if journal_entry.get("decision") != expected_value:
+                    raise ProjectValidationError(
+                        "Recipe decisions differ from the current owner decision journal."
+                    )
+                if decision["decision"] == "protected" and journal_entry.get(
+                    "classification"
+                ) != decision.get("classification"):
+                    raise ProjectValidationError(
+                        "A protected recipe decision differs from its owner journal."
+                    )
+
+            approval_tokens_raw = payload["owner_approval_tokens"]
+            if (
+                type(approval_tokens_raw) is not list
+                or len(approval_tokens_raw) != len(approved_candidates)
+                or len(set(map(str, approval_tokens_raw)))
+                != len(approval_tokens_raw)
+            ):
+                raise ProjectValidationError(
+                    "Owner approval tokens must exactly cover approved candidates."
+                )
+            approvals_by_candidate: dict[str, dict[str, Any]] = {}
+            consumed_approval_tokens: list[str] = []
+            for raw_token in approval_tokens_raw:
+                token = _restoration_token(
+                    raw_token, "owner", "Owner approval token"
+                )
+                approval = self.server.restoration_owner_approvals.get(token)
+                if approval is None:
+                    raise ProjectValidationError(
+                        "An owner approval token is absent, stale, or already consumed."
+                    )
+                candidate_id = cast(str, approval["candidate_id"])
+                approval_journal_entry = journal_entries.get(candidate_id)
+                preview_binding: dict[str, Any] | None = (
+                    approval_journal_entry.get("preview")
+                    if type(approval_journal_entry) is dict
+                    else None
+                )
+                if (
+                    candidate_id not in approved_candidates
+                    or candidate_id in approvals_by_candidate
+                    or approval.get("project_sha256") != project_sha256
+                    or approval.get("source_receipt") != source_receipt["receipt"]
+                    or approval.get("scan_token") != payload["scan_token"]
+                    or type(preview_binding) is not dict
+                    or approval.get("preview_token") != preview_binding.get("token")
+                    or approval.get("preview_sha256") != preview_binding.get("sha256")
+                    or approval.get("preview_token") not in preview_tokens_raw
+                    or approval.get("auditioned_roles")
+                    != ["before", "proposed", "removed"]
+                ):
+                    raise ProjectValidationError(
+                        "An owner approval token does not match the current exact proof."
+                    )
+                approvals_by_candidate[candidate_id] = approval
+                consumed_approval_tokens.append(token)
+            if set(approvals_by_candidate) != approved_candidates:
+                raise ProjectValidationError(
+                    "Fresh owner approval is missing for an approved candidate."
+                )
+            owner_authority_proof = {
+                "schema": "groove-serpent.owner-authority-proof/1",
+                "channel": "same-origin-owner-cookie",
+                "claim": "owner-channel-action-not-human-perception",
+                "decision_journal": {
+                    "token": expected_journal_token,
+                    "sha256": decision_file_sha256,
+                    "body_sha256": decision_journal["body_sha256"],
+                },
+                "approvals": sorted(
+                    (
+                        {
+                            key: approval[key]
+                            for key in {
+                                "candidate_id",
+                                "candidate_sha256",
+                                "preview_token",
+                                "preview_sha256",
+                                "auditioned_roles",
+                                "capability_sha256",
+                            }
+                        }
+                        for approval in approvals_by_candidate.values()
+                    ),
+                    key=lambda item: str(item["candidate_id"]),
+                ),
+            }
+            preview_manifest_paths = [
+                Path(cast(str, self.server.restoration_artifacts[token]["path"]))
+                for token in preview_tokens_raw
+            ]
             recipe_path = self.server.new_restoration_path("recipe", suffix=".json")
             self._pending_restoration_path = recipe_path
             create_restoration_recipe(
@@ -2983,9 +4044,36 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 decisions,
                 recipe_path,
                 source_snapshot=source_snapshot,
+                review_preview_manifests=preview_manifest_paths,
+                owner_authority_proof=owner_authority_proof,
             )
             recipe_path = self.server.checked_restoration_path(recipe_path, suffix=".json")
             recipe_payload = _read_restoration_json(recipe_path, RECIPE_SCHEMA)
+            recipe_workflow = recipe_payload.get("review_workflow")
+            if type(recipe_workflow) is not dict:
+                raise ProjectValidationError(
+                    "The recipe did not bind its preview workflow."
+                )
+            bound_previews = recipe_workflow.get("previews")
+            bound_preview_tokens = (
+                [
+                    cast(str, cast(dict[str, Any], item)["token"])
+                    for item in bound_previews
+                ]
+                if type(bound_previews) is list
+                else None
+            )
+            if (
+                bound_preview_tokens is None
+                or sorted(bound_preview_tokens) != sorted(preview_tokens_raw)
+            ):
+                raise ProjectValidationError(
+                    "The recipe preview workflow changed during creation."
+                )
+            if recipe_payload.get("owner_authority") != owner_authority_proof:
+                raise ProjectValidationError(
+                    "The recipe owner-authority proof changed during creation."
+                )
             try:
                 self._assert_restoration_inputs_unchanged(
                     revision=project.revision,
@@ -3003,9 +4091,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "token": recipe_token,
                 "sha256": digest,
                 "scan_token": payload["scan_token"],
+                "preview_tokens": list(bound_preview_tokens),
                 "created_at": str(recipe_payload.get("created_at", ""))[:200],
                 "summary": recipe_payload.get("summary", {}),
                 "decisions": decisions,
+                "owner_authority": owner_authority_proof,
             }
             if isinstance(recipe_payload.get("coverage"), dict):
                 public["coverage"] = dict(recipe_payload["coverage"])
@@ -3018,12 +4108,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "source_receipt": source_receipt["receipt"],
                 "source_sha256": source_receipt["sha256"],
                 "scan_token": payload["scan_token"],
+                "preview_tokens": list(bound_preview_tokens),
                 "payload": recipe_payload,
                 "public": public,
             }
             self._pending_restoration_path = None
             self.server.latest_restoration_recipe = recipe_token
             self.server.latest_restoration_render = None
+            for token in consumed_approval_tokens:
+                self.server.restoration_owner_approvals.pop(token, None)
             response = {
                 "ok": True,
                 "recipe": public,
@@ -3032,6 +4125,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._json(response)
 
     def _restoration_render(self) -> None:
+        if not self._require_owner_restoration_channel():
+            return
         payload = self._read_json()
         required = {
             "expected_revision",
@@ -3066,6 +4161,48 @@ class ReviewHandler(BaseHTTPRequestHandler):
             )
             if recipe.get("scan_token") != payload["scan_token"]:
                 raise ProjectValidationError("The recipe token belongs to a different scan.")
+            if not self.server.restoration_recipe_matches_owner_authority(recipe):
+                raise ProjectValidationError(
+                    "The recipe is not bound to the current owner decision authority."
+                )
+            preview_tokens = recipe.get("preview_tokens")
+            if type(preview_tokens) is not list:
+                raise ProjectValidationError(
+                    "The recipe lacks server-verified preview workflow evidence."
+                )
+            for preview_token in preview_tokens:
+                preview = self._restoration_artifact(
+                    preview_token,
+                    prefix="preview",
+                    kind="preview",
+                    project_sha256=project_sha256,
+                    source_receipt=source_receipt,
+                )
+                if preview.get("scan_token") != payload["scan_token"]:
+                    raise ProjectValidationError(
+                        "The recipe preview workflow belongs to a different scan."
+                    )
+
+            public_recipe = recipe.get("public")
+            raw_decisions = (
+                public_recipe.get("decisions", [])
+                if type(public_recipe) is dict
+                else []
+            )
+            approved_candidates = frozenset(
+                str(item["candidate_id"])
+                for item in raw_decisions
+                if type(item) is dict
+                and item.get("decision") == "approved"
+                and isinstance(item.get("candidate_id"), str)
+            )
+            self._verify_restoration_preview_workflow(
+                tuple(cast(list[str], preview_tokens)),
+                approved_candidates,
+                scan_token=cast(str, payload["scan_token"]),
+                project_sha256=project_sha256,
+                source_receipt=source_receipt,
+            )
             bundle = self.server.new_restoration_path("render")
             self._pending_restoration_path = bundle
             render_restored_side(
@@ -3308,18 +4445,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
             raise ProjectValidationError(
                 "Endpoint scope label must be bounded, trimmed, printable text."
             )
+        if label != self.server.endpoint_scope.label:
+            raise ProjectValidationError(
+                "Endpoint analysis must use the review server's exact physical-side scope."
+            )
         with self.server.operation_lock:
+            endpoint_scope = self.server.validate_endpoint_scope()
             project, project_sha256, source_receipt = (
                 self._endpoint_request_state(payload)
             )
-            sample_count = project.source.sample_count
-            if type(sample_count) is not int or sample_count <= 0:
-                raise ProjectValidationError(
-                    "Endpoint review requires an exact positive source sample count."
-                )
             proposal = analyze_endpoint_proposals(
                 self.server.project_path,
-                (EndpointScope(label, 0, sample_count),),
+                (endpoint_scope,),
                 snapshot_workspace=self.server.source_snapshot_workspace,
             )
             current, current_sha256 = load_project_with_sha256(
@@ -3337,6 +4474,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 raise _ProjectConflictError(
                     "The source changed while endpoint evidence was being analyzed."
                 )
+            self.server.validate_endpoint_scope()
             proposal = validate_endpoint_proposal_document(proposal)
             if not self._endpoint_document_matches_project(
                 proposal,
@@ -3392,6 +4530,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "Endpoint rejection reason must be bounded, trimmed, printable text."
             )
         with self.server.operation_lock:
+            self.server.validate_endpoint_scope()
             project, project_sha256, source_receipt = (
                 self._endpoint_request_state(payload)
             )
@@ -3439,11 +4578,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             raise ProjectValidationError(
                 "Endpoint acceptance requires the explicit no-runout review intent."
             )
-        if payload["reviewed_start"] is not True or payload["reviewed_end"] is not True:
+        if (
+            type(payload["reviewed_start"]) is not bool
+            or type(payload["reviewed_end"]) is not bool
+        ):
             raise ProjectValidationError(
-                "Audition and inspect both proposed endpoints before acceptance."
+                "Endpoint review decisions must be explicit booleans."
             )
-        with self.server.operation_lock:
+        with self.server.endpoint_accept_transaction() as held_write_lease:
             project, project_sha256, source_receipt = (
                 self._endpoint_request_state(payload)
             )
@@ -3454,28 +4596,48 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 payload["proposal_sha256"],
             )
             scopes = proposal["scopes"]
-            sample_count = project.source.sample_count
+            expected_scope = self.server.endpoint_scope
             if (
                 len(scopes) != 1
-                or scopes[0]["scope_start_sample"] != 0
-                or scopes[0]["scope_end_sample_exclusive"] != sample_count
+                or scopes[0]["label"] != expected_scope.label
+                or scopes[0]["scope_start_sample"] != expected_scope.start_sample
+                or scopes[0]["scope_end_sample_exclusive"]
+                != expected_scope.end_sample_exclusive
             ):
                 raise ProjectValidationError(
-                    "The side review can accept only one full-source endpoint scope."
+                    "The side review can accept only its exact physical-side endpoint scope."
                 )
             scope = scopes[0]
-            if scope["status"] != "proposed" or scope["requires_review"] is not True:
+            if scope["status"] == "abstained" or scope["requires_review"] is not True:
                 raise ProjectValidationError(
                     "This endpoint analysis abstained; there is no suggestion to accept."
                 )
-            start_sample = scope["proposed_music_start_sample"]
-            end_sample = scope["proposed_music_end_sample_exclusive"]
-            if type(start_sample) is not int or type(end_sample) is not int:
+            start = scope["start"]
+            end = scope["end"]
+            reviewed_start = payload["reviewed_start"]
+            reviewed_end = payload["reviewed_end"]
+            if reviewed_start and start["status"] != "proposed":
                 raise ProjectValidationError(
-                    "The endpoint proposal has no exact samples to accept."
+                    "The start analysis abstained; there is no start suggestion to accept."
+                )
+            if reviewed_end and end["status"] != "proposed":
+                raise ProjectValidationError(
+                    "The end analysis abstained; there is no end suggestion to accept."
+                )
+            if not reviewed_start and not reviewed_end:
+                raise ProjectValidationError(
+                    "Audition and select at least one proposed endpoint before acceptance."
                 )
             first = project.tracks[0]
             last = project.tracks[-1]
+            proposed_start = start["sample"] if reviewed_start else first.start_sample
+            proposed_end = end["sample"] if reviewed_end else last.end_sample
+            if type(proposed_start) is not int or type(proposed_end) is not int:
+                raise ProjectValidationError(
+                    "A selected endpoint proposal has no exact sample to accept."
+                )
+            start_sample = proposed_start
+            end_sample = proposed_end
             if start_sample >= first.end_sample or end_sample <= last.start_sample:
                 raise ProjectValidationError(
                     "The proposed endpoints would erase or invert a reviewed track."
@@ -3487,6 +4649,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 raise ProjectValidationError(
                     "The reviewed project already uses these exact endpoints."
                 )
+            self.server.validate_endpoint_scope()
             before_state = project.capture_state()
             sample_rate = project.source.sample_rate
             if len(project.tracks) == 1:
@@ -3508,19 +4671,33 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     end_sample=end_sample,
                     end_seconds=end_sample / sample_rate,
                 )
+            accepted_boundaries = (
+                "start and end"
+                if reviewed_start and reviewed_end
+                else "start"
+                if reviewed_start
+                else "end"
+            )
             history = project.append_history(
                 action="move_marker",
                 summary=(
-                    "Accepted reviewed music endpoints; removed lead-in and "
-                    "runout while preserving wanted music"
+                    f"Accepted reviewed music {accepted_boundaries}"
+                    + "; removed only the explicitly reviewed lead-in or runout "
+                    "while preserving wanted music"
                 ),
                 before=before_state,
                 after=project.capture_state(),
             )
+            # Recompute the complete parent binding at the last pre-commit
+            # boundary.  The album transaction serializes cooperating writers;
+            # this second check also catches direct sibling-file drift triggered
+            # after the first validation but before this target save.
+            self.server.validate_endpoint_scope()
             save_project(
                 project,
                 self.server.project_path,
                 expected_existing_sha256=project_sha256,
+                held_write_lease=held_write_lease,
             )
             project, project_sha256 = load_project_with_sha256(
                 self.server.project_path
@@ -3542,8 +4719,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "review_decision": "accepted",
                 "proposal_sha256": proposal["proposal_sha256"],
-                "accepted_start_sample": start_sample,
-                "accepted_end_sample_exclusive": end_sample,
+                "accepted_start_sample": start_sample if reviewed_start else None,
+                "accepted_end_sample_exclusive": end_sample if reviewed_end else None,
+                "resulting_start_sample": start_sample,
+                "resulting_end_sample_exclusive": end_sample,
                 "history_sequence": history.sequence,
                 "project": response_project,
             }

@@ -2,6 +2,111 @@
 
 All notable public changes to Groove Serpent are documented here.
 
+## 1.1.0 — prepared for release, not yet published
+
+These entries describe the changes from published 1.0.0 to the local 1.1 release
+candidate. Development-candidate approval does not transfer to changed stable
+bytes. Exact release validation and asset availability are governed by the new
+candidate's receipts; see [1.1 release notes](RELEASE_NOTES_1.1.md).
+
+### Fixed
+
+- Refuse preexisting staged track outputs before rendering. Error-only FFmpeg
+  diagnostics now fail the operation even when the encoder exits zero, preventing
+  a stale but valid AAC file from being credited as a newly rendered track.
+- Independently validate saved source descriptors against the actual verified
+  audio before export, Original audition, click work, and continuous previews.
+  Mismatched precision, channels, rate, codec, sample format, or frame count are
+  refused rather than silently converted to match the saved descriptor.
+- Preserve supported 24-bit integer precision in archival FLAC rendering.
+  Complete source/output PCM comparisons now decode both streams at signed
+  32-bit precision, so a lower-precision output cannot hide discarded source
+  bits. Core track rendering also validates its source geometry independently.
+- Preserve existing or replaced destinations when immutable-copy staging fails;
+  failed partial copies remain under their caller's guarded staging cleanup.
+- Bind project, album, cache, proposal, evidence, restoration, and publication
+  JSON cleanup to the original open writer's file identity and exact bytes,
+  preserving replacements even when they contain identical content.
+- Preserve substituted preview/export staging directories and artwork files;
+  uncertain unregistered restoration artifacts remain non-authorizing scratch
+  material instead of being deleted without an ownership receipt.
+- Drain bounded rejected HTTP request bodies before closing so ordinary
+  unauthorized requests reliably receive their explicit error response.
+- Keep CLI output paths lexical until the output policy checks their ancestry,
+  so symbolic links and Windows junctions cannot bypass destination rejection.
+- Restoration audition requires uninterrupted, normal-speed playback from at or
+  before the changed window through its end for every role. Partial entry,
+  seeking, pauses, stalls, rate changes, and discontinuous media clocks do not
+  satisfy the audition gate.
+- New project paths use portable separators. Existing Windows-relative source
+  paths can reopen on POSIX without taking precedence over literal POSIX names.
+- Public source and package scans share normalized text and Python/JSON literal
+  inspection. Owner-specific denylist values are supplied by an external private
+  policy, with only its digest retained in local evidence. Source archives exclude
+  Git history bundles; earlier public history is not rewritten by this repair.
+
+- Ordinary pull requests now build deterministic candidate source archives
+  without misusing the immutable prior-release marker; final-release archive
+  verification remains a separate fail-closed mode.
+- Python 3.11 on Windows uses its creation-time field for safe no-replace
+  publication identity, so archive safety tests execute instead of being skipped.
+- State-changing review requests and snapshot lease receipts reject duplicate
+  JSON fields and non-finite numeric constants before interpretation.
+- Endpoint evidence now decides the music start and end independently, so an
+  ambiguous intro cannot hide a trustworthy no-runout ending (or vice versa).
+  Needle morphology may corroborate a strongly low-frequency lead-in/runout
+  signature, but every proposed edge remains audition-only until explicitly
+  accepted by the owner.
+- Album-side endpoint review is bound to every sibling project sharing the
+  capture, and an open child review is retired if a neighboring side changes
+  the physical midpoint from which its exact scope was derived.
+- Approved click recipes and renders now require core-validated preview proof
+  and an owner-channel authority proof. The recipe binds the exact preview
+  manifests, the catalog treats them as dependencies, and recipe creation plus
+  rendering re-open and hash the before, proposed, and removed FLAC bytes
+  through stable file identities.
+- The restoration recipe schema is now version 3. A browser approval seals the
+  full scan candidate record rather than the reduced display projection, so the
+  core renderer can verify exactly what was reviewed.
+- The retired `click-recipe` and `click-render` CLI commands now fail closed;
+  recipes and restoration renders are created only through the owner review
+  workbench. Decision journals also use a hash of the full project identity,
+  preventing display-safe filename collisions from sharing review state.
+- Both local review servers close malformed persistent connections when a
+  rejected POST body remains unread or a GET incorrectly carries a body,
+  preventing the next request from being parsed out of leftover bytes.
+- Album-side endpoint acceptance now follows the same child-lock-before-write-
+  lease order as ordinary side saves. A real HTTP concurrency regression proves
+  that the first serialized mutation succeeds and the stale second mutation is
+  rejected without reaching the write-lease timeout.
+- Native/Bearer review clients can construct restoration evidence but can no
+  longer record decisions, create recipes, or render derivatives. Those routes
+  require the same-origin owner browser session, and approvals additionally use
+  exact one-use capabilities issued after all three transports cross the changed
+  sample window. The recipe schema records that authority
+  as an owner-channel action without claiming to prove human perception.
+- Rejected and protected click decisions now persist in a strict self-hashed,
+  non-authorizing partial journal bound to the exact project, source, scan,
+  candidate, and preview. Reopening the workbench restores reviewed progress
+  while pending approvals still require a fresh browser audition and a complete
+  recipe before any render is possible.
+
+### Compatibility and release scope
+
+- Project schema 4 and album schema 3 remain in use. Restoration recipes now
+  require schema 3 and current review authority; do not relabel older recipes
+  or treat earlier approvals as fresh audition.
+- The reviewed development candidate had native Windows Python 3.11/3.13,
+  browser, real-album export/reopen/replay, and package evidence. Those results
+  remain historical to its exact bytes, not stable 1.1 release passes.
+- Native Linux/WSL/macOS, Python 3.12, live online/raw-fpcalc identification,
+  physical-device Safari, and new owner listening approval were not established
+  by that development review. Windows WebKit's unavailable FLAC decoder is an
+  explicit refusal case, not successful Safari playback.
+- A 1.1 portable asset, signing, SmartScreen reputation, and independent
+  clean-machine certification are not implied by the source release. Only
+  candidate-specific delivery receipts can establish those claims.
+
 ## 1.0.0 — 2026-07-15
 
 First collector-grade release of the complete local album workflow.

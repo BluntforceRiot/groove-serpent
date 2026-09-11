@@ -5,7 +5,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -55,6 +57,126 @@ class CacheStorageTests(unittest.TestCase):
                     lease.bind_source_identity("b" * 64, 321)
             finally:
                 lease.release()
+
+    def test_inspection_does_not_overlap_receipt_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value) / "cache"
+            lease = acquire_provisional_snapshot_lease(
+                root,
+                source_size_bytes=321,
+            )
+            inspection_entered = threading.Event()
+            release_inspection = threading.Event()
+            binding_ready = threading.Event()
+            replacement_entered = threading.Event()
+            real_load = cache_storage_module._load_metadata
+            real_replace = os.replace
+            hold_first_load = True
+
+            def held_load(path: Path) -> SnapshotLeaseMetadata:
+                nonlocal hold_first_load
+                if hold_first_load:
+                    hold_first_load = False
+                    inspection_entered.set()
+                    if not release_inspection.wait(timeout=5):
+                        raise AssertionError("Inspection test synchronization timed out.")
+                return real_load(path)
+
+            def observed_replace(source: Path | str, target: Path | str) -> None:
+                replacement_entered.set()
+                real_replace(source, target)
+
+            def bind_after_signal() -> None:
+                lease.assert_owned()
+                binding_ready.set()
+                lease.bind_source_identity(self.source_sha256, 321)
+
+            try:
+                with mock.patch.object(
+                    cache_storage_module,
+                    "_load_metadata",
+                    side_effect=held_load,
+                ), mock.patch.object(
+                    cache_storage_module.os,
+                    "replace",
+                    side_effect=observed_replace,
+                ), ThreadPoolExecutor(max_workers=2) as executor:
+                    inspection = executor.submit(inspect_snapshot_cache, root)
+                    self.assertTrue(inspection_entered.wait(timeout=5))
+                    binding = executor.submit(bind_after_signal)
+                    self.assertTrue(binding_ready.wait(timeout=5))
+                    self.assertFalse(replacement_entered.is_set())
+                    release_inspection.set()
+                    self.assertEqual(len(inspection.result(timeout=5).entries), 1)
+                    binding.result(timeout=5)
+                lease.assert_owned()
+            finally:
+                release_inspection.set()
+                lease.release()
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing retry is Windows-only")
+    def test_receipt_replace_retries_one_windows_sharing_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value) / "cache"
+            lease = acquire_provisional_snapshot_lease(
+                root,
+                source_size_bytes=321,
+            )
+            real_replace = os.replace
+            calls = 0
+
+            def replace_after_one_failure(
+                source: Path | str,
+                target: Path | str,
+            ) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("simulated sharing violation")
+                real_replace(source, target)
+
+            try:
+                with mock.patch.object(
+                    cache_storage_module.os,
+                    "replace",
+                    side_effect=replace_after_one_failure,
+                ), mock.patch.object(cache_storage_module.time, "sleep") as sleep:
+                    lease.bind_source_identity(self.source_sha256, 321)
+                self.assertEqual(calls, 2)
+                sleep.assert_called_once_with(0.01)
+                lease.assert_owned()
+            finally:
+                lease.release()
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing retry is Windows-only")
+    def test_release_retries_one_windows_sharing_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value) / "cache"
+            lease = acquire_snapshot_lease(
+                root,
+                source_sha256=self.source_sha256,
+                source_size_bytes=321,
+            )
+            real_quarantine = cache_storage_module.quarantine_path_no_replace
+            calls = 0
+
+            def quarantine_after_one_failure(path: Path, *, purpose: str) -> Path:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("simulated sharing violation")
+                return real_quarantine(path, purpose=purpose)
+
+            with mock.patch.object(
+                cache_storage_module,
+                "quarantine_path_no_replace",
+                side_effect=quarantine_after_one_failure,
+            ), mock.patch.object(cache_storage_module.time, "sleep") as sleep:
+                lease.release()
+
+            self.assertEqual(calls, 2)
+            sleep.assert_called_once_with(0.01)
+            self.assertFalse(lease.directory.exists())
 
     def test_active_lease_records_identity_and_is_not_cleaned(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
@@ -161,6 +283,32 @@ class CacheStorageTests(unittest.TestCase):
         with mock.patch.object(cache_storage_module.sys, "platform", "linux"):
             self.assertIsNone(cache_storage_module._windows_machine_guid())
 
+    @unittest.skipUnless(os.name == "nt", "Windows path spelling is Windows-only")
+    def test_windows_extended_local_drive_is_not_remote(self) -> None:
+        local = Path(r"\\?\C:\groove-serpent\snapshot")
+        self.assertFalse(cache_storage_module._windows_remote_path(local))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path spelling is Windows-only")
+    def test_windows_extended_unc_path_is_remote(self) -> None:
+        remote = Path(r"\\?\UNC\example.invalid\share\snapshot")
+        self.assertTrue(cache_storage_module._windows_remote_path(remote))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path spelling is Windows-only")
+    def test_windows_extended_device_namespace_is_rejected(self) -> None:
+        device = Path(r"\\?\GLOBALROOT\Device\HarddiskVolume1\snapshot")
+        self.assertTrue(cache_storage_module._windows_remote_path(device))
+
+    @unittest.skipUnless(os.name == "nt", "Windows boot identity is Windows-only")
+    def test_windows_boot_session_uses_one_stable_boot_identifier(self) -> None:
+        first = cache_storage_module._windows_boot_session_identity()
+        second = cache_storage_module._windows_boot_session_identity()
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertRegex(
+            first or "",
+            r"^boot-identifier:[0-9a-f]{32};session:[0-9]+$",
+        )
+
     def test_cloned_machine_guid_is_separated_by_boot_session(self) -> None:
         with mock.patch.object(
             cache_storage_module,
@@ -169,7 +317,7 @@ class CacheStorageTests(unittest.TestCase):
         ), mock.patch.object(
             cache_storage_module,
             "_windows_boot_session_identity",
-            return_value="boot-filetime:100;session:1",
+            return_value=f"boot-identifier:{'1' * 32};session:1",
         ):
             first = cache_storage_module._process_namespace_identity_windows()
         with mock.patch.object(
@@ -179,7 +327,7 @@ class CacheStorageTests(unittest.TestCase):
         ), mock.patch.object(
             cache_storage_module,
             "_windows_boot_session_identity",
-            return_value="boot-filetime:200;session:1",
+            return_value=f"boot-identifier:{'2' * 32};session:1",
         ):
             second = cache_storage_module._process_namespace_identity_windows()
         self.assertRegex(first or "", r"^local-namespace-sha256:[0-9a-f]{64}$")
@@ -359,6 +507,39 @@ class CacheStorageTests(unittest.TestCase):
             self.assertEqual(cleaned.removed, ())
             self.assertEqual(cleaned.skipped_unknown, 1)
             self.assertTrue(malformed.exists())
+
+    def test_duplicate_lease_fields_never_grant_cleanup_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value) / "cache"
+            lease = acquire_snapshot_lease(
+                root,
+                source_sha256=self.source_sha256,
+                source_size_bytes=64,
+            )
+            marker = lease.directory / "source.flac"
+            marker.write_bytes(b"irreplaceable snapshot")
+            original = lease.receipt_path.read_text(encoding="utf-8")
+            owner_record = f'"owner_pid": {os.getpid()},'
+            self.assertIn(owner_record, original)
+            ambiguous = original.replace(
+                owner_record,
+                owner_record + '\n  "owner_pid": 2000000000,',
+                1,
+            )
+            lease.receipt_path.write_text(ambiguous, encoding="utf-8")
+
+            with mock.patch(
+                "groove_serpent.cache_storage._pid_exists",
+                return_value=False,
+            ):
+                status = inspect_snapshot_cache(root)
+                cleaned = cleanup_stale_snapshots(root)
+
+            self.assertIsNone(status.entries[0].metadata)
+            self.assertFalse(status.entries[0].reclaimable)
+            self.assertEqual(cleaned.removed, ())
+            self.assertTrue(marker.is_file())
+            lease._released = True
 
     def test_hardlinked_receipt_is_not_trusted_as_cache_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory_value:
