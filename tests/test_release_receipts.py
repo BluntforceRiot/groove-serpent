@@ -3,6 +3,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from groove_serpent import __version__
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,3 +59,11 @@ def test_stable_version_package_has_matching_development_classifier() -> None:
     classifiers = project["project"]["classifiers"]
     assert "Development Status :: 5 - Production/Stable" in classifiers
     assert "Development Status :: 4 - Beta" not in classifiers
+
+
+def test_review_header_matches_the_package_version() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project["project"]["version"]
+    assert __version__ == version
+    markup = (ROOT / "src/groove_serpent/web/index.html").read_text(encoding="utf-8")
+    assert f"<h1>Groove Serpent <small>{version}</small></h1>" in markup
