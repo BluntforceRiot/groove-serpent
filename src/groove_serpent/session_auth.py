@@ -64,6 +64,7 @@ class LoopbackSessionAuth:
         "_bootstrap_lock",
         "_bootstrap_path",
         "_cookie_name",
+        "_cookie_token",
         "_public_host",
         "_token",
     )
@@ -71,6 +72,7 @@ class LoopbackSessionAuth:
     def __init__(self) -> None:
         # token_urlsafe(32) draws 32 random bytes: a 256-bit capability.
         self._token = secrets.token_urlsafe(32)
+        self._cookie_token = secrets.token_urlsafe(32)
         self._bootstrap_lock = threading.Lock()
         self._bootstrap_consumed = False
         self._cookie_name = f"groove_serpent_{secrets.token_hex(16)}"
@@ -82,7 +84,10 @@ class LoopbackSessionAuth:
 
     def _new_bootstrap_path(self) -> str:
         bootstrap_nonce = secrets.token_urlsafe(32)
-        while hmac.compare_digest(bootstrap_nonce, self._token):
+        while any(
+            hmac.compare_digest(bootstrap_nonce, value)
+            for value in (self._token, self._cookie_token)
+        ):
             bootstrap_nonce = secrets.token_urlsafe(32)
         return f"{_BOOTSTRAP_PREFIX}{bootstrap_nonce}"
 
@@ -107,7 +112,7 @@ class LoopbackSessionAuth:
         """Return a host-only, per-server, non-script-readable session cookie."""
 
         return (
-            f"{self._cookie_name}={self._token}; Path=/; HttpOnly; "
+            f"{self._cookie_name}={self._cookie_token}; Path=/; HttpOnly; "
             "SameSite=Strict"
         )
 
@@ -176,7 +181,7 @@ class LoopbackSessionAuth:
             cookie_authenticated = (
                 candidate is not None
                 and candidate.isascii()
-                and hmac.compare_digest(candidate, self._token)
+                and hmac.compare_digest(candidate, self._cookie_token)
             )
 
         if not authorization_values:
