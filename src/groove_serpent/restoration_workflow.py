@@ -30,6 +30,7 @@ from .errors import GrooveSerpentError, ProjectValidationError
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
     probe_audio,
     sha256_file,
     tool_version,
@@ -53,8 +54,10 @@ from .restoration import (
 )
 from .subprocess_policy import (
     BoundedDiagnostic,
+    MEDIA_RENDER_TIMEOUT_SECONDS,
     join_diagnostic_reader,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 from .validation import strict_finite_number
@@ -531,6 +534,8 @@ def _decode_chunks(
     chunk_frames: int = 262_144,
 ) -> Generator[np.ndarray, None, None]:
     ffmpeg = find_tool("ffmpeg")
+    frame_bytes = channels * spec.bytes_per_sample
+    maximum_output_bytes = (end_frame - start_frame) * frame_bytes
     filter_graph = (
         f"atrim=start_sample={start_frame}:end_sample={end_frame},"
         "asetpts=PTS-STARTPTS"
@@ -541,8 +546,7 @@ def _decode_chunks(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
         "-map",
         "0:a:0",
         "-vn",
@@ -554,9 +558,10 @@ def _decode_chunks(
         spec.codec,
         "-f",
         spec.format,
+        "-fs",
+        str(maximum_output_bytes),
         "pipe:1",
     ]
-    frame_bytes = channels * spec.bytes_per_sample
     process: subprocess.Popen[bytes] | None = None
     stderr_thread: threading.Thread | None = None
     diagnostic_capture: BoundedDiagnostic | None = None
@@ -564,8 +569,9 @@ def _decode_chunks(
     remainder = b""
     completed = False
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             command,
+            timeout=MEDIA_RENDER_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -609,6 +615,10 @@ def _decode_chunks(
                 f"FFmpeg decoded {decoded_frames} frames; expected {expected_frames}."
             )
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            "Restoration PCM decoding exceeded its safety deadline."
+        ) from exc
     finally:
         if process is not None and process.stdout is not None:
             try:
@@ -1802,8 +1812,9 @@ def _encode_flac(
     completed = False
     write_error: OSError | None = None
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             command,
+            timeout=MEDIA_RENDER_TIMEOUT_SECONDS,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -1836,6 +1847,10 @@ def _encode_flac(
                 f"FFmpeg preview PCM streaming failed: {write_error}"
             ) from write_error
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            "Click-preview encoding exceeded its safety deadline."
+        ) from exc
     except OSError as exc:
         raise GrooveSerpentError(f"Could not start the preview encoder: {exc}") from exc
     finally:
@@ -2501,8 +2516,9 @@ def _encode_streamed_restored_flac(
     completed = False
     cursor = start_frame
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             command,
+            timeout=MEDIA_RENDER_TIMEOUT_SECONDS,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -2544,6 +2560,10 @@ def _encode_streamed_restored_flac(
                 f"{end_frame - start_frame}."
             )
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            "Restoration rendering exceeded its safety deadline."
+        ) from exc
     except OSError as exc:
         raise GrooveSerpentError(f"Restoration PCM streaming failed: {exc}") from exc
     finally:

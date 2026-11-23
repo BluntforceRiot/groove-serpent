@@ -79,8 +79,8 @@ def _directory_identity(parent: Path) -> tuple[int, ...]:
     )
 
 
-def _cached_directory_names(parent: Path) -> tuple[str, ...]:
-    """Return one stable, bounded, stat-invalidated directory snapshot."""
+def _cached_directory_names(parent: Path, *, fresh: bool = False) -> tuple[str, ...]:
+    """Return one stable directory snapshot, bypassing the cache when requested."""
 
     cache_key = os.fspath(parent)
     last_names: tuple[str, ...] | None = None
@@ -88,7 +88,7 @@ def _cached_directory_names(parent: Path) -> tuple[str, ...]:
         with _DIRECTORY_CACHE_LOCK:
             before = _directory_identity(parent)
             cached = _DIRECTORY_CACHE.get(cache_key)
-            if cached is not None and cached.identity == before:
+            if cached is not None and cached.identity == before and not fresh:
                 _DIRECTORY_CACHE.move_to_end(cache_key)
                 return cached.names
             if cached is not None:
@@ -131,17 +131,17 @@ def _absolute_path(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
-def _portable_matches(parent: Path, name: str) -> list[Path]:
+def _portable_matches(parent: Path, name: str, *, fresh: bool = False) -> list[Path]:
     target_key = portable_name_key(name)
     return [
         parent / entry_name
-        for entry_name in _cached_directory_names(parent)
+        for entry_name in _cached_directory_names(parent, fresh=fresh)
         if portable_name_key(entry_name) == target_key
     ]
 
 
-def _unique_portable_match(parent: Path, name: str) -> Path | None:
-    matches = _portable_matches(parent, name)
+def _unique_portable_match(parent: Path, name: str, *, fresh: bool = False) -> Path | None:
+    matches = _portable_matches(parent, name, fresh=fresh)
     if len(matches) > 1:
         spellings = ", ".join(repr(entry.name) for entry in matches)
         raise PortablePathError(
@@ -177,6 +177,7 @@ def resolve_portable_path(
     path: Path,
     *,
     create_parents: bool = False,
+    fresh: bool = True,
 ) -> PortablePathResolution:
     """Resolve every component using NFC/casefold equivalence.
 
@@ -184,7 +185,9 @@ def resolve_portable_path(
     siblings are unsafe and fail closed. Missing components are normalized to
     NFC; when ``create_parents`` is true, missing ancestor directories are
     created one at a time after another equivalence check. The final component
-    is never created by this function.
+    is never created by this function. A live directory read is the default:
+    Windows can retain unchanged directory metadata after a sibling appears.
+    ``fresh=False`` is only suitable for non-authoritative display lookups.
     """
 
     absolute = _absolute_path(path)
@@ -196,7 +199,7 @@ def resolve_portable_path(
     current = anchor
     for index, raw_name in enumerate(parts):
         is_final = index == len(parts) - 1
-        match = _unique_portable_match(current, raw_name)
+        match = _unique_portable_match(current, raw_name, fresh=fresh)
         if match is not None:
             if not is_final:
                 if _is_redirecting_ancestor(match):
@@ -225,7 +228,7 @@ def resolve_portable_path(
             # Another process may have created an exact or equivalent entry
             # after the lookup. Rediscover it and use only one unambiguous
             # directory.
-            match = _unique_portable_match(current, raw_name)
+            match = _unique_portable_match(current, raw_name, fresh=True)
             if (
                 match is None
                 or _is_redirecting_ancestor(match)
@@ -241,7 +244,7 @@ def resolve_portable_path(
             ) from exc
         else:
             try:
-                confirmed = _unique_portable_match(current, raw_name)
+                confirmed = _unique_portable_match(current, raw_name, fresh=True)
             except PortablePathError:
                 # This function created candidate and it is still expected to
                 # be empty. Remove it if possible so a racing equivalent name

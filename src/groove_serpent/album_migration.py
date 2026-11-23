@@ -581,6 +581,37 @@ def _build_plan(
     }
 
 
+def _reconstruct_album_migration(
+    path: Path, backup_raw: bytes
+) -> tuple[
+    dict[str, Any],
+    str,
+    AlbumProject,
+    tuple[dict[str, str], ...],
+    bytes,
+    AlbumMigrationArtifactPaths,
+]:
+    """Rebuild deterministic album state from exact legacy backup bytes."""
+
+    try:
+        original = decode_project_json(backup_raw)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProjectValidationError(
+            f"Album migration backup is not a valid album: {exc}"
+        ) from exc
+    original_schema = original.get("schema")
+    if not isinstance(original_schema, str) or original_schema not in _MIGRATORS:
+        raise ProjectValidationError(
+            "Album migration backup is not a supported legacy album."
+        )
+    migrated, steps = migrate_album_data(original)
+    migrated_raw = _candidate_bytes(migrated)
+    artifacts = album_migration_artifact_paths(
+        path, _sha256(backup_raw), original_schema
+    )
+    return original, original_schema, migrated, steps, migrated_raw, artifacts
+
+
 def _validate_digest(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -787,34 +818,67 @@ def _resume_pending(
 ) -> AlbumMigrationResult:
     plan, artifacts, pending_sha256 = _read_pending(path, pending_path)
     original_sha256 = str(plan["original_sha256"])
-    migrated_sha256 = str(plan["migrated_sha256"])
     backup_raw = _read_artifact(artifacts.backup, MAX_ALBUM_FILE_BYTES)
     if _sha256(backup_raw) != original_sha256:
         raise ProjectValidationError("Album migration backup hash does not match.")
+    (
+        original,
+        original_schema,
+        expected_album,
+        expected_steps,
+        expected_candidate_raw,
+        expected_artifacts,
+    ) = _reconstruct_album_migration(path, backup_raw)
+    expected_migrated_sha256 = _sha256(expected_candidate_raw)
 
     parent_identity = _assert_plain_parent(path)
     current_raw, current_identity = _read_stable_album_bytes(path)
     current_sha256 = _sha256(current_raw)
-    if current_sha256 == original_sha256:
+    if current_raw != backup_raw and current_raw != expected_candidate_raw:
+        raise ProjectValidationError(
+            "Pending album migration conflicts with current album bytes."
+        )
+    expected_side_projects = _side_project_identities(expected_album, path)
+    expected_plan = _build_plan(
+        path=path,
+        original=original,
+        original_schema=original_schema,
+        original_sha256=_sha256(backup_raw),
+        migrated=expected_album,
+        migrated_sha256=expected_migrated_sha256,
+        artifacts=expected_artifacts,
+        steps=expected_steps,
+        side_projects=expected_side_projects,
+    )
+    if plan != expected_plan or artifacts != expected_artifacts:
+        raise ProjectValidationError(
+            "Album migration plan does not match the deterministic migration "
+            "reconstructed from the backup; the backup or a side project changed."
+        )
+    plan = expected_plan
+    artifacts = expected_artifacts
+    original_sha256 = str(plan["original_sha256"])
+    migrated_sha256 = str(plan["migrated_sha256"])
+    if current_raw == backup_raw and current_sha256 == original_sha256:
         if _lexists(artifacts.receipt):
             raise ProjectValidationError(
                 "A receipt exists while the legacy album is still present."
             )
         candidate_raw = _read_artifact(artifacts.candidate, MAX_ALBUM_FILE_BYTES)
-        if _sha256(candidate_raw) != migrated_sha256:
-            raise ProjectValidationError("Album migration candidate hash does not match.")
+        if candidate_raw != expected_candidate_raw:
+            raise ProjectValidationError(
+                "Album migration candidate does not match the deterministic migration "
+                "reconstructed from the backup."
+            )
         candidate_album = AlbumProject.from_dict(decode_project_json(candidate_raw))
         if _sha256(_canonical_json_bytes(candidate_album.to_dict())) != plan[
             "album_state_sha256"
         ]:
             raise ProjectValidationError("Album migration candidate state does not match.")
-        if _side_project_identities(candidate_album, path) != plan["side_projects"]:
-            raise ProjectValidationError(
-                "A referenced side project changed during album migration."
-            )
         repeated_raw, repeated_identity = _read_stable_album_bytes(path)
         if (
             repeated_identity != current_identity
+            or repeated_raw != backup_raw
             or _sha256(repeated_raw) != original_sha256
             or _assert_plain_parent(path) != parent_identity
         ):
@@ -824,7 +888,7 @@ def _resume_pending(
         _commit_album_candidate(
             path,
             artifacts.candidate,
-            candidate_raw,
+            expected_candidate_raw,
             migrated_sha256,
             backup_raw,
             original_sha256,
@@ -833,7 +897,7 @@ def _resume_pending(
         current_raw, _ = _read_stable_album_bytes(path)
         current_sha256 = _sha256(current_raw)
 
-    if current_sha256 != migrated_sha256:
+    if current_raw != expected_candidate_raw or current_sha256 != migrated_sha256:
         raise ProjectValidationError(
             "Pending album migration conflicts with current album bytes."
         )
@@ -841,7 +905,7 @@ def _resume_pending(
         candidate_raw = _read_artifact(
             artifacts.candidate, MAX_ALBUM_FILE_BYTES
         )
-        if _sha256(candidate_raw) != migrated_sha256:
+        if candidate_raw != expected_candidate_raw:
             raise ProjectValidationError(
                 "The migrated album and a changed candidate both exist; state "
                 "is ambiguous."

@@ -4,9 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from groove_serpent.errors import GrooveSerpentError
-from groove_serpent.tracklist import load_tracklist, parse_duration
+from groove_serpent.models import MAX_TRACKS
+from groove_serpent.tracklist import (
+    MAX_TRACKLIST_BYTES,
+    MAX_TRACKLIST_LINE_BYTES,
+    load_tracklist,
+    parse_duration,
+)
 
 
 class TracklistTests(unittest.TestCase):
@@ -59,6 +66,50 @@ class TracklistTests(unittest.TestCase):
             self.assertEqual(result.metadata["side"], "B")
             self.assertEqual(result.tracks[1].title, "Finale")
             self.assertEqual(result.tracks[1].duration_seconds, 301.0)
+
+    def test_oversized_file_is_rejected_before_decoding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tracks.json"
+            with path.open("wb") as source:
+                source.truncate(MAX_TRACKLIST_BYTES + 1)
+            with patch("groove_serpent.tracklist.json.JSONDecoder") as decoder:
+                with self.assertRaisesRegex(GrooveSerpentError, "byte limit"):
+                    load_tracklist(path)
+                decoder.assert_not_called()
+
+    def test_json_and_text_stop_at_the_track_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            json_path = Path(directory) / "tracks.json"
+            json_path.write_text(
+                json.dumps({"tracks": [{"title": "Track"}] * (MAX_TRACKS + 1)}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(GrooveSerpentError, "more than"):
+                load_tracklist(json_path)
+
+            text_path = Path(directory) / "tracks.txt"
+            text_path.write_text("Track\n" * (MAX_TRACKS + 1), encoding="utf-8")
+            with self.assertRaisesRegex(GrooveSerpentError, "more than"):
+                load_tracklist(text_path)
+
+    def test_oversized_fields_and_lines_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tracks.txt"
+            path.write_text("X" * (MAX_TRACKLIST_LINE_BYTES + 1), encoding="utf-8")
+            with self.assertRaisesRegex(GrooveSerpentError, "line exceeds"):
+                load_tracklist(path)
+
+            json_path = Path(directory) / "tracks.json"
+            json_path.write_text(json.dumps([{"title": "X" * 4097}]), encoding="utf-8")
+            with self.assertRaisesRegex(GrooveSerpentError, "Track title exceeds"):
+                load_tracklist(json_path)
+
+    def test_json_trailing_comma_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tracks.json"
+            path.write_text('{"tracks":["Track",]}', encoding="utf-8")
+            with self.assertRaisesRegex(GrooveSerpentError, "Invalid JSON"):
+                load_tracklist(path)
 
 
 if __name__ == "__main__":

@@ -365,6 +365,76 @@ class AlbumMigrationTests(unittest.TestCase):
                     (directory / str(result.backup)).read_bytes(), original
                 )
 
+    def test_self_consistent_forged_pending_candidate_is_rejected(self) -> None:
+        real_write = migration_module._write_exclusive
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            self._write_current_side(directory)
+            path, original = self._copy_fixture(directory, 2)
+
+            def stop_after_pending(target: Path, payload: bytes) -> None:
+                real_write(target, payload)
+                if target.name.endswith(".pending.json"):
+                    raise KeyboardInterrupt
+
+            with patch.object(
+                migration_module, "_write_exclusive", side_effect=stop_after_pending
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    migrate_album_file(path)
+
+            artifacts = album_migration_artifact_paths(
+                path, _sha256(original), "groove-serpent.album/2"
+            )
+            candidate_data = decode_project_json(artifacts.candidate.read_bytes())
+            candidate_data["metadata"]["title"] = "Attacker-chosen title"
+            attacker_album = AlbumProject.from_dict(candidate_data)
+            attacker_raw = (
+                json.dumps(
+                    attacker_album.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8")
+            artifacts.candidate.write_bytes(attacker_raw)
+
+            pending = decode_project_json(artifacts.pending.read_bytes())
+            plan = pending["plan"]
+            plan["migrated_sha256"] = _sha256(attacker_raw)
+            plan["album_state_sha256"] = _sha256(
+                json.dumps(
+                    attacker_album.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            pending["plan_sha256"] = _sha256(
+                json.dumps(
+                    plan,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            artifacts.pending.write_text(json.dumps(pending), encoding="utf-8")
+            forged_pending = artifacts.pending.read_bytes()
+
+            with self.assertRaisesRegex(
+                ProjectValidationError, "deterministic migration"
+            ):
+                migrate_album_file(path)
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(artifacts.candidate.read_bytes(), attacker_raw)
+            self.assertEqual(artifacts.pending.read_bytes(), forged_pending)
+            self.assertFalse(artifacts.receipt.exists())
+
     def test_mismatched_partial_candidate_is_left_untouched(self) -> None:
         real_write = migration_module._write_exclusive
         with tempfile.TemporaryDirectory() as value:

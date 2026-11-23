@@ -13,6 +13,7 @@ import math
 import os
 import shutil
 import stat
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -70,7 +71,13 @@ from .exporter import (
     render_verified_track,
     sanitize_filename,
 )
-from .media import audio_source_descriptor_mismatches, find_tool, probe_audio
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    local_ffmpeg_input_args,
+    local_ffprobe_input_args,
+    probe_audio,
+)
 from .models import Project, Track
 from .portable_names import (
     PortablePathError,
@@ -1123,19 +1130,27 @@ def _verification_payload(value: Any) -> dict[str, Any]:
 
 
 def _semantic_tags_and_artwork(path: Path) -> dict[str, Any]:
-    completed = run_bounded_capture(
-        [
-            find_tool("ffprobe"),
-            "-v",
-            "error",
-            "-show_entries",
-            ("format_tags:stream=index,codec_type:stream_disposition=attached_pic:stream_tags"),
-            "-of",
-            "json",
-            str(path),
-        ],
-        stdout_limit=1024 * 1024,
-    )
+    try:
+        completed = run_bounded_capture(
+            [
+                find_tool("ffprobe"),
+                "-v",
+                "error",
+                "-show_entries",
+                (
+                    "format_tags:stream=index,codec_type:"
+                    "stream_disposition=attached_pic:stream_tags"
+                ),
+                "-of",
+                "json",
+                *local_ffprobe_input_args(path),
+            ],
+            stdout_limit=1024 * 1024,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExportError(
+            f"Audio metadata verification timed out for {path.name!r}."
+        ) from exc
     if completed.returncode != 0 or completed.stdout_truncated or completed.stderr_truncated:
         raise ExportError(f"Audio metadata could not be verified for {path.name!r}.")
     try:
@@ -1185,28 +1200,32 @@ def _semantic_tags_and_artwork(path: Path) -> dict[str, Any]:
         raise ExportError(f"Audio file {path.name!r} has multiple attached pictures.")
     artwork_sha256: str | None = None
     if attached_streams == 1:
-        artwork = run_bounded_capture(
-            [
-                find_tool("ffmpeg"),
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-xerror",
-                "-i",
-                str(path),
-                "-map",
-                "0:v:0",
-                "-frames:v",
-                "1",
-                "-c:v",
-                "copy",
-                "-f",
-                "image2pipe",
-                "pipe:1",
-            ],
-            stdout_limit=_MAX_EMBEDDED_ARTWORK_BYTES,
-        )
+        try:
+            artwork = run_bounded_capture(
+                [
+                    find_tool("ffmpeg"),
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-xerror",
+                    *local_ffmpeg_input_args(path),
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "copy",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ],
+                stdout_limit=_MAX_EMBEDDED_ARTWORK_BYTES,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExportError(
+                f"Embedded artwork verification timed out for {path.name!r}."
+            ) from exc
         if (
             artwork.returncode != 0
             or artwork.stdout_truncated

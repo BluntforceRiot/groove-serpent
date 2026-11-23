@@ -985,13 +985,11 @@ UNINSTALL / REMOVE
 
 INTEGRITY AND SIGNING
   PORTABLE-MANIFEST.json records exact payload hashes and exact build inputs.
-  Run verify-portable.cmd before use. When a trusted release receipt provides
-  the manifest hash, pass:
-    verify-portable.cmd --expected-manifest-sha256 64_HEX_CHARACTERS
-  Without that external hash, verification proves consistency, not origin or
-  authenticity. The verifier does not execute the app, NumPy, FFmpeg, or
-  ffprobe while it hashes them; its bundled Python bootstrap is still part of
-  the externally anchored payload trust boundary.
+  Before launching, use independently trusted host Python and a reviewed
+  verify_windows_portable.py outside the bundle. Follow the trusted copy of
+  WINDOWS_RELEASE_POLICY.md and supply its separately trusted manifest hash.
+  Do not run verify-portable.cmd, verify-portable.py, or the bundled Python
+  to establish trust. A consistency-only check does not authorize launching.
   This private foundation does not claim Authenticode or other code signing.
 
 LICENSES
@@ -1022,13 +1020,10 @@ def _launcher() -> bytes:
 def _verifier_launcher() -> bytes:
     return (
         "@echo off\r\n"
-        "setlocal\r\n"
-        'set "PYTHONDONTWRITEBYTECODE=1"\r\n'
-        'set "PYTHONNOUSERSITE=1"\r\n'
-        'set "PYTHONUTF8=1"\r\n'
-        '"%~dp0runtime\\python.exe" -B "%~dp0verify-portable.py" '
-        '--root "%~dp0." %*\r\n'
-        "exit /b %errorlevel%\r\n"
+        "echo This bundle cannot verify itself. 1>&2\r\n"
+        "echo Use trusted host Python and verify_windows_portable.py from outside it. 1>&2\r\n"
+        "echo Follow independently trusted release instructions before running the app. 1>&2\r\n"
+        "exit /b 2\r\n"
     ).encode("ascii")
 
 
@@ -1391,12 +1386,12 @@ def _smoke_bundle(
     }
 
 
-def _smoke_packaged_verifier(
+def _smoke_host_verifier(
     root: Path,
     expected_manifest_sha256: str,
 ) -> dict[str, object]:
     environment = {
-        "PATH": str(root / "tools"),
+        "PATH": str(Path(sys.executable).resolve(strict=True).parent),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUTF8": "1",
@@ -1406,9 +1401,11 @@ def _smoke_packaged_verifier(
     }
     completed = _run_bounded(
         [
-            str(root / "runtime" / "python.exe"),
+            str(Path(sys.executable).resolve(strict=True)),
+            "-I",
+            "-S",
             "-B",
-            str(root / "verify-portable.py"),
+            str(ROOT / "scripts" / "verify_windows_portable.py"),
             "--root",
             str(root),
             "--expected-manifest-sha256",
@@ -1420,16 +1417,16 @@ def _smoke_packaged_verifier(
     try:
         decoded = json.loads(completed.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PortableBuildError("Packaged verifier did not emit strict JSON.") from exc
+        raise PortableBuildError("Trusted-host verifier did not emit strict JSON.") from exc
     if not isinstance(decoded, dict) or not all(isinstance(key, str) for key in decoded):
-        raise PortableBuildError("Packaged verifier did not emit a JSON object.")
+        raise PortableBuildError("Trusted-host verifier did not emit a JSON object.")
     result = cast(dict[str, object], decoded)
     if (
         result.get("ok") is not True
         or result.get("manifest_sha256") != expected_manifest_sha256
         or result.get("authenticity") != "anchored-to-expected-manifest-sha256"
     ):
-        raise PortableBuildError("Packaged verifier did not validate the exact staged bundle.")
+        raise PortableBuildError("Trusted-host verifier did not validate the exact staged bundle.")
     return result
 
 
@@ -1827,13 +1824,13 @@ def build_portable_directory(
         _write_manifest(stage, inputs, smoke, epoch, builder_sha256)
         _verify_manifest(stage)
         manifest_sha256 = _sha256_file(stage / "PORTABLE-MANIFEST.json")
-        _smoke_packaged_verifier(stage, manifest_sha256)
+        _smoke_host_verifier(stage, manifest_sha256)
         _publish_new_directory(stage, final)
         inspect_plain_directory(final, "Published portable directory")
         if capture_identity(final) != stage_identity:
             raise PortableBuildError("Published portable directory changed identity.")
         _verify_manifest(final)
-        _smoke_packaged_verifier(final, manifest_sha256)
+        _smoke_host_verifier(final, manifest_sha256)
         completed = True
         return final
     finally:

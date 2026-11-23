@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -107,7 +108,12 @@ def _observe_media_tool(name: str) -> tuple[str, str, str]:
         command = [str(executable_path), "-version"]
         if name == "ffmpeg":
             command = require_ffmpeg_nostdin(command)
-        completed = run_bounded_capture(command)
+        try:
+            completed = run_bounded_capture(command)
+        except subprocess.TimeoutExpired as exc:
+            raise ProjectValidationError(
+                f"{name} version/build query exceeded its safety deadline."
+            ) from exc
         if (
             completed.returncode != 0
             or completed.stdout_truncated

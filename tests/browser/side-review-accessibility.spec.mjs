@@ -47,10 +47,11 @@ async function loadSideReview(page) {
   await expect(page.locator("#status")).toHaveText("Ready");
   await expect(page.getByRole("heading", { level: 2, name: "Drag the cut markers" }))
     .toBeVisible();
-  await expect(page.locator("#evidenceStatus")).not.toContainText(
-    "Select any track marker",
+  // Wait for the first decode to settle before later controls trigger a new
+  // selection. A pending timer can otherwise supersede a WebKit POST with 409.
+  await expect(page.locator("#evidenceStatus")).toHaveText(
+    "Evidence is aligned to the selected marker on one exact sample grid.",
   );
-  await expect(page.locator("#evidenceStatus")).not.toHaveClass(/busy/);
 }
 
 async function tabUntil(page, predicate, limit = 100, key = "Tab") {

@@ -24,6 +24,8 @@ def main() -> int:
             sys.executable,
             "-m",
             "mypy",
+            "--platform",
+            "win32",
             "--no-incremental",
             "src/groove_serpent",
         ]

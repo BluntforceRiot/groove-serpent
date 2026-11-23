@@ -14,15 +14,56 @@ from .executable_discovery import find_executable
 from .models import AudioSource
 from .subprocess_policy import (
     BoundedDiagnostic,
+    MEDIA_ANALYSIS_TIMEOUT_SECONDS,
+    MEDIA_RENDER_TIMEOUT_SECONDS,
     join_diagnostic_reader,
     require_ffmpeg_nostdin,
     run_bounded_capture,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 
 
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
+_LOCAL_MEDIA_PROTOCOLS = "file,pipe"
+_LOCAL_MEDIA_DEMUXERS = {
+    ".aif": "aiff",
+    ".aiff": "aiff",
+    ".flac": "flac",
+    ".jpeg": "image2",
+    ".jpg": "image2",
+    ".m4a": "mov",
+    ".png": "image2",
+    ".wav": "wav",
+    ".wave": "wav",
+}
+
+
+def _local_media_input_options(path: Path) -> list[str]:
+    demuxer = _LOCAL_MEDIA_DEMUXERS.get(path.suffix.casefold())
+    if demuxer is None:
+        raise GrooveSerpentError(
+            f"Unsupported local media container for '{path.name}'."
+        )
+    return [
+        "-protocol_whitelist",
+        _LOCAL_MEDIA_PROTOCOLS,
+        "-f",
+        demuxer,
+    ]
+
+
+def local_ffmpeg_input_args(path: Path) -> list[str]:
+    """Build one local-only FFmpeg input with an explicit expected demuxer."""
+
+    return [*_local_media_input_options(path), "-i", str(path)]
+
+
+def local_ffprobe_input_args(path: Path) -> list[str]:
+    """Build one local-only ffprobe input with an explicit expected demuxer."""
+
+    return [*_local_media_input_options(path), str(path)]
 
 
 def audio_source_descriptor_mismatches(
@@ -77,7 +118,16 @@ def tool_version(name: str) -> str:
     command = [executable, "-version"]
     if Path(executable).name.casefold().startswith("ffmpeg"):
         command = require_ffmpeg_nostdin(command)
-    completed = run_bounded_capture(command)
+    try:
+        completed = run_bounded_capture(command)
+    except subprocess.TimeoutExpired:
+        return f"{name}: version unavailable"
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
+        return f"{name}: version unavailable"
     output = (completed.stdout or completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -90,6 +140,7 @@ def probe_audio(path: Path, stored_path: str | None = None) -> AudioSource:
     if not path.is_file():
         raise GrooveSerpentError(f"Input audio does not exist: {path}")
 
+    input_args = local_ffprobe_input_args(path)
     ffprobe = find_tool("ffprobe")
     command = [
         ffprobe,
@@ -106,26 +157,29 @@ def probe_audio(path: Path, stored_path: str | None = None) -> AudioSource:
         "format=duration",
         "-of",
         "json",
-        str(path),
+        *input_args,
     ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if completed.returncode != 0:
+    try:
+        completed = run_bounded_capture(command)
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            f"ffprobe exceeded its safety deadline while reading '{path.name}'."
+        ) from exc
+    diagnostic = completed.stderr.decode("utf-8", errors="replace")
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
         raise GrooveSerpentError(
             f"ffprobe could not read '{path.name}':\n"
-            f"{completed.stderr[:MAX_DIAGNOSTIC_BYTES].strip()}"
+            f"{diagnostic[:MAX_DIAGNOSTIC_BYTES].strip()}"
         )
 
     try:
-        payload = json.loads(completed.stdout)
+        payload = json.loads(completed.stdout.decode("utf-8"))
         stream = payload["streams"][0]
-    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+    except (KeyError, IndexError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GrooveSerpentError(f"No readable audio stream was found in {path}.") from exc
 
     duration_value = stream.get("duration") or payload.get("format", {}).get("duration")
@@ -175,6 +229,7 @@ def decode_rms_envelope(
     *,
     analysis_rate: int,
     window_ms: int,
+    maximum_duration_seconds: float,
 ) -> tuple[list[float], float]:
     """Decode audio through FFmpeg and return one mono RMS dBFS value per window.
 
@@ -184,18 +239,27 @@ def decode_rms_envelope(
 
     if analysis_rate <= 0 or window_ms <= 0:
         raise ValueError("analysis_rate and window_ms must be positive")
+    if (
+        not math.isfinite(maximum_duration_seconds)
+        or maximum_duration_seconds <= 0
+    ):
+        raise ValueError("maximum_duration_seconds must be finite and positive")
 
+    input_args = local_ffmpeg_input_args(path)
     ffmpeg = find_tool("ffmpeg")
     window_samples = max(1, round(analysis_rate * window_ms / 1000.0))
     window_seconds = window_samples / analysis_rate
+    maximum_samples = (
+        math.ceil(maximum_duration_seconds * analysis_rate) + analysis_rate
+    )
+    maximum_output_bytes = maximum_samples * 4
     command = [
         ffmpeg,
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(path),
+        *input_args,
         "-map",
         "0:a:0",
         "-vn",
@@ -207,6 +271,8 @@ def decode_rms_envelope(
         str(analysis_rate),
         "-f",
         "f32le",
+        "-fs",
+        str(maximum_output_bytes),
         "pipe:1",
     ]
 
@@ -215,8 +281,9 @@ def decode_rms_envelope(
     diagnostic_thread = None
     completed = False
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             require_ffmpeg_nostdin(command),
+            timeout=MEDIA_ANALYSIS_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -231,6 +298,7 @@ def decode_rms_envelope(
         values: list[float] = []
         sample_remainder = np.empty(0, dtype="<f4")
         byte_remainder = b""
+        decoded_samples = 0
 
         while True:
             chunk = process.stdout.read(4 * 1024 * 1024)
@@ -241,6 +309,11 @@ def decode_rms_envelope(
             byte_remainder = chunk[usable_bytes:]
             if usable_bytes == 0:
                 continue
+            decoded_samples += usable_bytes // 4
+            if decoded_samples >= maximum_samples:
+                raise GrooveSerpentError(
+                    "FFmpeg analysis exceeded the validated PCM output bound."
+                )
             samples = np.frombuffer(chunk[:usable_bytes], dtype="<f4")
             if sample_remainder.size:
                 samples = np.concatenate((sample_remainder, samples))
@@ -263,6 +336,10 @@ def decode_rms_envelope(
         join_diagnostic_reader(process, diagnostic_thread)
         stderr = diagnostic_capture.text() if diagnostic_capture else ""
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            f"FFmpeg analysis exceeded its safety deadline for '{path.name}'."
+        ) from exc
     finally:
         if process is not None and process.stdout is not None:
             try:
@@ -293,8 +370,9 @@ def run_ffmpeg(command: Iterable[str]) -> None:
     diagnostic_thread = None
     completed = False
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             require_ffmpeg_nostdin(list(command)),
+            timeout=MEDIA_RENDER_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -307,6 +385,8 @@ def run_ffmpeg(command: Iterable[str]) -> None:
         join_diagnostic_reader(process, diagnostic_thread)
         diagnostic = diagnostic_capture.text()
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError("FFmpeg exceeded the media render safety deadline.") from exc
     finally:
         if not completed:
             terminate_and_reap(process)

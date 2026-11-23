@@ -847,6 +847,7 @@ def _analyze_audio_snapshot(
         source_snapshot.path,
         analysis_rate=settings.analysis_rate,
         window_ms=settings.window_ms,
+        maximum_duration_seconds=source.duration_seconds,
     )
     envelope = smooth_envelope(raw_envelope, settings.smoothing_windows)
     noise_floor, silence_threshold, active_threshold = estimate_thresholds(

@@ -18,6 +18,8 @@ from .errors import ExportError, GrooveSerpentError, ProjectValidationError
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
+    local_ffprobe_input_args,
     probe_audio,
     run_ffmpeg,
     tool_version,
@@ -48,8 +50,12 @@ from .publication import (
 )
 from .subprocess_policy import (
     BoundedDiagnostic,
+    MAX_DIAGNOSTIC_BYTES,
+    MEDIA_RENDER_TIMEOUT_SECONDS,
     join_diagnostic_reader,
+    run_bounded_capture,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 from .validation import strict_finite_number
@@ -76,6 +82,7 @@ _STORAGE_FILE_OVERHEAD_BYTES = 1024 * 1024
 _PORTABLE_COMPONENT_UTF8_BYTES = 240
 _PORTABLE_COMPONENT_UTF16_UNITS = 240
 _TRUNCATED_NAME_HASH_HEX = 10
+_MAX_FFPROBE_OUTPUT_BYTES = 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -488,39 +495,53 @@ def _probe_m4a_presentation_sample_count(path: Path, expected_sample_rate: int) 
     """
 
     ffprobe = find_tool("ffprobe")
-    completed = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=sample_rate,duration_ts,time_base",
-            "-of",
-            "json",
-            str(path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if completed.returncode != 0:
+    try:
+        completed = run_bounded_capture(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate,duration_ts,time_base",
+                "-of",
+                "json",
+                *local_ffprobe_input_args(path),
+            ],
+            stdout_limit=_MAX_FFPROBE_OUTPUT_BYTES,
+            stderr_limit=MAX_DIAGNOSTIC_BYTES,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExportError(
+            f"FFprobe exceeded its deadline verifying staged M4A '{path.name}'."
+        ) from exc
+    diagnostic = completed.stderr.decode("utf-8", errors="replace").strip()
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
         raise ExportError(
             f"FFprobe could not verify the staged M4A '{path.name}': "
-            f"{completed.stderr.strip() or 'no diagnostic was returned'}"
+            f"{diagnostic or 'bounded output was unavailable'}"
         )
     try:
-        payload = json.loads(completed.stdout)
+        payload = json.loads(completed.stdout.decode("utf-8"))
         stream = payload["streams"][0]
         sample_rate = int(stream["sample_rate"])
         duration_ts = int(stream["duration_ts"])
         numerator_text, denominator_text = str(stream["time_base"]).split("/", 1)
         numerator = int(numerator_text)
         denominator = int(denominator_text)
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ExportError(
             f"FFprobe did not return an exact presentation timeline for '{path.name}'."
         ) from exc
@@ -546,35 +567,42 @@ def _probe_m4a_presentation_sample_count(path: Path, expected_sample_rate: int) 
 def _probe_exact_audio_stream(path: Path) -> dict[str, Any]:
     """Probe one staged audio stream without trusting container duration rounding."""
 
-    completed = subprocess.run(
-        [
-            find_tool("ffprobe"),
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            (
-                "stream=codec_name,sample_rate,channels,bits_per_raw_sample,"
-                "bits_per_sample,sample_fmt,duration_ts,time_base"
-            ),
-            "-of",
-            "json",
-            str(path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if completed.returncode != 0:
+    try:
+        completed = run_bounded_capture(
+            [
+                find_tool("ffprobe"),
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                (
+                    "stream=codec_name,sample_rate,channels,bits_per_raw_sample,"
+                    "bits_per_sample,sample_fmt,duration_ts,time_base"
+                ),
+                "-of",
+                "json",
+                *local_ffprobe_input_args(path),
+            ],
+            stdout_limit=_MAX_FFPROBE_OUTPUT_BYTES,
+            stderr_limit=MAX_DIAGNOSTIC_BYTES,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExportError(
+            f"FFprobe exceeded its deadline verifying staged output '{path.name}'."
+        ) from exc
+    diagnostic = completed.stderr.decode("utf-8", errors="replace").strip()
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
         raise ExportError(
             f"FFprobe could not verify staged output '{path.name}': "
-            f"{completed.stderr.strip() or 'no diagnostic was returned'}"
+            f"{diagnostic or 'bounded output was unavailable'}"
         )
     try:
-        stream = json.loads(completed.stdout)["streams"][0]
+        stream = json.loads(completed.stdout.decode("utf-8"))["streams"][0]
         sample_rate = int(stream["sample_rate"])
         channels = int(stream["channels"])
         duration_ts = int(stream["duration_ts"])
@@ -582,7 +610,14 @@ def _probe_exact_audio_stream(path: Path) -> dict[str, Any]:
         numerator = int(numerator_text)
         denominator = int(denominator_text)
         codec_name = str(stream["codec_name"])
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ExportError(
             f"FFprobe did not return exact audio stream details for '{path.name}'."
         ) from exc
@@ -628,31 +663,38 @@ def _probe_track_numbering_tags(path: Path) -> dict[str, str]:
     generic ``mdta`` tag mode just to manufacture a redundant custom key.
     """
 
-    completed = subprocess.run(
-        [
-            find_tool("ffprobe"),
-            "-v",
-            "error",
-            "-show_entries",
-            "format_tags:stream_tags",
-            "-of",
-            "json",
-            str(path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if completed.returncode != 0:
+    try:
+        completed = run_bounded_capture(
+            [
+                find_tool("ffprobe"),
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags:stream_tags",
+                "-of",
+                "json",
+                *local_ffprobe_input_args(path),
+            ],
+            stdout_limit=_MAX_FFPROBE_OUTPUT_BYTES,
+            stderr_limit=MAX_DIAGNOSTIC_BYTES,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExportError(
+            f"FFprobe exceeded its deadline verifying tags for '{path.name}'."
+        ) from exc
+    diagnostic = completed.stderr.decode("utf-8", errors="replace").strip()
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
         raise ExportError(
             f"FFprobe could not verify track numbering for '{path.name}': "
-            f"{completed.stderr.strip() or 'no diagnostic was returned'}"
+            f"{diagnostic or 'bounded output was unavailable'}"
         )
     try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ExportError(
             f"FFprobe returned invalid track metadata for '{path.name}'."
         ) from exc
@@ -761,8 +803,7 @@ def _complete_decode(path: Path) -> None:
                 "-loglevel",
                 "error",
                 "-xerror",
-                "-i",
-                str(path),
+                *local_ffmpeg_input_args(path),
                 "-map",
                 "0:a:0",
                 "-vn",
@@ -797,8 +838,7 @@ def _decoded_pcm_sha256(
         "-loglevel",
         "error",
         "-xerror",
-        "-i",
-        str(path),
+        *local_ffmpeg_input_args(path),
         "-map",
         "0:a:0",
         "-vn",
@@ -822,8 +862,9 @@ def _decoded_pcm_sha256(
     diagnostic_thread = None
     completed = False
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             command,
+            timeout=MEDIA_RENDER_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -842,6 +883,10 @@ def _decoded_pcm_sha256(
         join_diagnostic_reader(process, diagnostic_thread)
         diagnostic = diagnostic_capture.text() if diagnostic_capture else ""
         completed = True
+    except subprocess.TimeoutExpired as exc:
+        raise ExportError(
+            f"Staged audio '{path.name}' exceeded the PCM verification deadline."
+        ) from exc
     finally:
         if process is not None and process.stdout is not None:
             try:
@@ -1093,11 +1138,10 @@ def _build_command(
         "-loglevel",
         "error",
         "-y" if overwrite else "-n",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
     ]
     if artwork_path is not None:
-        command.extend(["-i", str(artwork_path)])
+        command.extend(local_ffmpeg_input_args(artwork_path))
     command.extend(
         [
             "-map",

@@ -425,17 +425,22 @@ def _hash_installed_record_file(
 
 def _installed_distribution_inventory(repository_root: Path) -> dict[str, Any]:
     environment_root = Path(sys.prefix).resolve(strict=True)
-    search_roots = sorted(
-        {Path(path).resolve(strict=True) for path in site.getsitepackages()},
+    declared_roots = sorted(
+        {Path(path).resolve(strict=False) for path in site.getsitepackages()},
         key=os.fspath,
     )
-    for search_root in search_roots:
+    search_roots: list[Path] = []
+    for search_root in declared_roots:
         try:
             search_root.relative_to(environment_root)
         except ValueError as exc:
             raise AcceptanceError(
                 "An installed-distribution search root is outside the canonical .venv."
             ) from exc
+        if search_root.exists():
+            if not search_root.is_dir():
+                raise AcceptanceError("An installed-distribution search root is not a directory.")
+            search_roots.append(search_root)
     packages: list[dict[str, Any]] = []
     seen: set[str] = set()
     total_record_file_count = 0

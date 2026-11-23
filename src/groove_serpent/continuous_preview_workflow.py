@@ -102,6 +102,7 @@ from .hum_preview import (
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
     probe_audio,
     sha256_file,
     tool_version,
@@ -758,8 +759,7 @@ def _decode_scope(
             find_tool("ffmpeg"),
             "-v",
             "error",
-            "-i",
-            str(snapshot.path),
+            *local_ffmpeg_input_args(snapshot.path),
             "-map",
             "0:a:0",
             "-vn",
@@ -792,6 +792,8 @@ def _decode_scope(
     stdout = completed.stdout
     if completed.stdout_truncated:
         raise ProjectValidationError("FFmpeg returned more PCM than the bounded request allowed.")
+    if completed.stderr_truncated:
+        raise GrooveSerpentError("FFmpeg exceeded the continuous-preview diagnostic bound.")
     if completed.returncode != 0:
         message = completed.stderr.decode("utf-8", errors="replace").strip()
         raise GrooveSerpentError(f"FFmpeg could not decode the continuous preview: {message}")
