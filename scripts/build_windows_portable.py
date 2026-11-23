@@ -47,10 +47,16 @@ MAX_ARCHIVE_MEMBERS = 50_000
 MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_INPUT_BYTES = 1024 * 1024 * 1024
+MAX_AUTHORITY_BYTES = 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 1024 * 1024
 MAX_RELATIVE_PATH_LENGTH = 240
 SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 CHROMAPRINT_FINGERPRINT_RE = re.compile(rb"[A-Za-z0-9_-]{16,16384}={0,2}\Z")
+WINDOWS_PORTABLE_INPUT_AUTHORITY_SCHEMA = (
+    "groove-serpent.windows-portable-input-authority/1"
+)
+WINDOWS_PORTABLE_INPUT_AUTHORITY = ROOT / "packaging" / "windows" / "input-authority.json"
+WINDOWS_MEDIA_CAPABILITY_SMOKE = ROOT / "toolchains" / "windows-media" / "capability_smoke.py"
 WINDOWS_MEDIA_RUNTIME_SCHEMA = "groove-serpent.windows-media-runtime-manifest/1"
 WINDOWS_MEDIA_SMOKE_SCHEMA = "groove-serpent.windows-media-capability-smoke/1"
 WINDOWS_MEDIA_RUNTIME_FILENAME = "groove-serpent-windows-media-8.1.2-x86_64.zip"
@@ -396,6 +402,132 @@ def _strict_json_object(payload: bytes, context: str) -> dict[str, object]:
     return cast(dict[str, object], decoded)
 
 
+def _read_trusted_repository_file(path: Path, context: str, maximum: int) -> bytes:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise PortableBuildError(f"Cannot inspect {context}: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode) or _is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise PortableBuildError(f"{context} must be a checked-in regular non-link file.")
+    if before.st_size > maximum:
+        raise PortableBuildError(f"{context} exceeds its bounded size.")
+    try:
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
+                raise PortableBuildError(f"{context} changed identity while it was opened.")
+            payload = handle.read(maximum + 1)
+    except OSError as exc:
+        raise PortableBuildError(f"Cannot read {context}: {exc}") from exc
+    if len(payload) != before.st_size or len(payload) > maximum:
+        raise PortableBuildError(f"{context} changed size while it was read.")
+    return payload
+
+
+def _authority_input_records(inputs: PortableInputs) -> list[dict[str, str]]:
+    def record(exact: ExactInput, role: str, **identity: str) -> dict[str, str]:
+        filename = _portable_component(exact.path.name, f"{exact.label} filename")
+        return {
+            "filename": filename,
+            "role": role,
+            "sha256": _validated_sha256(exact.sha256, f"{exact.label} SHA-256"),
+            **identity,
+        }
+
+    records = [
+        record(
+            inputs.app_wheel.exact,
+            "app-wheel",
+            distribution=_normalized_distribution(inputs.app_wheel.distribution),
+            version=inputs.app_wheel.version,
+        ),
+        *(
+            record(
+                wheel.exact,
+                "dependency-wheel",
+                distribution=_normalized_distribution(wheel.distribution),
+                version=wheel.version,
+            )
+            for wheel in inputs.dependency_wheels
+        ),
+        record(inputs.python_embed, "python-embed", version=inputs.python_version),
+        record(inputs.windows_media_runtime, "windows-media-runtime"),
+        record(
+            inputs.windows_media_corresponding_source,
+            "windows-media-corresponding-source",
+        ),
+        record(inputs.groove_license, "groove-license"),
+        record(inputs.third_party_notices, "third-party-notices"),
+        record(inputs.portable_verifier, "portable-verifier"),
+        *(
+            record(
+                resource.exact,
+                "skill-file",
+                destination=resource.destination.as_posix(),
+            )
+            for resource in inputs.skill_files
+        ),
+    ]
+    return sorted(records, key=lambda item: json.dumps(item, sort_keys=True))
+
+
+def _verify_input_authority(inputs: PortableInputs) -> None:
+    payload = _read_trusted_repository_file(
+        WINDOWS_PORTABLE_INPUT_AUTHORITY,
+        "Windows portable input authority",
+        MAX_AUTHORITY_BYTES,
+    )
+    authority = _strict_json_object(payload, "Windows portable input authority")
+    if set(authority) != {"releases", "schema"}:
+        raise PortableBuildError("Windows portable input authority fields are not exact.")
+    if authority.get("schema") != WINDOWS_PORTABLE_INPUT_AUTHORITY_SCHEMA:
+        raise PortableBuildError("Windows portable input authority schema is unsupported.")
+    releases = authority.get("releases")
+    if not isinstance(releases, list):
+        raise PortableBuildError("Windows portable input authority releases are not an array.")
+    validated_releases: list[dict[str, object]] = []
+    for candidate in releases:
+        if (
+            not isinstance(candidate, dict)
+            or not all(isinstance(key, str) for key in candidate)
+            or set(candidate) != {"inputs", "python_version", "version"}
+            or not isinstance(candidate.get("version"), str)
+            or not isinstance(candidate.get("python_version"), str)
+            or not isinstance(candidate.get("inputs"), list)
+        ):
+            raise PortableBuildError("Windows portable input authority has a malformed release.")
+        validated_releases.append(cast(dict[str, object], candidate))
+    versions = [cast(str, release["version"]) for release in validated_releases]
+    if len(versions) != len(set(versions)):
+        raise PortableBuildError("Windows portable input authority repeats a release version.")
+    matches = [
+        release
+        for release in validated_releases
+        if release.get("version") == inputs.app_wheel.version
+    ]
+    if len(matches) != 1:
+        raise PortableBuildError(
+            "The application version has no unique independently authorized input set."
+        )
+    release = matches[0]
+    if release.get("python_version") != inputs.python_version:
+        raise PortableBuildError("The authorized release identity is not exact.")
+    authorized = release.get("inputs")
+    if not isinstance(authorized, list) or not all(
+        isinstance(item, dict) and all(isinstance(key, str) for key in item)
+        for item in authorized
+    ):
+        raise PortableBuildError("The authorized release inputs are not exact objects.")
+    normalized = sorted(
+        cast(list[dict[str, object]], authorized),
+        key=lambda item: json.dumps(item, sort_keys=True),
+    )
+    if normalized != _authority_input_records(inputs):
+        raise PortableBuildError(
+            "The supplied inputs do not match the independently authorized release input set."
+        )
+
+
 def _parse_archive_sums(payload: bytes, context: str) -> dict[str, str]:
     try:
         text = payload.decode("utf-8", errors="strict")
@@ -491,7 +623,8 @@ def _verify_windows_media_pair(
     source_snapshot: Path,
     destination: Path,
     epoch: int,
-) -> tuple[WindowsMediaEvidence, bytes]:
+    trusted_capability_script: bytes,
+) -> WindowsMediaEvidence:
     try:
         runtime_archive = zipfile.ZipFile(runtime_snapshot, "r")
         runtime_members = _archive_members(runtime_archive, "Windows media runtime")
@@ -610,6 +743,10 @@ def _verify_windows_media_pair(
             source_archive,
             source_by_name["recipe/capability_smoke.py"],
         )
+        if capability_script != trusted_capability_script:
+            raise PortableBuildError(
+                "Windows media capability smoke does not match the checked-in implementation."
+            )
         _extract_members(
             runtime_archive,
             runtime_members,
@@ -627,7 +764,7 @@ def _verify_windows_media_pair(
             ffmpeg_version="8.1.2",
             source_input_count=len(runtime_sources),
         )
-        return evidence, capability_script
+        return evidence
     finally:
         runtime_archive.close()
         source_archive.close()
@@ -947,10 +1084,13 @@ def _smoke_windows_media_runtime(
                 str(report),
             ],
             environment={
-                **os.environ,
+                "PATH": str(root / "tools"),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONUTF8": "1",
+                "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                "TEMP": tempfile.gettempdir(),
+                "TMP": tempfile.gettempdir(),
             },
             timeout=240.0,
         )
@@ -1553,10 +1693,21 @@ def build_portable_directory(
     output_root: Path,
     *,
     epoch: int = DEFAULT_EPOCH,
+    execute_verified_inputs: bool = False,
 ) -> Path:
-    """Build, smoke, and atomically publish a new self-contained Windows directory."""
+    """Build, explicitly smoke, and atomically publish an authorized Windows directory."""
 
     epoch = _validate_epoch(epoch)
+    _verify_input_authority(inputs)
+    if not execute_verified_inputs:
+        raise PortableBuildError(
+            "Portable input execution requires the explicit execute_verified_inputs opt-in."
+        )
+    capability_script_payload = _read_trusted_repository_file(
+        WINDOWS_MEDIA_CAPABILITY_SMOKE,
+        "checked-in Windows media capability smoke",
+        MAX_ARCHIVE_MEMBER_BYTES,
+    )
     builder_path = Path(__file__).resolve()
     builder_sha256 = _sha256_file(builder_path)
     version = inputs.app_wheel.version
@@ -1607,11 +1758,12 @@ def build_portable_directory(
         )
         tools = stage / "tools"
         tools.mkdir()
-        media_evidence, capability_script_payload = _verify_windows_media_pair(
+        media_evidence = _verify_windows_media_pair(
             media_runtime_snapshot,
             media_source_snapshot,
             tools,
             epoch,
+            capability_script_payload,
         )
         capability_script = input_directory / "windows-media-capability-smoke.py"
         _write_bytes(capability_script, capability_script_payload, epoch)
@@ -1765,6 +1917,14 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.environ.get("SOURCE_DATE_EPOCH", DEFAULT_EPOCH)),
     )
+    parser.add_argument(
+        "--execute-verified-inputs",
+        action="store_true",
+        help=(
+            "explicitly allow smoke execution after every input matches the checked-in "
+            "release authority"
+        ),
+    )
     return parser
 
 
@@ -1810,7 +1970,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         skill_files=_parse_skill(args.skill_file),
     )
-    output = build_portable_directory(inputs, args.output_root, epoch=args.epoch)
+    output = build_portable_directory(
+        inputs,
+        args.output_root,
+        epoch=args.epoch,
+        execute_verified_inputs=args.execute_verified_inputs,
+    )
     manifest = _verify_manifest(output)
     print(
         json.dumps(

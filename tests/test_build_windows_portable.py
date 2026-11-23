@@ -11,6 +11,8 @@ import tempfile
 import unittest
 import warnings
 import zipfile
+from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -102,6 +104,9 @@ def _media_pair(root: Path) -> tuple[portable.ExactInput, portable.ExactInput]:
             for name in portable.WINDOWS_MEDIA_SOURCE_RECIPE
         },
     }
+    source_members["recipe/capability_smoke.py"] = (
+        portable.WINDOWS_MEDIA_CAPABILITY_SMOKE.read_bytes()
+    )
     source = _write_zip_with_sums(
         root / portable.WINDOWS_MEDIA_SOURCE_FILENAME,
         source_members,
@@ -245,6 +250,26 @@ def _inputs(root: Path) -> portable.PortableInputs:
     )
 
 
+def _authorized_inputs(inputs: portable.PortableInputs) -> AbstractContextManager[object]:
+    path = inputs.app_wheel.exact.path.parent / "input-authority.json"
+    payload = {
+        "releases": [
+            {
+                "inputs": portable._authority_input_records(inputs),
+                "python_version": inputs.python_version,
+                "version": inputs.app_wheel.version,
+            }
+        ],
+        "schema": portable.WINDOWS_PORTABLE_INPUT_AUTHORITY_SCHEMA,
+    }
+    path.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return mock.patch.object(portable, "WINDOWS_PORTABLE_INPUT_AUTHORITY", path)
+
+
 def _synthetic_smoke(
     root: Path,
     inputs: portable.PortableInputs,
@@ -302,6 +327,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
         self.assertIn("scripts/build_windows_portable.py", members)
         self.assertIn("packaging/windows/README.md", members)
         self.assertIn("packaging/windows/THIRD-PARTY-NOTICES.txt", members)
+        self.assertIn("packaging/windows/input-authority.json", members)
 
     def test_synthetic_build_is_exact_deterministic_and_side_by_side(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -313,6 +339,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
             first_root.mkdir()
             second_root.mkdir()
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -334,10 +361,22 @@ class WindowsPortableBuildTests(unittest.TestCase):
                     side_effect=lambda stage, final: os.rename(stage, final),
                 ),
             ):
-                first = portable.build_portable_directory(inputs, first_root)
-                second = portable.build_portable_directory(inputs, second_root)
+                first = portable.build_portable_directory(
+                    inputs,
+                    first_root,
+                    execute_verified_inputs=True,
+                )
+                second = portable.build_portable_directory(
+                    inputs,
+                    second_root,
+                    execute_verified_inputs=True,
+                )
                 with self.assertRaises(FileExistsError):
-                    portable.build_portable_directory(inputs, first_root)
+                    portable.build_portable_directory(
+                        inputs,
+                        first_root,
+                        execute_verified_inputs=True,
+                    )
 
             first_inventory = portable._inventory(first)
             second_inventory = portable._inventory(second)
@@ -406,6 +445,124 @@ class WindowsPortableBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(portable.PortableBuildError, "SHA-256 mismatch"):
                 portable._copy_exact_input(wrong, destination, portable.DEFAULT_EPOCH)
             self.assertFalse(destination.exists())
+
+    def test_self_attested_input_is_rejected_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = _inputs(root / "inputs")
+            authority = _authorized_inputs(inputs)
+            substituted_wheel = _wheel(
+                root / "substituted" / inputs.app_wheel.exact.path.name,
+                "groove-serpent",
+                inputs.app_wheel.version,
+                {
+                    "groove_serpent/__init__.py": b'__version__ = "1.0.0"\n',
+                    "groove_serpent/__main__.py": b"raise SystemExit('attacker')\n",
+                },
+            )
+            substituted = replace(inputs, app_wheel=substituted_wheel)
+            output_root = root / "output"
+            output_root.mkdir()
+            with (
+                authority,
+                mock.patch.object(portable, "_run_bounded") as run,
+                self.assertRaisesRegex(
+                    portable.PortableBuildError,
+                    "do not match the independently authorized release input set",
+                ),
+            ):
+                portable.build_portable_directory(
+                    substituted,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
+            run.assert_not_called()
+            self.assertEqual(list(output_root.iterdir()), [])
+
+    def test_authorized_input_execution_requires_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = _inputs(root / "inputs")
+            output_root = root / "output"
+            output_root.mkdir()
+            with (
+                _authorized_inputs(inputs),
+                mock.patch.object(portable, "_run_bounded") as run,
+                self.assertRaisesRegex(
+                    portable.PortableBuildError,
+                    "explicit execute_verified_inputs opt-in",
+                ),
+            ):
+                portable.build_portable_directory(inputs, output_root)
+            run.assert_not_called()
+            self.assertEqual(list(output_root.iterdir()), [])
+
+    def test_archive_smoke_must_match_checked_in_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime, source = _media_pair(root / "original")
+            with zipfile.ZipFile(source.path, "r") as archive:
+                source_members = {
+                    member.filename: archive.read(member)
+                    for member in archive.infolist()
+                    if member.filename != "SHA256SUMS"
+                }
+            source_members["recipe/capability_smoke.py"] = b"raise SystemExit('attacker')\n"
+            substituted = _write_zip_with_sums(root / "substituted-source.zip", source_members)
+            trusted_smoke = portable.WINDOWS_MEDIA_CAPABILITY_SMOKE.read_bytes()
+            with self.assertRaisesRegex(
+                portable.PortableBuildError,
+                "does not match the checked-in implementation",
+            ):
+                portable._verify_windows_media_pair(
+                    runtime.path,
+                    substituted.path,
+                    root / "tools",
+                    portable.DEFAULT_EPOCH,
+                    trusted_smoke,
+                )
+
+    def test_media_smoke_receives_minimal_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tools = root / "tools"
+            tools.mkdir()
+            embedded = b'{"result":"passed"}\n'
+            (tools / "CAPABILITY-SMOKE.json").write_bytes(embedded)
+            capability_script = root / "capability_smoke.py"
+            capability_script.write_text("# checked-in fixture\n", encoding="utf-8")
+            observed: dict[str, str] = {}
+
+            def complete(
+                command: list[str],
+                *,
+                environment: dict[str, str],
+                timeout: float,
+            ) -> subprocess.CompletedProcess[bytes]:
+                del timeout
+                observed.update(environment)
+                report = Path(command[command.index("--report") + 1])
+                report.write_bytes(embedded)
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with mock.patch.object(portable, "_run_bounded", side_effect=complete):
+                portable._smoke_windows_media_runtime(
+                    root,
+                    capability_script,
+                    hashlib.sha256(embedded).hexdigest(),
+                )
+            self.assertEqual(
+                set(observed),
+                {
+                    "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONNOUSERSITE",
+                    "PYTHONUTF8",
+                    "SYSTEMROOT",
+                    "TEMP",
+                    "TMP",
+                },
+            )
 
     def test_unsafe_and_duplicate_archive_members_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -485,6 +642,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
             output_root = root / "output"
             output_root.mkdir()
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -506,7 +664,11 @@ class WindowsPortableBuildTests(unittest.TestCase):
                     side_effect=lambda stage, final: os.rename(stage, final),
                 ),
             ):
-                output = portable.build_portable_directory(inputs, output_root)
+                output = portable.build_portable_directory(
+                    inputs,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
             (output / "README-PORTABLE.txt").write_text("tampered", encoding="utf-8")
             with self.assertRaisesRegex(portable.PortableBuildError, "does not exactly match"):
                 portable._verify_manifest(output)
@@ -539,6 +701,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
             output_root = root / "output"
             output_root.mkdir()
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -561,7 +724,11 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(portable.PortableBuildError, "private material"),
             ):
-                portable.build_portable_directory(inputs, output_root)
+                portable.build_portable_directory(
+                    inputs,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
             self.assertEqual(list(output_root.iterdir()), [])
 
     def test_non_windows_publication_fails_closed(self) -> None:
@@ -629,6 +796,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 raise portable.PortableBuildError("synthetic build failure")
 
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -644,7 +812,11 @@ class WindowsPortableBuildTests(unittest.TestCase):
                     "synthetic build failure",
                 ) as caught,
             ):
-                portable.build_portable_directory(inputs, output_root)
+                portable.build_portable_directory(
+                    inputs,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
 
             self.assertIsNotNone(swapped_stage)
             assert swapped_stage is not None
@@ -670,6 +842,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 raise KeyboardInterrupt
 
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -692,7 +865,11 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 self.assertRaises(KeyboardInterrupt),
             ):
-                portable.build_portable_directory(inputs, output_root)
+                portable.build_portable_directory(
+                    inputs,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
 
             self.assertEqual(list(output_root.iterdir()), [])
 
@@ -704,6 +881,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
             output_root = root / "output"
             output_root.mkdir()
             with (
+                _authorized_inputs(inputs),
                 mock.patch.object(
                     portable,
                     "_smoke_bundle",
@@ -725,7 +903,11 @@ class WindowsPortableBuildTests(unittest.TestCase):
                     side_effect=lambda stage, final: os.rename(stage, final),
                 ),
             ):
-                output = portable.build_portable_directory(inputs, output_root)
+                output = portable.build_portable_directory(
+                    inputs,
+                    output_root,
+                    execute_verified_inputs=True,
+                )
             manifest = json.loads((output / "PORTABLE-MANIFEST.json").read_text(encoding="utf-8"))
             recorded = {item["path"] for item in manifest["payload"]["members"]}
             actual = {
