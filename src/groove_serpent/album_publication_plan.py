@@ -1711,7 +1711,10 @@ def save_album_publication_plan(plan: AlbumPublicationPlan, path: Path) -> None:
                     "publication plan."
                 ) from exc
             try:
-                confirmed = resolve_portable_path(destination)
+                # Windows can report unchanged directory metadata immediately
+                # after a sibling appears, so the cached preflight snapshot
+                # cannot establish that the committed name is unambiguous.
+                confirmed = resolve_portable_path(destination, fresh=True)
             except PortablePathError as exc:
                 remove_owned_file_if_present(destination, temporary_receipt)
                 raise ProjectValidationError(
