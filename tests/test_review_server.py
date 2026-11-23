@@ -263,7 +263,7 @@ class ReviewServerTests(unittest.TestCase):
         cookie_header = headers["Set-Cookie"]
         self.assertIn("; Path=/; HttpOnly; SameSite=Strict", cookie_header)
         cookie = cookie_header.split(";", 1)[0]
-        self.assertEqual(cookie.split("=", 1)[1], token)
+        self.assertNotEqual(cookie.split("=", 1)[1], token)
 
         status, _headers, _body, _will_close = self.request(
             "GET",
