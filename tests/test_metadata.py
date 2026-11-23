@@ -295,7 +295,8 @@ class MetadataTests(unittest.TestCase):
             def _wait_for_rate_limit(self) -> None:
                 pass
 
-            def _open(self, request: Any) -> Any:
+            def _open(self, request: Any, timeout: float) -> Any:
+                del request, timeout
                 if isinstance(self.response, BaseException):
                     raise self.response
                 return self.response
@@ -325,7 +326,8 @@ class MetadataTests(unittest.TestCase):
             def _wait_for_rate_limit(self) -> None:
                 pass
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del timeout
                 self.request = request
                 return FakeResponse(json.dumps({"releases": []}).encode())
 
@@ -448,7 +450,8 @@ class CoverArtTests(unittest.TestCase):
                 self.path = path
                 return payload
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     image,
                     headers={
@@ -485,7 +488,8 @@ class CoverArtTests(unittest.TestCase):
                     },
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del timeout
                 self.request = request
                 return FakeResponse(
                     image,
@@ -528,7 +532,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/original.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     self.payload,
                     headers={"Content-Type": self.content_type},
@@ -557,7 +562,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     image,
                     headers={"Content-Type": "image/jpeg"},
@@ -578,7 +584,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     b"not actually a jpeg",
                     headers={"Content-Type": "image/jpeg"},
@@ -603,7 +610,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
 
         with tempfile.TemporaryDirectory() as directory:
@@ -629,7 +637,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
 
         with tempfile.TemporaryDirectory() as directory:

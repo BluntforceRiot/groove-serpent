@@ -20,6 +20,7 @@ from .album_publication_policy import speed_correction_details
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
 from .executable_discovery import find_executable
+from .provider_http import fetch_provider_response
 from .subprocess_policy import (
     BoundedDiagnostic,
     MAX_DIAGNOSTIC_BYTES,
@@ -956,16 +957,11 @@ class AcoustIDRecognitionProvider:
 
         self._wait_for_request_slot()
         try:
-            with urllib.request.urlopen(
-                request, timeout=self._timeout_seconds
-            ) as response:
-                raw = response.read(self._max_response_bytes + 1)
-        except urllib.error.HTTPError as exc:
-            detail = _http_error_detail(exc, self._max_response_bytes)
-            suffix = f": {detail}" if detail else ""
-            raise RecognitionError(
-                f"AcoustID lookup failed with HTTP {exc.code}{suffix}"
-            ) from exc
+            response = fetch_provider_response(
+                lambda remaining: urllib.request.urlopen(request, timeout=remaining),
+                timeout=self._timeout_seconds,
+                max_bytes=self._max_response_bytes,
+            )
         except urllib.error.URLError as exc:
             raise RecognitionError(f"AcoustID lookup could not connect: {exc.reason}") from exc
         except TimeoutError as exc:
@@ -973,6 +969,14 @@ class AcoustIDRecognitionProvider:
         except OSError as exc:
             raise RecognitionError(f"AcoustID lookup failed: {exc}") from exc
 
+        if not 200 <= response.status < 300:
+            detail = _http_error_detail(response.body, self._max_response_bytes)
+            suffix = f": {detail}" if detail else ""
+            raise RecognitionError(
+                f"AcoustID lookup failed with HTTP {response.status}{suffix}"
+            )
+
+        raw = response.body
         if len(raw) > self._max_response_bytes:
             raise RecognitionError("AcoustID returned an unexpectedly large response.")
         try:
@@ -1172,11 +1176,8 @@ def _parse_fingerprint_output(
     return {"fingerprint": fingerprint, "duration": authoritative_duration}
 
 
-def _http_error_detail(error: urllib.error.HTTPError, limit: int) -> str:
-    try:
-        raw = error.read(min(limit, _MAX_DIAGNOSTIC_BYTES) + 1)
-    except OSError:
-        return ""
+def _http_error_detail(raw: bytes, limit: int) -> str:
+    raw = raw[: min(limit, _MAX_DIAGNOSTIC_BYTES) + 1]
     if len(raw) > min(limit, _MAX_DIAGNOSTIC_BYTES):
         return "response was too large"
     try:

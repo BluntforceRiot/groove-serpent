@@ -21,7 +21,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, cast
+from typing import Any, Mapping
 
 from . import __user_agent__
 from .atomic_create import (
@@ -31,6 +31,7 @@ from .atomic_create import (
     rename_no_replace,
 )
 from .errors import GrooveSerpentError
+from .provider_http import ProviderResponse, fetch_provider_response
 
 
 DEFAULT_USER_AGENT = __user_agent__
@@ -176,22 +177,18 @@ def _cover_art_summary(release: Mapping[str, Any], release_id: str) -> dict[str,
     }
 
 
-def _http_error_message(service: str, error: urllib.error.HTTPError) -> str:
+def _http_error_message(service: str, response: ProviderResponse) -> str:
     detail = ""
-    try:
-        payload = error.read(512).decode("utf-8", errors="replace").strip()
-        if payload:
-            detail = f" Response: {payload}"
-    except (OSError, AttributeError):
-        pass
-    return f"{service} returned HTTP {error.code} ({error.reason}).{detail}"
+    payload = response.body[:512].decode("utf-8", errors="replace").strip()
+    if payload:
+        detail = f" Response: {payload}"
+    return f"{service} returned HTTP {response.status} ({response.reason}).{detail}"
 
 
-def _read_json(response: BinaryIO, service: str) -> Any:
-    status = getattr(response, "status", 200)
-    if not 200 <= int(status) < 300:
-        raise MetadataLookupError(f"{service} returned an unexpected HTTP status ({status}).")
-    raw = response.read(MAX_JSON_BYTES + 1)
+def _read_json(response: ProviderResponse, service: str) -> Any:
+    if not 200 <= response.status < 300:
+        raise MetadataLookupError(_http_error_message(service, response))
+    raw = response.body
     if len(raw) > MAX_JSON_BYTES:
         raise MetadataLookupError(f"{service} returned an unexpectedly large response.")
     try:
@@ -250,8 +247,8 @@ class MusicBrainzClient:
                 max(now, next_request) + self.REQUEST_INTERVAL_SECONDS
             )
 
-    def _open(self, request: urllib.request.Request) -> BinaryIO:
-        return cast(BinaryIO, urllib.request.urlopen(request, timeout=self.timeout))
+    def _open(self, request: urllib.request.Request, timeout: float) -> Any:
+        return urllib.request.urlopen(request, timeout=timeout)
 
     def _request_json(self, path: str, params: Mapping[str, Any]) -> Any:
         query = urllib.parse.urlencode(params)
@@ -267,13 +264,15 @@ class MusicBrainzClient:
         )
         self._wait_for_rate_limit()
         try:
-            with self._open(request) as response:
-                return _read_json(response, "MusicBrainz")
-        except urllib.error.HTTPError as exc:
-            raise MetadataLookupError(_http_error_message("MusicBrainz", exc)) from exc
+            response = fetch_provider_response(
+                lambda remaining: self._open(request, remaining),
+                timeout=self.timeout,
+                max_bytes=MAX_JSON_BYTES,
+            )
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not reach MusicBrainz: {reason}") from exc
+        return _read_json(response, "MusicBrainz")
 
     def search_releases(self, artist: str, album: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search releases and return compact, JSON-ready choices.
@@ -699,8 +698,8 @@ class CoverArtArchiveClient:
             )
         return current
 
-    def _open(self, request: urllib.request.Request) -> BinaryIO:
-        return cast(BinaryIO, urllib.request.urlopen(request, timeout=self.timeout))
+    def _open(self, request: urllib.request.Request, timeout: float) -> Any:
+        return urllib.request.urlopen(request, timeout=timeout)
 
     def _request_json(self, path: str) -> Any:
         request = urllib.request.Request(
@@ -711,13 +710,15 @@ class CoverArtArchiveClient:
             },
         )
         try:
-            with self._open(request) as response:
-                return _read_json(response, "Cover Art Archive")
-        except urllib.error.HTTPError as exc:
-            raise MetadataLookupError(_http_error_message("Cover Art Archive", exc)) from exc
+            response = fetch_provider_response(
+                lambda remaining: self._open(request, remaining),
+                timeout=self.timeout,
+                max_bytes=MAX_JSON_BYTES,
+            )
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not reach Cover Art Archive: {reason}") from exc
+        return _read_json(response, "Cover Art Archive")
 
     def _resolve_front_art(
         self,
@@ -838,7 +839,7 @@ class CoverArtArchiveClient:
             raise MetadataLookupError("Artwork size must be 1200, 500, or original.")
         urls = metadata["urls"]
         selected_size = size if size in urls else "original"
-        source_url = urls[selected_size]
+        source_url = str(urls[selected_size])
         request = urllib.request.Request(
             source_url,
             headers={
@@ -846,106 +847,107 @@ class CoverArtArchiveClient:
                 "User-Agent": self.user_agent,
             },
         )
+
+        def validate_artwork_response(candidate: ProviderResponse) -> None:
+            if not 200 <= candidate.status < 300:
+                return
+            self._validate_final_art_url(candidate.url or source_url)
+            candidate_type = (
+                candidate.header("Content-Type").split(";", 1)[0].strip().casefold()
+            )
+            if candidate_type not in _IMAGE_TYPES:
+                raise MetadataLookupError("Cover artwork must be a JPEG or PNG image.")
+            candidate_length = _optional_int(candidate.header("Content-Length"))
+            if candidate_length is not None and candidate_length > self.max_bytes:
+                raise MetadataLookupError("Cover artwork exceeds the 25 MB download limit.")
+
         try:
-            response = self._open(request)
-        except urllib.error.HTTPError as exc:
-            raise MetadataLookupError(_http_error_message("Cover Art Archive", exc)) from exc
+            response = fetch_provider_response(
+                lambda remaining: self._open(request, remaining),
+                timeout=self.timeout,
+                max_bytes=self.max_bytes,
+                validate_response=validate_artwork_response,
+            )
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise MetadataLookupError(f"Could not download cover artwork: {reason}") from exc
 
+        if not 200 <= response.status < 300:
+            raise MetadataLookupError(_http_error_message("Cover Art Archive", response))
+        final_url = response.url or source_url
+        self._validate_final_art_url(final_url)
+        raw_content_type = response.header("Content-Type")
+        content_type = raw_content_type.split(";", 1)[0].strip().casefold()
+        image_type = _IMAGE_TYPES.get(content_type)
+        if image_type is None:
+            raise MetadataLookupError("Cover artwork must be a JPEG or PNG image.")
+        mime_type, extension = image_type
+        content_length = _optional_int(response.header("Content-Length"))
+        if content_length is not None and content_length > self.max_bytes:
+            raise MetadataLookupError("Cover artwork exceeds the 25 MB download limit.")
+        if len(response.body) > self.max_bytes:
+            raise MetadataLookupError("Cover artwork exceeds the 25 MB download limit.")
+
         temporary_path: Path | None = None
         cleanup_receipt: OwnedFileReceipt | None = None
         try:
-            with response:
-                status = getattr(response, "status", 200)
-                if not 200 <= int(status) < 300:
-                    raise MetadataLookupError(
-                        f"Cover Art Archive returned an unexpected HTTP status ({status})."
-                    )
-                final_url_getter = getattr(response, "geturl", None)
-                final_url = final_url_getter() if callable(final_url_getter) else source_url
-                self._validate_final_art_url(str(final_url))
-                headers = getattr(response, "headers", {})
-                raw_content_type = str(headers.get("Content-Type", ""))
-                content_type = raw_content_type.split(";", 1)[0].strip().casefold()
-                image_type = _IMAGE_TYPES.get(content_type)
-                if image_type is None:
-                    raise MetadataLookupError("Cover artwork must be a JPEG or PNG image.")
-                mime_type, extension = image_type
-                content_length = _optional_int(headers.get("Content-Length"))
-                if content_length is not None and content_length > self.max_bytes:
-                    raise MetadataLookupError("Cover artwork exceeds the 25 MB download limit.")
-
-                resolved_artwork_dir = self._prepare_artwork_directory()
-                descriptor, temporary_name = tempfile.mkstemp(
-                    prefix=".cover-", suffix=".tmp", dir=resolved_artwork_dir
-                )
-                temporary_path = Path(temporary_name)
-                digest = hashlib.sha256()
-                total = 0
-                prefix = b""
-                payload = bytearray()
-                with os.fdopen(descriptor, "wb") as output:
-                    try:
-                        while True:
-                            chunk = response.read(min(64 * 1024, self.max_bytes - total + 1))
-                            if not chunk:
-                                break
-                            total += len(chunk)
-                            if total > self.max_bytes:
-                                raise MetadataLookupError(
-                                    "Cover artwork exceeds the 25 MB download limit."
-                                )
-                            if len(prefix) < 16:
-                                prefix += chunk[: 16 - len(prefix)]
-                            digest.update(chunk)
-                            written = output.write(chunk)
-                            payload.extend(chunk[:written])
-                            if written != len(chunk):
-                                raise OSError("short write while staging cover artwork")
-                        output.flush()
-                        os.fsync(output.fileno())
-                        cleanup_receipt = capture_owned_file_receipt(
-                            temporary_path, bytes(payload), owned_descriptor=output.fileno()
-                        )
-                    except BaseException:
-                        # A failed response can still leave a fully known partial file.
-                        # Never adopt a replacement after the writer has closed.
-                        try:
-                            output.flush()
-                            cleanup_receipt = capture_owned_file_receipt(
-                                temporary_path, bytes(payload), owned_descriptor=output.fileno()
-                            )
-                        except OSError:
-                            pass
-                        raise
-                self._validate_image_signature(mime_type, prefix)
-                storage_id = str(
-                    metadata.get("storage_id")
-                    or metadata.get("release_id")
-                    or metadata.get("release_group_id")
-                    or ""
-                )
-                storage_id = _validated_uuid(storage_id, "artwork owner ID")
-                destination = resolved_artwork_dir / (
-                    f"{storage_id}-front-{selected_size}{extension}"
-                )
-                if self._prepare_artwork_directory() != resolved_artwork_dir:
-                    raise MetadataLookupError(
-                        "The artwork folder changed before the image could be published."
-                    )
+            resolved_artwork_dir = self._prepare_artwork_directory()
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".cover-", suffix=".tmp", dir=resolved_artwork_dir
+            )
+            temporary_path = Path(temporary_name)
+            digest = hashlib.sha256(response.body)
+            total = len(response.body)
+            prefix = response.body[:16]
+            payload = b""
+            with os.fdopen(descriptor, "wb") as output:
                 try:
-                    rename_no_replace(temporary_path, destination)
-                except FileExistsError as exc:
-                    raise MetadataLookupError(
-                        "Cover artwork already exists; Groove Serpent will not overwrite it."
-                    ) from exc
-                except OSError as exc:
-                    raise MetadataLookupError(
-                        "The filesystem cannot atomically create a no-overwrite cover file."
-                    ) from exc
-                temporary_path = None
+                    written = output.write(response.body)
+                    payload = response.body[:written]
+                    if written != total:
+                        raise OSError("short write while staging cover artwork")
+                    output.flush()
+                    os.fsync(output.fileno())
+                    cleanup_receipt = capture_owned_file_receipt(
+                        temporary_path, payload, owned_descriptor=output.fileno()
+                    )
+                except BaseException:
+                    # A failed response can still leave a fully known partial file.
+                    # Never adopt a replacement after the writer has closed.
+                    try:
+                        output.flush()
+                        cleanup_receipt = capture_owned_file_receipt(
+                            temporary_path, payload, owned_descriptor=output.fileno()
+                        )
+                    except OSError:
+                        pass
+                    raise
+            self._validate_image_signature(mime_type, prefix)
+            storage_id = str(
+                metadata.get("storage_id")
+                or metadata.get("release_id")
+                or metadata.get("release_group_id")
+                or ""
+            )
+            storage_id = _validated_uuid(storage_id, "artwork owner ID")
+            destination = resolved_artwork_dir / (
+                f"{storage_id}-front-{selected_size}{extension}"
+            )
+            if self._prepare_artwork_directory() != resolved_artwork_dir:
+                raise MetadataLookupError(
+                    "The artwork folder changed before the image could be published."
+                )
+            try:
+                rename_no_replace(temporary_path, destination)
+            except FileExistsError as exc:
+                raise MetadataLookupError(
+                    "Cover artwork already exists; Groove Serpent will not overwrite it."
+                ) from exc
+            except OSError as exc:
+                raise MetadataLookupError(
+                    "The filesystem cannot atomically create a no-overwrite cover file."
+                ) from exc
+            temporary_path = None
         except MetadataLookupError:
             raise
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
