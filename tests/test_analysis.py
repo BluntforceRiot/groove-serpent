@@ -435,8 +435,10 @@ class AnalysisTests(unittest.TestCase):
                 *,
                 analysis_rate: int,
                 window_ms: int,
+                maximum_duration_seconds: float,
             ) -> tuple[list[float], float]:
                 del analysis_rate, window_ms
+                self.assertEqual(maximum_duration_seconds, 10.0)
                 decoded_paths.append(path)
                 live.write_bytes(replacement)
                 try:

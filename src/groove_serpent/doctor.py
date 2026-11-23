@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -89,7 +90,7 @@ def _soxr_check() -> CapabilityCheck:
     ]
     try:
         completed = run_bounded_capture(command)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         return CapabilityCheck(
             capability="ffmpeg-libsoxr",
             required=True,
@@ -97,7 +98,11 @@ def _soxr_check() -> CapabilityCheck:
             message=f"The libsoxr smoke test could not run: {exc}",
             executable=ffmpeg,
         )
-    if completed.returncode != 0:
+    if (
+        completed.returncode != 0
+        or completed.stdout_truncated
+        or completed.stderr_truncated
+    ):
         diagnostic = completed.stderr.decode("utf-8", errors="replace")
         diagnostic = " ".join(diagnostic.split())[:500]
         message = "FFmpeg could not execute a libsoxr resample."

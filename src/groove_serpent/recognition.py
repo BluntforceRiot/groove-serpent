@@ -13,7 +13,15 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast, runtime_checkable
+from typing import (
+    BinaryIO,
+    Callable,
+    Literal,
+    Protocol,
+    TypedDict,
+    cast,
+    runtime_checkable,
+)
 
 from . import __user_agent__
 from .album_publication_policy import speed_correction_details
@@ -26,6 +34,7 @@ from .subprocess_policy import (
     join_diagnostic_reader,
     run_bounded_capture,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 
@@ -96,8 +105,9 @@ class _FingerprintRuntime:
 
 
 class _BoundedBinaryCapture:
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, on_overflow: Callable[[], None]) -> None:
         self._limit = limit
+        self._on_overflow = on_overflow
         self._payload = bytearray()
         self.truncated = False
 
@@ -111,7 +121,10 @@ class _BoundedBinaryCapture:
                 if room > 0:
                     self._payload.extend(chunk[:room])
                 if len(chunk) > room:
+                    first_overflow = not self.truncated
                     self.truncated = True
+                    if first_overflow:
+                        self._on_overflow()
         except (OSError, ValueError):
             self.truncated = True
         finally:
@@ -439,11 +452,15 @@ def fingerprint_backend_readiness() -> FingerprintBackendReadiness:
 
 
 def _start_binary_capture(
+    process: subprocess.Popen[bytes],
     stream: BinaryIO,
     *,
     name: str,
 ) -> tuple[_BoundedBinaryCapture, threading.Thread]:
-    capture = _BoundedBinaryCapture(_MAX_FINGERPRINT_OUTPUT_BYTES)
+    capture = _BoundedBinaryCapture(
+        _MAX_FINGERPRINT_OUTPUT_BYTES,
+        on_overflow=lambda: terminate_and_reap(process),
+    )
     thread = threading.Thread(
         target=capture.drain,
         args=(stream,),
@@ -715,8 +732,9 @@ class AcoustIDRecognitionProvider:
         output_thread: threading.Thread | None = None
         try:
             _assert_executable_unchanged(runtime.ffmpeg, "FFmpeg executable")
-            process = subprocess.Popen(
+            process = start_media_process(
                 command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -724,6 +742,7 @@ class AcoustIDRecognitionProvider:
             if process.stdout is None or process.stderr is None:
                 raise RecognitionError("FFmpeg did not expose its fingerprint pipes.")
             output_capture, output_thread = _start_binary_capture(
+                process,
                 cast(BinaryIO, process.stdout),
                 name="groove-serpent-chromaprint-stdout",
             )
@@ -835,8 +854,9 @@ class AcoustIDRecognitionProvider:
         try:
             _assert_executable_unchanged(runtime.ffmpeg, "FFmpeg executable")
             _assert_executable_unchanged(runtime.fpcalc, "fpcalc executable")
-            ffmpeg_process = subprocess.Popen(
+            ffmpeg_process = start_media_process(
                 ffmpeg_command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -849,8 +869,9 @@ class AcoustIDRecognitionProvider:
                 name="groove-serpent-ffmpeg-stderr",
             )
 
-            fpcalc_process = subprocess.Popen(
+            fpcalc_process = start_media_process(
                 fpcalc_command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=ffmpeg_process.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -861,6 +882,7 @@ class AcoustIDRecognitionProvider:
             if fpcalc_process.stdout is None or fpcalc_process.stderr is None:
                 raise RecognitionError("fpcalc did not expose its result pipes.")
             output_capture, output_thread = _start_binary_capture(
+                fpcalc_process,
                 cast(BinaryIO, fpcalc_process.stdout),
                 name="groove-serpent-fpcalc-stdout",
             )

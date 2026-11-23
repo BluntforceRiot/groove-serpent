@@ -10,6 +10,11 @@ from unittest import mock
 
 from groove_serpent.errors import GrooveSerpentError
 from groove_serpent.media import decode_rms_envelope, run_ffmpeg, tool_version
+from groove_serpent.subprocess_policy import (
+    BoundedProcessResult,
+    MEDIA_ANALYSIS_TIMEOUT_SECONDS,
+    MEDIA_RENDER_TIMEOUT_SECONDS,
+)
 
 
 class _FakeProcess:
@@ -62,7 +67,7 @@ class MediaTests(unittest.TestCase):
                     io.BytesIO(), return_code, io.BytesIO(diagnostic)
                 )
                 with mock.patch(
-                    "groove_serpent.media.subprocess.Popen", return_value=process
+                    "groove_serpent.media.start_media_process", return_value=process
                 ) as popen:
                     command = ["ffmpeg", "-loglevel", "error", "-n", "out.m4a"]
                     if return_code or diagnostic:
@@ -73,16 +78,22 @@ class MediaTests(unittest.TestCase):
                 self.assertTrue(process.waited)
                 self.assertIn("-nostdin", popen.call_args.args[0])
                 self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+                self.assertEqual(
+                    popen.call_args.kwargs["timeout"], MEDIA_RENDER_TIMEOUT_SECONDS
+                )
 
     def test_analysis_emits_partial_terminal_rms_window(self) -> None:
         samples = [0.25] * 2_000 + [0.5] * 40
         process = _FakeProcess(io.BytesIO(struct.pack("<2040f", *samples)))
 
         with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
-            "groove_serpent.media.subprocess.Popen", return_value=process
+            "groove_serpent.media.start_media_process", return_value=process
         ):
             values, window_seconds = decode_rms_envelope(
-                Path("side.flac"), analysis_rate=8_000, window_ms=50
+                Path("side.flac"),
+                analysis_rate=8_000,
+                window_ms=50,
+                maximum_duration_seconds=1.0,
             )
 
         self.assertEqual(len(values), 6)
@@ -91,33 +102,27 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(window_seconds, 0.05)
 
     def test_ffmpeg_version_query_uses_shared_noninteractive_bounded_policy(self) -> None:
-        observed: dict[str, object] = {}
-
-        def fake_run(command, *, check, stdin, stdout, stderr, timeout):
-            observed.update(
-                command=command,
-                check=check,
-                stdin=stdin,
-                timeout=timeout,
-            )
-            stdout.write(b"ffmpeg version bounded-test\n")
-            return subprocess.CompletedProcess(command, 0)
-
+        result = BoundedProcessResult(
+            returncode=0,
+            stdout=b"ffmpeg version bounded-test\n",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
         with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
-            "groove_serpent.subprocess_policy.subprocess.run", side_effect=fake_run
-        ):
+            "groove_serpent.media.run_bounded_capture", return_value=result
+        ) as bounded:
             version = tool_version("ffmpeg")
 
         self.assertEqual(version, "ffmpeg version bounded-test")
-        self.assertIn("-nostdin", observed["command"])
-        self.assertIs(observed["stdin"], subprocess.DEVNULL)
-        self.assertIsNone(observed["timeout"])
+        self.assertIn("-nostdin", bounded.call_args.args[0])
 
     def test_analysis_stderr_is_drained_with_a_bounded_capture(self) -> None:
         captured: dict[str, object] = {}
 
-        def popen(command, *, stdin, stdout, stderr):
+        def popen(command, *, timeout, stdin, stdout, stderr):
             captured["command"] = command
+            captured["timeout"] = timeout
             captured["stdin"] = stdin
             captured["stdout"] = stdout
             captured["stderr"] = stderr
@@ -128,17 +133,24 @@ class MediaTests(unittest.TestCase):
             )
 
         with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
-            "groove_serpent.media.subprocess.Popen", side_effect=popen
+            "groove_serpent.media.start_media_process", side_effect=popen
         ):
             with self.assertRaisesRegex(
                 GrooveSerpentError, "diagnostic"
             ) as raised:
-                decode_rms_envelope(Path("side.flac"), analysis_rate=10, window_ms=100)
+                decode_rms_envelope(
+                    Path("side.flac"),
+                    analysis_rate=10,
+                    window_ms=100,
+                    maximum_duration_seconds=1.0,
+                )
 
         self.assertIn("-nostdin", captured["command"])
+        self.assertIn("-fs", captured["command"])
         self.assertIs(captured["stdin"], subprocess.DEVNULL)
         self.assertIs(captured["stdout"], subprocess.PIPE)
         self.assertIs(captured["stderr"], subprocess.PIPE)
+        self.assertEqual(captured["timeout"], MEDIA_ANALYSIS_TIMEOUT_SECONDS)
         self.assertIn("[diagnostic truncated]", str(raised.exception))
         self.assertLess(len(str(raised.exception)), 70_000)
 
@@ -146,14 +158,35 @@ class MediaTests(unittest.TestCase):
         process = _FakeProcess(_ExplodingStream())
 
         with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
-            "groove_serpent.media.subprocess.Popen", return_value=process
+            "groove_serpent.media.start_media_process", return_value=process
         ):
             with self.assertRaisesRegex(RuntimeError, "decode loop failed"):
-                decode_rms_envelope(Path("side.flac"), analysis_rate=10, window_ms=100)
+                decode_rms_envelope(
+                    Path("side.flac"),
+                    analysis_rate=10,
+                    window_ms=100,
+                    maximum_duration_seconds=1.0,
+                )
 
         self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
         self.assertTrue(process.stdout.closed)
+
+    def test_analysis_refuses_pcm_beyond_validated_duration(self) -> None:
+        process = _FakeProcess(io.BytesIO(struct.pack("<20f", *([0.25] * 20))))
+
+        with mock.patch("groove_serpent.media.find_tool", return_value="ffmpeg"), mock.patch(
+            "groove_serpent.media.start_media_process", return_value=process
+        ), self.assertRaisesRegex(GrooveSerpentError, "validated PCM output bound"):
+            decode_rms_envelope(
+                Path("side.flac"),
+                analysis_rate=10,
+                window_ms=100,
+                maximum_duration_seconds=1.0,
+            )
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
 
 
 if __name__ == "__main__":

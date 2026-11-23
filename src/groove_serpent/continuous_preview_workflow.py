@@ -792,6 +792,8 @@ def _decode_scope(
     stdout = completed.stdout
     if completed.stdout_truncated:
         raise ProjectValidationError("FFmpeg returned more PCM than the bounded request allowed.")
+    if completed.stderr_truncated:
+        raise GrooveSerpentError("FFmpeg exceeded the continuous-preview diagnostic bound.")
     if completed.returncode != 0:
         message = completed.stderr.decode("utf-8", errors="replace").strip()
         raise GrooveSerpentError(f"FFmpeg could not decode the continuous preview: {message}")

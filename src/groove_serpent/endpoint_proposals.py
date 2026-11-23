@@ -40,8 +40,10 @@ from .publication import (
     capture_file_receipt,
 )
 from .subprocess_policy import (
+    MEDIA_ANALYSIS_TIMEOUT_SECONDS,
     join_diagnostic_reader,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 
@@ -1093,6 +1095,10 @@ def _decode_scope_features(
     config: EndpointProposalConfig,
 ) -> tuple[EndpointWindowFeature, ...]:
     ffmpeg = find_tool("ffmpeg")
+    frame_bytes = channels * 4
+    maximum_output_bytes = (
+        scope.end_sample_exclusive - scope.start_sample
+    ) * frame_bytes
     command = [
         ffmpeg,
         "-nostdin",
@@ -1116,14 +1122,17 @@ def _decode_scope_features(
         "pcm_f32le",
         "-f",
         "f32le",
+        "-fs",
+        str(maximum_output_bytes),
         "pipe:1",
     ]
     process: subprocess.Popen[bytes] | None = None
     diagnostic_thread = None
     completed = False
     try:
-        process = subprocess.Popen(
+        process = start_media_process(
             command,
+            timeout=MEDIA_ANALYSIS_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1139,7 +1148,6 @@ def _decode_scope_features(
         current_sample = scope.start_sample
         previous_spectrum: np.ndarray | None = None
         features: list[EndpointWindowFeature] = []
-        frame_bytes = channels * 4
         while remaining:
             frames = min(window_samples, remaining)
             raw = _read_exact_pipe(process.stdout, frames * frame_bytes)
@@ -1175,6 +1183,10 @@ def _decode_scope_features(
                 "FFmpeg could not decode endpoint evidence: " + diagnostic.text()
             )
         return tuple(features)
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            "Endpoint evidence decoding exceeded its safety deadline."
+        ) from exc
     finally:
         if process is not None and process.stdout is not None:
             try:

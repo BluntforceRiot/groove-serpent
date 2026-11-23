@@ -414,7 +414,7 @@ class FingerprintBackendTests(unittest.TestCase):
 
             provider = AcoustIDRecognitionProvider(api_key="key")
             with mock.patch(
-                "groove_serpent.recognition.subprocess.Popen",
+                "groove_serpent.recognition.start_media_process",
                 side_effect=popen,
             ), mock.patch("groove_serpent.recognition.urllib.request.urlopen") as network:
                 payload = provider._fingerprint(
@@ -463,7 +463,7 @@ class FingerprintBackendTests(unittest.TestCase):
                 )
                 provider = AcoustIDRecognitionProvider(api_key="key")
                 with mock.patch(
-                    "groove_serpent.recognition.subprocess.Popen",
+                    "groove_serpent.recognition.start_media_process",
                     return_value=process,
                 ), self.assertRaises(RecognitionError):
                     provider._fingerprint(
@@ -532,7 +532,7 @@ class FingerprintBackendTests(unittest.TestCase):
 
             provider = AcoustIDRecognitionProvider(api_key="key")
             with mock.patch(
-                "groove_serpent.recognition.subprocess.Popen",
+                "groove_serpent.recognition.start_media_process",
                 side_effect=popen,
             ):
                 payload = provider._fingerprint(
@@ -638,7 +638,7 @@ class RecognitionPipelineTests(unittest.TestCase):
                 "groove_serpent.recognition._discover_fingerprint_runtime",
                 return_value=(_runtime_status(runtime), runtime),
             ), mock.patch(
-                "groove_serpent.recognition.subprocess.Popen", side_effect=fake_popen
+                "groove_serpent.recognition.start_media_process", side_effect=fake_popen
             ), mock.patch(
                 "groove_serpent.recognition.urllib.request.urlopen",
                 side_effect=fake_urlopen,
@@ -745,7 +745,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             with mock.patch(
                 "groove_serpent.recognition._discover_fingerprint_runtime",
                 return_value=(_runtime_status(runtime), runtime),
-            ), mock.patch("groove_serpent.recognition.subprocess.Popen") as popen:
+            ), mock.patch("groove_serpent.recognition.start_media_process") as popen:
                 fingerprint_processes = 0
 
                 def fake_popen(command: list[str], **kwargs: object) -> _FakeProcess:
