@@ -290,6 +290,30 @@ def _synthetic_verifier(root: Path, expected: str) -> dict[str, object]:
 
 
 class WindowsPortableBuildTests(unittest.TestCase):
+    def test_portable_smoke_calls_only_the_reviewed_host_verifier(self) -> None:
+        digest = "a" * 64
+        receipt = {
+            "ok": True,
+            "authenticity": "anchored-to-expected-manifest-sha256",
+            "manifest_sha256": digest,
+        }
+        host = Path(portable.sys.executable).resolve(strict=True)
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                portable, "_run_bounded",
+                return_value=subprocess.CompletedProcess([], 0, json.dumps(receipt).encode(), b""),
+            ) as run,
+        ):
+            root = Path(temporary) / "bundle"
+            self.assertEqual(portable._smoke_host_verifier(root, digest), receipt)
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], [str(host), "-I", "-S", "-B"])
+        self.assertEqual(command[4], str(portable.ROOT / "scripts" / "verify_windows_portable.py"))
+        self.assertEqual(command[5:], ["--root", str(root), "--expected-manifest-sha256", digest])
+        self.assertEqual(run.call_args.kwargs["environment"]["PATH"], str(host.parent))
+
     def test_builder_and_notices_are_in_private_handoff_scope(self) -> None:
         if build_handoff is None:
             self.skipTest("Private handoff builder is intentionally absent.")
@@ -325,7 +349,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     portable,
-                    "_smoke_packaged_verifier",
+                    "_smoke_host_verifier",
                     side_effect=_synthetic_verifier,
                 ),
                 mock.patch.object(
@@ -362,14 +386,13 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 (first / "verify-portable.py").read_bytes(),
                 inputs.portable_verifier.path.read_bytes(),
             )
-            self.assertIn(
-                b"verify-portable.py",
-                (first / "verify-portable.cmd").read_bytes(),
-            )
-            self.assertIn(b'--root "%~dp0."', (first / "verify-portable.cmd").read_bytes())
+            launcher = (first / "verify-portable.cmd").read_bytes()
+            self.assertIn(b"exit /b 2", launcher)
+            self.assertNotIn(b"%~dp0", launcher)
+            self.assertNotIn(b"python.exe", launcher)
             portable_readme = (first / "README-PORTABLE.txt").read_bytes()
-            self.assertIn(b"Do not start verify-portable.cmd until trusted host", portable_readme)
-            self.assertIn(b"matched every payload member", portable_readme)
+            self.assertIn(b"independently trusted host Python", portable_readme)
+            self.assertIn(b"Do not run verify-portable.cmd", portable_readme)
 
             manifest = portable._verify_manifest(first)
             self.assertEqual(manifest["app"]["version"], "1.0.0")
@@ -500,7 +523,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     portable,
-                    "_smoke_packaged_verifier",
+                    "_smoke_host_verifier",
                     side_effect=_synthetic_verifier,
                 ),
                 mock.patch.object(
@@ -554,7 +577,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     portable,
-                    "_smoke_packaged_verifier",
+                    "_smoke_host_verifier",
                     side_effect=_synthetic_verifier,
                 ),
                 mock.patch.object(
@@ -685,7 +708,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     portable,
-                    "_smoke_packaged_verifier",
+                    "_smoke_host_verifier",
                     side_effect=_synthetic_verifier,
                 ),
                 mock.patch.object(
@@ -719,7 +742,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     portable,
-                    "_smoke_packaged_verifier",
+                    "_smoke_host_verifier",
                     side_effect=_synthetic_verifier,
                 ),
                 mock.patch.object(

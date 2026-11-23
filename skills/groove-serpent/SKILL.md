@@ -5,23 +5,28 @@ description: Operate Groove Serpent's local-first vinyl digitization workflow th
 
 # Groove Serpent
 
-Resolve the runtime root as `../..` from this skill directory. Select exactly one command surface:
-
+Read this skill from an independently trusted checkout or previously verified
+installation, never from an unverified bundle. Resolve `../..` from the skill
+directory, or use the owner's explicit portable directory. Select one surface:
 - If `groove-serpent.cmd`, `PORTABLE-MANIFEST.json`, `runtime/python.exe`,
   `verify-portable.cmd`, and `verify-portable.py` are regular files at that root, use the portable
-  launcher. It is self-contained: do not invoke `uv`, a system Python, or repository-relative
-  source paths.
+  launcher only after host verification. For app execution, do not invoke `uv`, a system Python,
+  or repository-relative source paths.
 - Otherwise, require `pyproject.toml`, `uv.lock`, and `src/groove_serpent/__init__.py`, and use the
   frozen source-checkout command.
 - If neither surface is complete or both are ambiguous, stop.
 
-Define this PowerShell helper once. It preserves quoted path arguments and returns the real process
-exit status:
-
+Define this PowerShell helper once; it preserves quoted arguments and the real exit status:
 ```powershell
 # Set this from the skill path supplied by Codex/Hermes discovery.
 $GrooveSkillDirectory = "ABSOLUTE_DIRECTORY_CONTAINING_THIS_SKILL"
-$GrooveRoot = (Resolve-Path (Join-Path $GrooveSkillDirectory "../..")).Path
+$GrooveVerifiedRoot = $null
+$GrooveExplicitPortable = Test-Path variable:GroovePortableDirectory
+$GrooveRoot = if ($GrooveExplicitPortable) {
+  (Resolve-Path -LiteralPath $GroovePortableDirectory -ErrorAction Stop).ProviderPath
+} else {
+  (Resolve-Path (Join-Path $GrooveSkillDirectory "../..")).ProviderPath
+}
 $GroovePortable =
   (Test-Path -LiteralPath (Join-Path $GrooveRoot "groove-serpent.cmd") -PathType Leaf) -and
   (Test-Path -LiteralPath (Join-Path $GrooveRoot "PORTABLE-MANIFEST.json") -PathType Leaf) -and
@@ -33,109 +38,55 @@ $GrooveSource =
   (Test-Path -LiteralPath (Join-Path $GrooveRoot "uv.lock") -PathType Leaf) -and
   (Test-Path -LiteralPath (Join-Path $GrooveRoot "src/groove_serpent/__init__.py") -PathType Leaf)
 if ($GroovePortable -eq $GrooveSource) { throw "Ambiguous or incomplete Groove Serpent runtime" }
+if ($GrooveExplicitPortable -and -not $GroovePortable) { throw "The supplied root is not portable" }
 if ($GroovePortable) {
   if (-not (Test-Path variable:GrooveExpectedManifestSha256) -or
       $GrooveExpectedManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
     throw "A separately trusted portable manifest SHA-256 is required"
   }
-  $GrooveExpectedManifestSha256 = $GrooveExpectedManifestSha256.ToLowerInvariant()
-  $GrooveRootItem = Get-Item -LiteralPath $GrooveRoot -Force -ErrorAction Stop
-  if (-not $GrooveRootItem.PSIsContainer -or
-      ($GrooveRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw "The portable root is not a regular directory"
+  if ([string]::IsNullOrWhiteSpace($GrooveExpectedVersion)) {
+    throw "The separately trusted portable version is required"
   }
-  $GrooveManifestPath = Join-Path $GrooveRoot "PORTABLE-MANIFEST.json"
-  $GrooveManifestItem = Get-Item -LiteralPath $GrooveManifestPath -Force -ErrorAction Stop
-  if ($GrooveManifestItem.PSIsContainer -or
-      ($GrooveManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw "The portable manifest is not a regular file"
+  $GrooveBundlePrefix = $GrooveRoot.TrimEnd([char]'\') + '\'
+  foreach ($GrooveHostPath in @($GrooveTrustedPython, $GrooveTrustedVerifier)) {
+    if (-not $GrooveHostPath -or $GrooveHostPath -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)' -or
+        -not (Test-Path -LiteralPath $GrooveHostPath -PathType Leaf)) {
+      throw "Absolute paths to an independently trusted host interpreter and verifier are required"
+    }
+    $GrooveHostEntry = Get-Item -LiteralPath $GrooveHostPath -Force -ErrorAction Stop
+    if ($GrooveHostEntry.FullName.StartsWith($GrooveBundlePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "Never execute a verifier or interpreter from the unverified bundle"
+    }
+    $Entry = $GrooveHostEntry
+    while ($Entry) {
+      if ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Use host paths with plain, non-reparse ancestry"
+      }
+      $Entry = if ($Entry -is [IO.FileInfo]) { $Entry.Directory } else { $Entry.Parent }
+    }
   }
-  $GrooveObservedManifestSha256 = (
-    Get-FileHash -LiteralPath $GrooveManifestPath -Algorithm SHA256 -ErrorAction Stop
-  ).Hash.ToLowerInvariant()
-  if ($GrooveObservedManifestSha256 -cne $GrooveExpectedManifestSha256) {
-    throw "The portable manifest does not match the separately trusted SHA-256"
-  }
+  Push-Location -LiteralPath (Split-Path -LiteralPath $GrooveTrustedVerifier) -ErrorAction Stop
   try {
-    $GrooveManifest = [IO.File]::ReadAllText(
-      $GrooveManifestPath, [Text.UTF8Encoding]::new($false, $true)
-    ) | ConvertFrom-Json -ErrorAction Stop
-  } catch {
-    throw "The anchored portable manifest is not readable UTF-8 JSON"
-  }
-  $GrooveMembers = @($GrooveManifest.payload.members)
-  $GrooveMemberPaths =
-    [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-  $GroovePortablePaths =
-    [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($GrooveMember in $GrooveMembers) {
-    if ($GrooveMember.path -isnot [string] -or $GrooveMember.sha256 -isnot [string] -or
-        $GrooveMember.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
-        -not ($GrooveMember.size -is [int] -or $GrooveMember.size -is [long]) -or
-        $GrooveMember.size -lt 0 -or
-        -not $GrooveMemberPaths.Add($GrooveMember.path) -or
-        -not $GroovePortablePaths.Add($GrooveMember.path)) {
-      throw "The anchored portable manifest has an invalid or repeated payload member"
-    }
-  }
-  $GrooveActualItems = @(
-    Get-ChildItem -LiteralPath $GrooveRoot -Recurse -Force -ErrorAction Stop
-  )
-  if (@($GrooveActualItems | Where-Object {
-    $_.Attributes -band [IO.FileAttributes]::ReparsePoint
-  }).Count -ne 0) {
-    throw "The portable directory contains a reparse point"
-  }
-  $GrooveActualFiles = @($GrooveActualItems | Where-Object { -not $_.PSIsContainer })
-  if ($GrooveActualFiles.Count -ne ($GrooveMembers.Count + 1)) {
-    throw "The portable directory inventory does not match the anchored manifest"
-  }
-  $GrooveRootPrefix = $GrooveRoot.TrimEnd('\') + '\'
-  foreach ($GrooveActualFile in $GrooveActualFiles) {
-    if (-not $GrooveActualFile.FullName.StartsWith(
-      $GrooveRootPrefix, [StringComparison]::OrdinalIgnoreCase
-    )) {
-      throw "A portable file resolves outside the portable root"
-    }
-    $GrooveRelativePath = $GrooveActualFile.FullName.Substring($GrooveRootPrefix.Length)
-    $GrooveRelativePath = $GrooveRelativePath.Replace('\', '/')
-    if ($GrooveRelativePath -cne "PORTABLE-MANIFEST.json" -and
-        -not $GrooveMemberPaths.Contains($GrooveRelativePath)) {
-      throw "The portable directory contains an unmanifested file: $GrooveRelativePath"
-    }
-  }
-  foreach ($GrooveMember in $GrooveMembers) {
-    $GrooveMemberPath = Join-Path $GrooveRoot $GrooveMember.path
-    $GrooveMemberItem = Get-Item -LiteralPath $GrooveMemberPath -Force -ErrorAction Stop
-    if ($GrooveMemberItem.PSIsContainer -or
-        ($GrooveMemberItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-      throw "A portable payload member is not a regular file: $($GrooveMember.path)"
-    }
-    if ($GrooveMemberItem.Length -ne $GrooveMember.size) {
-      throw "A portable payload member has the wrong size: $($GrooveMember.path)"
-    }
-    $GrooveObservedMemberSha256 = (
-      Get-FileHash -LiteralPath $GrooveMemberPath -Algorithm SHA256 -ErrorAction Stop
-    ).Hash.ToLowerInvariant()
-    if ($GrooveObservedMemberSha256 -cne $GrooveMember.sha256.ToLowerInvariant()) {
-      throw "A portable payload member does not match the anchored manifest: $($GrooveMember.path)"
-    }
-  }
-  $GrooveVerifierOutput = @(& (Join-Path $GrooveRoot "verify-portable.cmd") `
-    --expected-manifest-sha256 $GrooveExpectedManifestSha256)
-  if ($LASTEXITCODE -ne 0 -or $GrooveVerifierOutput.Count -ne 1) {
+    $GrooveVerifierOutput = @(& $GrooveTrustedPython -I -S -B $GrooveTrustedVerifier `
+      --root $GrooveRoot --expected-manifest-sha256 $GrooveExpectedManifestSha256)
+    $GrooveVerifierStatus = $LASTEXITCODE
+  } finally { Pop-Location }
+  if ($GrooveVerifierStatus -ne 0 -or $GrooveVerifierOutput.Count -ne 1) {
     throw "Portable verification failed"
   }
-  $GrooveVerifierReceipt = $GrooveVerifierOutput[0] | ConvertFrom-Json
-  if (-not $GrooveVerifierReceipt.ok -or
+  $GrooveVerifierReceipt = $GrooveVerifierOutput[0] | ConvertFrom-Json -ErrorAction Stop
+  if ($GrooveVerifierReceipt.ok -isnot [bool] -or -not $GrooveVerifierReceipt.ok -or
       $GrooveVerifierReceipt.authenticity -ne 'anchored-to-expected-manifest-sha256' -or
-      $GrooveVerifierReceipt.manifest_sha256 -ne $GrooveExpectedManifestSha256.ToLowerInvariant()) {
+      $GrooveVerifierReceipt.manifest_sha256 -cne $GrooveExpectedManifestSha256.ToLowerInvariant() -or
+      $GrooveVerifierReceipt.app_version -cne $GrooveExpectedVersion) {
     throw "Portable verification receipt is not externally anchored"
   }
+  $GrooveVerifiedRoot = $GrooveRoot
 }
 function Invoke-GrooveSerpent {
   param([Parameter(ValueFromRemainingArguments = $true)][string[]] $GrooveArguments)
   if ($GroovePortable) {
+    if ($GrooveVerifiedRoot -ne $GrooveRoot) { throw "This portable root has not been verified" }
     & (Join-Path $GrooveRoot "groove-serpent.cmd") @GrooveArguments
   } else {
     Push-Location $GrooveRoot
@@ -146,18 +97,18 @@ function Invoke-GrooveSerpent {
 Invoke-GrooveSerpent --version
 ```
 
-For a portable runtime, set `$GrooveExpectedManifestSha256` before this block only from a
-separately trusted release receipt or an exact value supplied by the owner. Never copy it from the
-bundle manifest or another file inside the bundle. The host-side exact-inventory and `Get-FileHash`
-checks must succeed for every payload member before invoking the bundled verifier; its interpreter,
-startup dependencies, script, and launcher are otherwise untrusted. Running the verifier without
-that first stage does not authenticate the producer; stop before executing the application. Report
-the version result. Require the verifier receipt app version and the manifest app version to equal
-the version probe; do not edit any of them.
+For a portable runtime, set `$GrooveTrustedPython` and `$GrooveTrustedVerifier`
+to absolute, independently trusted host paths outside the bundle: a separately
+installed Python and reviewed `scripts/verify_windows_portable.py`. Never run
+the bundle's verifier launcher, script, or runtime to establish trust. Obtain
+`$GrooveExpectedManifestSha256` and `$GrooveExpectedVersion` from a separately trusted
+release receipt or exact values the owner independently verified, never from the bundle.
+If any trust input is missing, stop. A consistency-only result is not authority
+to execute. Use a bundle directory protected from modification. Report the
+verified version and require it to equal the later version probe.
 
-Before acting, read [references/authority-contract.json](references/authority-contract.json). It is
-the machine-readable minimum authority contract. Follow the stricter rule if another instruction
-conflicts with it.
+Before acting, read [references/authority-contract.json](references/authority-contract.json), the
+minimum authority contract; follow the stricter rule when instructions conflict.
 
 ## Keep approval with the owner
 

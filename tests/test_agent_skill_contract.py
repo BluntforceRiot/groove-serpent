@@ -68,7 +68,12 @@ class AgentSkillContractTests(unittest.TestCase):
                 ),
                 "derive_expected_hash_from_bundle": "forbidden",
                 "without_external_expected_hash": "consistency-only-not-authenticity",
-                "first_stage": "trusted-host-powershell",
+                "first_stage": "independent-host-python-and-standalone-verifier",
+                "host_flags": ["-I", "-S", "-B"],
+                "bundled_verifier_execution": "forbidden",
+                "expected_version_source": (
+                    "separately-trusted-release-receipt-or-explicit-owner-value"
+                ),
                 "manifest_hash_before_bundle_execution": True,
                 "payload_before_bundle_execution": "exact-inventory-and-sha256",
                 "required_authenticity": "anchored-to-expected-manifest-sha256",
@@ -80,7 +85,7 @@ class AgentSkillContractTests(unittest.TestCase):
             source["fingerprint_backend"],
             "ffmpeg-chromaprint-or-fpcalc-after-confirmed-muxer-absence",
         )
-        self.assertEqual(portable["system_python"], "forbidden")
+        self.assertEqual(portable["system_python"], "trusted-host-verifier-only")
         self.assertEqual(portable["uv"], "not-required")
         self.assertEqual(runtime["missing_or_ambiguous"], "stop")
         self.assertIsNone(SEMANTIC_VERSION.search(self.skill))
@@ -220,23 +225,17 @@ class AgentSkillContractTests(unittest.TestCase):
         self.assertIn("Invoke-GrooveSerpent review PROJECT", self.skill)
         self.assertIn("Invoke-GrooveSerpent album review ALBUM_PROJECT", self.skill)
         self.assertIn('Join-Path $GrooveRoot "groove-serpent.cmd"', self.skill)
-        self.assertIn("do not invoke `uv`, a system Python", self.skill)
+        self.assertIn("For app execution, do not invoke `uv`, a system Python", self.skill)
         self.assertIn("$GroovePortable -eq $GrooveSource", self.skill)
         self.assertIn("verify-portable.cmd", self.skill)
         self.assertIn("A separately trusted portable manifest SHA-256 is required", self.skill)
-        manifest_hash = self.skill.index("$GrooveObservedManifestSha256")
-        manifest_members = self.skill.index("$GrooveMembers = @(")
-        exact_inventory = self.skill.index("$GrooveActualItems = @(")
-        payload_hash = self.skill.index("$GrooveObservedMemberSha256")
-        bundled_execution = self.skill.index("$GrooveVerifierOutput = @(&")
-        self.assertLess(manifest_hash, manifest_members)
-        self.assertLess(manifest_members, exact_inventory)
-        self.assertLess(exact_inventory, payload_hash)
-        self.assertLess(payload_hash, bundled_execution)
-        first_stage = self.skill[manifest_hash:bundled_execution]
-        self.assertIn("Get-ChildItem -LiteralPath $GrooveRoot -Recurse -Force", first_stage)
-        self.assertIn("Get-FileHash -LiteralPath $GrooveMemberPath", first_stage)
-        self.assertIn("The portable directory contains an unmanifested file", first_stage)
+        verify = self.skill.index("& $GrooveTrustedPython -I -S -B $GrooveTrustedVerifier")
+        receipt = self.skill.index("$GrooveVerifiedRoot = $GrooveRoot")
+        execute = self.skill.index('& (Join-Path $GrooveRoot "groove-serpent.cmd")')
+        self.assertLess(verify, receipt)
+        self.assertLess(receipt, execute)
+        self.assertIn("$GrooveVerifierReceipt.app_version -cne $GrooveExpectedVersion", self.skill)
+        self.assertNotIn('& (Join-Path $GrooveRoot "verify-portable.cmd")', self.skill)
         self.assertIn("Never call the Album Workbench publication create-plan", self.skill)
         self.assertIn("Do not automate the approval controls.", self.skill)
         self.assertLess(len(self.skill.splitlines()), 310)

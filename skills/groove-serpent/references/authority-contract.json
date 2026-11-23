@@ -19,7 +19,10 @@
         "expected_manifest_sha256_source": "separately-trusted-release-receipt-or-explicit-owner-value",
         "derive_expected_hash_from_bundle": "forbidden",
         "without_external_expected_hash": "consistency-only-not-authenticity",
-        "first_stage": "trusted-host-powershell",
+        "first_stage": "independent-host-python-and-standalone-verifier",
+        "host_flags": ["-I", "-S", "-B"],
+        "bundled_verifier_execution": "forbidden",
+        "expected_version_source": "separately-trusted-release-receipt-or-explicit-owner-value",
         "manifest_hash_before_bundle_execution": true,
         "payload_before_bundle_execution": "exact-inventory-and-sha256",
         "required_authenticity": "anchored-to-expected-manifest-sha256",
@@ -30,7 +33,7 @@
         "groove-serpent.cmd",
         "--version"
       ],
-      "system_python": "forbidden",
+      "system_python": "trusted-host-verifier-only",
       "uv": "not-required"
     },
     "source_checkout": {

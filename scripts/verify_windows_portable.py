@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import sys
 import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import NoReturn, Sequence, TypedDict, cast
@@ -30,6 +31,9 @@ WINDOWS_RESERVED = frozenset(
     | {f"lpt{index}" for index in range(1, 10)}
 )
 REPARSE_POINT_ATTRIBUTE = 0x400
+# Historical bundles may still be verified as data on the trusted host. Their
+# launcher must never be used to establish pre-execution trust.
+LEGACY_VERIFIER_LAUNCHER_SHA256 = "1aab4ebd822d62c0bb95397b300a9ae8df57266855bb573d60f88d4b68e50682"
 REQUIRED_WEB_ASSETS = (
     "album.css",
     "album.html",
@@ -159,13 +163,10 @@ def expected_app_launcher() -> bytes:
 def expected_verifier_launcher() -> bytes:
     return (
         "@echo off\r\n"
-        "setlocal\r\n"
-        'set "PYTHONDONTWRITEBYTECODE=1"\r\n'
-        'set "PYTHONNOUSERSITE=1"\r\n'
-        'set "PYTHONUTF8=1"\r\n'
-        '"%~dp0runtime\\python.exe" -B "%~dp0verify-portable.py" '
-        '--root "%~dp0." %*\r\n'
-        "exit /b %errorlevel%\r\n"
+        "echo This bundle cannot verify itself. 1>&2\r\n"
+        "echo Use trusted host Python and verify_windows_portable.py from outside it. 1>&2\r\n"
+        "echo Follow independently trusted release instructions before running the app. 1>&2\r\n"
+        "exit /b 2\r\n"
     ).encode("ascii")
 
 
@@ -792,7 +793,10 @@ def _assert_static_identity(
     if launcher != expected_app_launcher():
         _fail("identity", "Application launcher bytes are unsupported.")
     verifier_launcher = _regular_bytes(root / "verify-portable.cmd", "verifier launcher", 16_384)
-    if verifier_launcher != expected_verifier_launcher():
+    if (
+        verifier_launcher != expected_verifier_launcher()
+        and _sha256_bytes(verifier_launcher) != LEGACY_VERIFIER_LAUNCHER_SHA256
+    ):
         _fail("identity", "Verifier launcher bytes are unsupported.")
     match = PYTHON_VERSION_RE.fullmatch(python_version)
     if match is None:
@@ -933,13 +937,43 @@ def verify_portable_directory(
 def _parser() -> argparse.ArgumentParser:
     parser = StrictArgumentParser(add_help=False)
     parser.add_argument("--root", type=Path)
-    parser.add_argument("--expected-manifest-sha256")
+    authority = parser.add_mutually_exclusive_group()
+    authority.add_argument("--expected-manifest-sha256")
+    authority.add_argument("--consistency-only", action="store_true")
     parser.add_argument("--help", action="store_true")
     return parser
 
 
 def _emit(payload: dict[str, object]) -> None:
     print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+
+
+def _require_independent_host(root: Path) -> None:
+    # This checks separation, not origin. The operator must select trusted
+    # paths and a trusted working directory before starting the interpreter.
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        _fail("host_bootstrap", "Run trusted host Python with -I -S -B from outside the bundle.")
+    try:
+        supplied = Path(os.path.abspath(root.expanduser()))
+        resolved = supplied.resolve()
+        for path in (Path(__file__), Path(sys.executable), Path(sys.base_prefix), Path.cwd()):
+            if not path.is_absolute():
+                _fail("host_bootstrap", "Use absolute paths for the trusted host verifier.")
+            if any(
+                candidate.is_relative_to(bundle)
+                for candidate in (Path(os.path.abspath(path)), path.resolve(strict=True))
+                for bundle in (supplied, resolved)
+            ):
+                _fail(
+                    "host_bootstrap",
+                    "The verifier, interpreter, and working directory must be outside the bundle.",
+                )
+    except VerificationError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise VerificationError(
+            "host_bootstrap", "Cannot resolve the host verifier paths.",
+        ) from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -949,17 +983,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(
                 {
                     "schema": VERIFICATION_SCHEMA,
-                    "ok": True,
-                    "usage": ("verify-portable.cmd [--expected-manifest-sha256 64_HEX_CHARACTERS]"),
+                    "ok": False,
+                    "usage": (
+                        "TRUSTED_PYTHON -I -S -B TRUSTED_VERIFY_SCRIPT --root BUNDLE_DIRECTORY "
+                        "(--expected-manifest-sha256 64_HEX_CHARACTERS | --consistency-only)"
+                    ),
                 }
             )
             return 0
         if args.root is None:
             _fail("usage", "--root is required.")
+        if args.expected_manifest_sha256 is None and not args.consistency_only:
+            _fail(
+                "usage",
+                "Supply an external manifest SHA-256 or explicitly use --consistency-only.",
+            )
+        _require_independent_host(args.root)
         result = verify_portable_directory(
             args.root,
             expected_manifest_sha256=args.expected_manifest_sha256,
         )
+        if args.consistency_only:
+            # Diagnostic success must not look like permission to launch.
+            _emit({**result, "ok": False, "consistent": True})
+            return 4
         _emit(cast(dict[str, object], result))
         return 0
     except VerificationError as exc:

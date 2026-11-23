@@ -66,18 +66,12 @@ The output name is
 refused. A fully staged, smoked, and hash-manifested directory is published with
 a native Windows new-name rename. The builder fails closed on non-Windows hosts.
 
-Before consequential use, follow the trusted-host first-stage procedure in
-`WINDOWS_RELEASE_POLICY.md`. It uses host PowerShell to authenticate the manifest,
-reject unmanifested or linked files, and hash every payload member before the
-bundled verifier is allowed to start. This covers the interpreter's DLLs,
-standard library, startup paths, verifier script, and launcher. Do not run
-`verify-portable.cmd` directly against an unverified extracted directory.
-
-After that first stage, the packaged verifier hashes every manifest member and
-rejects missing, extra, linked, unsafe, or portable-colliding paths without
-importing the application or invoking FFmpeg. Without the separately supplied
-expected manifest hash and host bootstrap checks, a passing result proves internal
-consistency only; it does not establish who produced the directory.
+Before first launch, follow the [trusted-host verification procedure](../../WINDOWS_RELEASE_POLICY.md).
+Use a separately installed trusted Python and a reviewed `scripts/verify_windows_portable.py`
+outside the extracted bundle to verify every payload member using the external manifest hash.
+Do not run the bundle's Python, verifier script, or `verify-portable.cmd` to establish trust.
+Only an anchored, successful result for the expected version authorizes execution. Keep the
+extracted directory protected from changes before and after verification.
 
 Create the versioned transport ZIP only from an anchored, verified directory:
 
