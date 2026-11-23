@@ -554,6 +554,29 @@ class ExporterTests(unittest.TestCase):
             with self.assertRaisesRegex(PortablePathError, "ambiguous"):
                 resolve_portable_path(target)
 
+    def test_portable_resolution_detects_new_sibling_with_unchanged_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            first = root / "Cafe\u0301"
+            second = root / "Caf\u00e9"
+            first.mkdir()
+            target = second / "new-batch"
+            portable_names_module._clear_directory_cache()
+
+            # Windows may not update the parent metadata immediately after
+            # mkdir, so a matching stat tuple cannot authorize cached names.
+            with mock.patch.object(
+                portable_names_module, "_directory_identity", return_value=(1,) * 8
+            ):
+                initial = resolve_portable_path(target)
+                self.assertEqual(initial.path.parent, first)
+                try:
+                    second.mkdir()
+                except FileExistsError:
+                    self.skipTest("This filesystem normalizes Unicode directory names.")
+                with self.assertRaisesRegex(PortablePathError, "ambiguous"):
+                    resolve_portable_path(target)
+
     def test_portable_directory_cache_is_safe_under_concurrent_resolution(
         self,
     ) -> None:
@@ -782,7 +805,7 @@ class ExporterTests(unittest.TestCase):
         track = Track(1, "One", 0, 48_000, 0.0, 1.0)
         with mock.patch("groove_serpent.exporter.find_tool", return_value="ffmpeg"):
             command = _build_command(
-                source_path=Path("source.bin"),
+                source_path=Path("source.flac"),
                 output_path=Path("track.flac"),
                 track=track,
                 total_tracks=1,
@@ -855,6 +878,16 @@ class ExporterTests(unittest.TestCase):
                 ]
                 self.assertEqual(
                     inputs, ["source.flac", str(Path("artwork/cover.jpg"))]
+                )
+                source_index = command.index("-i")
+                artwork_index = command.index("-i", source_index + 1)
+                self.assertEqual(
+                    command[source_index - 4 : source_index],
+                    ["-protocol_whitelist", "file,pipe", "-f", "flac"],
+                )
+                self.assertEqual(
+                    command[artwork_index - 4 : artwork_index],
+                    ["-protocol_whitelist", "file,pipe", "-f", "image2"],
                 )
                 self.assertEqual(mappings, ["0:a:0", "1:v:0"])
                 self.assertNotIn("-vn", command)

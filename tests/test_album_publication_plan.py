@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 import groove_serpent.album_publication_plan as publication_plan_module
+import groove_serpent.portable_names as portable_names_module
 from groove_serpent.album_publication_plan import (
     ALBUM_PUBLICATION_PLAN_SCHEMA,
     PROFILE_ARCHIVAL_SOURCE,
@@ -455,6 +456,21 @@ def test_plan_commit_rolls_back_when_a_portable_equivalent_races_rename(
     real_rename = publication_plan_module.rename_no_replace
     alias_at_commit: list[bool] = []
     racer_identity: list[tuple[int, int]] = []
+
+    # Windows can cache directory metadata briefly after a new entry appears.
+    # Keep that metadata fixed so the commit must observe the racing sibling
+    # through a fresh enumeration on every CI platform.
+    portable_names_module._clear_directory_cache()
+    real_directory_identity = portable_names_module._directory_identity
+
+    def stale_directory_identity(parent: Path) -> tuple[int, ...]:
+        if parent == tmp_path:
+            return (0,)
+        return real_directory_identity(parent)
+
+    monkeypatch.setattr(
+        portable_names_module, "_directory_identity", stale_directory_identity
+    )
 
     def race_then_rename(source: Path, target: Path) -> None:
         racing.write_text("foreign racing file", encoding="utf-8")

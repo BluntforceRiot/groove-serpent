@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
@@ -18,6 +19,7 @@ from groove_serpent.metadata import (
     MusicBrainzClient,
     find_track_selections,
 )
+from groove_serpent.safe_http import UnsafeNetworkTargetError
 
 
 RELEASE_ID = "11111111-1111-4111-8111-111111111111"
@@ -295,7 +297,8 @@ class MetadataTests(unittest.TestCase):
             def _wait_for_rate_limit(self) -> None:
                 pass
 
-            def _open(self, request: Any) -> Any:
+            def _open(self, request: Any, timeout: float) -> Any:
+                del request, timeout
                 if isinstance(self.response, BaseException):
                     raise self.response
                 return self.response
@@ -325,7 +328,8 @@ class MetadataTests(unittest.TestCase):
             def _wait_for_rate_limit(self) -> None:
                 pass
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del timeout
                 self.request = request
                 return FakeResponse(json.dumps({"releases": []}).encode())
 
@@ -354,8 +358,52 @@ class MetadataTests(unittest.TestCase):
         second._wait_for_rate_limit()
         self.assertEqual(ClockClient.sleeps, [1.0])
 
+    def test_musicbrainz_transport_restricts_provider_origin(self) -> None:
+        client = MusicBrainzClient()
+        request = urllib.request.Request("https://musicbrainz.org/ws/2/release/")
+        response = FakeResponse(b"{}")
+
+        with mock.patch(
+            "groove_serpent.metadata.open_validated_https",
+            return_value=response,
+        ) as transport:
+            self.assertIs(client._open(request), response)
+
+        policy = transport.call_args.kwargs["policy"]
+        self.assertEqual(policy.validate(request.full_url), ("musicbrainz.org", 443))
+        with self.assertRaises(UnsafeNetworkTargetError):
+            policy.validate("https://archive.org/substituted-provider.json")
+
 
 class CoverArtTests(unittest.TestCase):
+    def test_cover_art_transport_scopes_metadata_and_image_redirects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = CoverArtArchiveClient(directory)
+            metadata_request = urllib.request.Request(
+                "https://coverartarchive.org/release/example",
+                headers={"Accept": "application/json"},
+            )
+            artwork_request = urllib.request.Request(
+                "https://coverartarchive.org/release/example/front.jpg",
+                headers={"Accept": "image/jpeg, image/png"},
+            )
+            response = FakeResponse(b"{}")
+            with mock.patch(
+                "groove_serpent.metadata.open_validated_https",
+                return_value=response,
+            ) as transport:
+                client._open(metadata_request)
+                metadata_policy = transport.call_args.kwargs["policy"]
+                client._open(artwork_request)
+                artwork_policy = transport.call_args.kwargs["policy"]
+
+        with self.assertRaises(UnsafeNetworkTargetError):
+            metadata_policy.validate("https://archive.org/substituted-provider.json")
+        self.assertEqual(
+            artwork_policy.validate("https://ia801.example.archive.org/front.jpg"),
+            ("ia801.example.archive.org", 443),
+        )
+
     def test_resolve_front_art_prefers_approved_and_normalizes_https(self) -> None:
         payload = {
             "images": [
@@ -448,7 +496,8 @@ class CoverArtTests(unittest.TestCase):
                 self.path = path
                 return payload
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     image,
                     headers={
@@ -485,7 +534,8 @@ class CoverArtTests(unittest.TestCase):
                     },
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del timeout
                 self.request = request
                 return FakeResponse(
                     image,
@@ -528,7 +578,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/original.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     self.payload,
                     headers={"Content-Type": self.content_type},
@@ -557,7 +608,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     image,
                     headers={"Content-Type": "image/jpeg"},
@@ -578,7 +630,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(
                     b"not actually a jpeg",
                     headers={"Content-Type": "image/jpeg"},
@@ -603,7 +656,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
 
         with tempfile.TemporaryDirectory() as directory:
@@ -629,7 +683,8 @@ class CoverArtTests(unittest.TestCase):
                     "urls": {"original": "https://coverartarchive.org/release/front.jpg"},
                 }
 
-            def _open(self, request: Any) -> FakeResponse:
+            def _open(self, request: Any, timeout: float) -> FakeResponse:
+                del request, timeout
                 return FakeResponse(image, headers={"Content-Type": "image/jpeg"})
 
         with tempfile.TemporaryDirectory() as directory:

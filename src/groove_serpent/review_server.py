@@ -2920,6 +2920,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._json(response)
 
     def _continuous_preview_render(self) -> None:
+        if not self._require_owner_restoration_channel():
+            return
         payload = self._read_json()
         _strict_json_object(
             payload,
@@ -2990,6 +2992,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._json(response)
 
     def _continuous_preview_reject(self) -> None:
+        if not self._require_owner_restoration_channel():
+            return
         payload = self._read_json()
         _strict_json_object(
             payload,

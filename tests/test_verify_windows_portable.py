@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import contextlib
 import hashlib
-import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from scripts import verify_windows_portable as verifier
 
@@ -249,7 +252,10 @@ class WindowsPortableVerifierTests(unittest.TestCase):
                 expected_manifest_sha256=digest.upper(),
             )
             consistency = verifier.verify_portable_directory(root)
-            self.assertIn(b'--root "%~dp0."', verifier.expected_verifier_launcher())
+            launcher = verifier.expected_verifier_launcher()
+            self.assertIn(b"exit /b 2", launcher)
+            for bundled_target in (b"%~dp0", b"python.exe", b"verify-portable.py", b"%*"):
+                self.assertNotIn(bundled_target, launcher)
             self.assertTrue(anchored["ok"])
             self.assertEqual(
                 anchored["authenticity"],
@@ -261,26 +267,81 @@ class WindowsPortableVerifierTests(unittest.TestCase):
             )
             self.assertEqual(anchored["manifest_sha256"], digest)
 
-    def test_cli_emits_one_json_document_and_nonzero_for_anchor_mismatch(self) -> None:
+    def test_host_cli_requires_the_external_anchor_for_a_successful_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            host_work = Path(temp_dir)
+            root = host_work / "bundle"
             _bundle(root)
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                status = verifier.main(
-                    [
-                        "--root",
-                        str(root),
-                        "--expected-manifest-sha256",
-                        "0" * 64,
-                    ]
+            # These plain files are never executed. The trusted host verifies
+            # all bytes without importing from the bundle or requiring its runtime.
+            _write(root, "json.py", b"# inert bundle fixture, never imported\n")
+            digest = _write_manifest(root, _manifest(root))
+            invocation = [
+                sys.executable, "-I", "-S", "-B", str(Path(verifier.__file__).resolve()),
+                "--root", str(root),
+            ]
+            for cli_args, status, error in (
+                (["--expected-manifest-sha256", digest], 0, None),
+                (["--expected-manifest-sha256", "0" * 64], 1, "manifest_hash"),
+                ([], 2, "usage"),
+                (["--consistency-only"], 4, None),
+            ):
+                process = subprocess.run(
+                    [*invocation, *cli_args], cwd=host_work, check=False,
+                    capture_output=True, env={**os.environ, "PYTHONPATH": str(root)}, timeout=20,
                 )
-            self.assertNotEqual(status, 0)
-            lines = output.getvalue().splitlines()
-            self.assertEqual(len(lines), 1)
-            report = json.loads(lines[0])
-            self.assertFalse(report["ok"])
-            self.assertEqual(report["error"]["code"], "manifest_hash")
+                with self.subTest(status=status, error=error):
+                    self.assertEqual(len(process.stdout.splitlines()), 1)
+                    report = json.loads(process.stdout)
+                    self.assertEqual(process.returncode, status, process.stderr)
+                    if status == 0:
+                        self.assertTrue(report["ok"])
+                        self.assertEqual(report["manifest_sha256"], digest)
+                    elif status == 4:
+                        self.assertFalse(report["ok"])
+                        self.assertTrue(report["consistent"])
+                        self.assertEqual(
+                            report["authenticity"], "consistency-only-no-external-trust-anchor",
+                        )
+                    else:
+                        self.assertFalse(report["ok"])
+                        self.assertEqual(report["error"]["code"], error)
+
+    def test_host_bootstrap_rejects_bundle_paths_and_unisolated_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "bundle"
+            _bundle(root)
+            host = SimpleNamespace(
+                executable=sys.executable,
+                base_prefix=sys.base_prefix,
+                flags=SimpleNamespace(isolated=1, no_site=1, dont_write_bytecode=1),
+            )
+            with mock.patch.object(verifier, "sys", host):
+                for attribute, path in (
+                    ("executable", root / "runtime" / "python.exe"),
+                    ("base_prefix", root / "runtime"),
+                ):
+                    with (
+                        self.subTest(attribute=attribute),
+                        mock.patch.object(host, attribute, str(path)),
+                        self.assertRaisesRegex(verifier.VerificationError, "outside the bundle"),
+                    ):
+                        verifier._require_independent_host(root)
+                with (
+                    mock.patch.object(verifier, "__file__", str(root / "verify-portable.py")),
+                    self.assertRaisesRegex(verifier.VerificationError, "outside the bundle"),
+                ):
+                    verifier._require_independent_host(root)
+                with (
+                    mock.patch.object(Path, "cwd", return_value=root),
+                    self.assertRaisesRegex(verifier.VerificationError, "outside the bundle"),
+                ):
+                    verifier._require_independent_host(root)
+                with (
+                    mock.patch.object(host.flags, "isolated", 0),
+                    self.assertRaisesRegex(verifier.VerificationError, "-I -S -B"),
+                ):
+                    verifier._require_independent_host(root)
 
     def test_member_tamper_truncation_missing_and_extra_are_rejected(self) -> None:
         cases = ("tamper", "truncate", "missing", "extra")

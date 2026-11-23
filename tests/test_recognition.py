@@ -8,7 +8,7 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 from unittest import mock
 
 from groove_serpent import __user_agent__
@@ -32,6 +32,7 @@ from groove_serpent.recognition import (
     _parse_matches,
     _probe_ffmpeg_chromaprint,
 )
+from groove_serpent.safe_http import HTTPSRequestPolicy, UnsafeNetworkTargetError
 from groove_serpent.subprocess_policy import BoundedProcessResult
 
 
@@ -118,6 +119,7 @@ def _macos_namespace_probe_process(command: list[str]) -> _FakeProcess:
 class _FakeResponse:
     def __init__(self, payload: object) -> None:
         self._raw = json.dumps(payload).encode("utf-8")
+        self._stream = io.BytesIO(self._raw)
 
     def __enter__(self) -> _FakeResponse:
         return self
@@ -126,7 +128,7 @@ class _FakeResponse:
         return None
 
     def read(self, size: int = -1) -> bytes:
-        return self._raw[:size]
+        return self._stream.read(size)
 
 
 def _runtime(
@@ -359,7 +361,7 @@ class FingerprintBackendTests(unittest.TestCase):
                     "groove_serpent.recognition._probe_ffmpeg_chromaprint",
                     return_value=("absent", "not compiled"),
                 ),
-                mock.patch("groove_serpent.recognition.urllib.request.urlopen") as network,
+                mock.patch("groove_serpent.recognition.open_validated_https") as network,
             ):
                 status, runtime = _discover_fingerprint_runtime()
             self.assertTrue(status.ready)
@@ -390,7 +392,7 @@ class FingerprintBackendTests(unittest.TestCase):
         with (
             mock.patch("groove_serpent.recognition.find_executable", return_value=None),
             mock.patch("groove_serpent.recognition._find_fpcalc", return_value=None),
-            mock.patch("groove_serpent.recognition.urllib.request.urlopen") as network,
+            mock.patch("groove_serpent.recognition.open_validated_https") as network,
         ):
             status, runtime = _discover_fingerprint_runtime()
         self.assertFalse(status.ready)
@@ -414,9 +416,9 @@ class FingerprintBackendTests(unittest.TestCase):
 
             provider = AcoustIDRecognitionProvider(api_key="key")
             with mock.patch(
-                "groove_serpent.recognition.subprocess.Popen",
+                "groove_serpent.recognition.start_media_process",
                 side_effect=popen,
-            ), mock.patch("groove_serpent.recognition.urllib.request.urlopen") as network:
+            ), mock.patch("groove_serpent.recognition.open_validated_https") as network:
                 payload = provider._fingerprint(
                     source,
                     123,
@@ -463,7 +465,7 @@ class FingerprintBackendTests(unittest.TestCase):
                 )
                 provider = AcoustIDRecognitionProvider(api_key="key")
                 with mock.patch(
-                    "groove_serpent.recognition.subprocess.Popen",
+                    "groove_serpent.recognition.start_media_process",
                     return_value=process,
                 ), self.assertRaises(RecognitionError):
                     provider._fingerprint(
@@ -532,7 +534,7 @@ class FingerprintBackendTests(unittest.TestCase):
 
             provider = AcoustIDRecognitionProvider(api_key="key")
             with mock.patch(
-                "groove_serpent.recognition.subprocess.Popen",
+                "groove_serpent.recognition.start_media_process",
                 side_effect=popen,
             ):
                 payload = provider._fingerprint(
@@ -623,9 +625,15 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         captured_request: dict[str, object] = {}
 
-        def fake_urlopen(request: object, timeout: float) -> _FakeResponse:
+        def fake_urlopen(
+            request: object,
+            *,
+            timeout: float,
+            policy: object,
+        ) -> _FakeResponse:
             captured_request["request"] = request
             captured_request["timeout"] = timeout
+            captured_request["policy"] = policy
             return _FakeResponse(lookup_payload)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -638,9 +646,9 @@ class RecognitionPipelineTests(unittest.TestCase):
                 "groove_serpent.recognition._discover_fingerprint_runtime",
                 return_value=(_runtime_status(runtime), runtime),
             ), mock.patch(
-                "groove_serpent.recognition.subprocess.Popen", side_effect=fake_popen
+                "groove_serpent.recognition.start_media_process", side_effect=fake_popen
             ), mock.patch(
-                "groove_serpent.recognition.urllib.request.urlopen",
+                "groove_serpent.recognition.open_validated_https",
                 side_effect=fake_urlopen,
             ):
                 matches = provider.identify_track(
@@ -672,6 +680,13 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(fields["duration"], ["120"])
         self.assertEqual(fields["fingerprint"], ["encoded-fingerprint"])
         self.assertEqual(fields["meta"], ["recordings+releasegroups+releases"])
+        policy = cast(HTTPSRequestPolicy, captured_request["policy"])
+        self.assertEqual(
+            policy.validate(ACOUSTID_LOOKUP_URL),
+            ("api.acoustid.org", 443),
+        )
+        with self.assertRaises(UnsafeNetworkTargetError):
+            policy.validate("https://musicbrainz.org/substituted.json")
         self.assertTrue(ffmpeg_process.waited)
         self.assertTrue(fpcalc_process.waited)
 
@@ -745,7 +760,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             with mock.patch(
                 "groove_serpent.recognition._discover_fingerprint_runtime",
                 return_value=(_runtime_status(runtime), runtime),
-            ), mock.patch("groove_serpent.recognition.subprocess.Popen") as popen:
+            ), mock.patch("groove_serpent.recognition.start_media_process") as popen:
                 fingerprint_processes = 0
 
                 def fake_popen(command: list[str], **kwargs: object) -> _FakeProcess:
@@ -768,7 +783,7 @@ class RecognitionPipelineTests(unittest.TestCase):
     def test_lookup_rejects_oversized_and_error_json(self) -> None:
         provider = AcoustIDRecognitionProvider(api_key="key", max_response_bytes=20)
         with mock.patch(
-            "groove_serpent.recognition.urllib.request.urlopen",
+            "groove_serpent.recognition.open_validated_https",
             return_value=_FakeResponse({"status": "ok", "padding": "x" * 100}),
         ):
             with self.assertRaisesRegex(RecognitionError, "large response"):
@@ -776,7 +791,7 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         provider = AcoustIDRecognitionProvider(api_key="key")
         with mock.patch(
-            "groove_serpent.recognition.urllib.request.urlopen",
+            "groove_serpent.recognition.open_validated_https",
             return_value=_FakeResponse(
                 {"status": "error", "error": {"code": 4, "message": "bad key"}}
             ),

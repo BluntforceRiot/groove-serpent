@@ -156,7 +156,8 @@ def test_artwork_partial_response_failure_cleans_owned_bytes(tmp_path: Path) -> 
     ):
         with pytest.raises(metadata.MetadataLookupError, match="primary response failure"):
             client._download_resolved_front_art(RESOLVED, size="1200")
-    assert list((tmp_path / "artwork").iterdir()) == []
+    artwork_dir = tmp_path / "artwork"
+    assert not artwork_dir.exists() or not any(artwork_dir.iterdir())
 
 
 def test_artwork_cleanup_failure_preserves_primary_error(tmp_path: Path) -> None:

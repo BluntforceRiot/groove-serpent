@@ -13,19 +13,31 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast, runtime_checkable
+from typing import (
+    BinaryIO,
+    Callable,
+    Literal,
+    Protocol,
+    TypedDict,
+    cast,
+    runtime_checkable,
+)
 
 from . import __user_agent__
 from .album_publication_policy import speed_correction_details
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
 from .executable_discovery import find_executable
+from .media import local_ffmpeg_input_args
+from .provider_http import fetch_provider_response
+from .safe_http import HTTPSRequestPolicy, open_validated_https
 from .subprocess_policy import (
     BoundedDiagnostic,
     MAX_DIAGNOSTIC_BYTES,
     join_diagnostic_reader,
     run_bounded_capture,
     start_diagnostic_reader,
+    start_media_process,
     terminate_and_reap,
 )
 
@@ -33,6 +45,7 @@ _MAX_DIAGNOSTIC_BYTES = MAX_DIAGNOSTIC_BYTES
 
 
 ACOUSTID_LOOKUP_URL = "https://api.acoustid.org/v2/lookup"
+_ACOUSTID_REQUEST_POLICY = HTTPSRequestPolicy(("api.acoustid.org",))
 _MAX_FINGERPRINT_SECONDS = 120.0
 _LEAD_AMBIENCE_SECONDS = 8.0
 _MIN_AUDIO_AFTER_SKIP_SECONDS = 15.0
@@ -96,8 +109,9 @@ class _FingerprintRuntime:
 
 
 class _BoundedBinaryCapture:
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, on_overflow: Callable[[], None]) -> None:
         self._limit = limit
+        self._on_overflow = on_overflow
         self._payload = bytearray()
         self.truncated = False
 
@@ -111,7 +125,10 @@ class _BoundedBinaryCapture:
                 if room > 0:
                     self._payload.extend(chunk[:room])
                 if len(chunk) > room:
+                    first_overflow = not self.truncated
                     self.truncated = True
+                    if first_overflow:
+                        self._on_overflow()
         except (OSError, ValueError):
             self.truncated = True
         finally:
@@ -439,11 +456,15 @@ def fingerprint_backend_readiness() -> FingerprintBackendReadiness:
 
 
 def _start_binary_capture(
+    process: subprocess.Popen[bytes],
     stream: BinaryIO,
     *,
     name: str,
 ) -> tuple[_BoundedBinaryCapture, threading.Thread]:
-    capture = _BoundedBinaryCapture(_MAX_FINGERPRINT_OUTPUT_BYTES)
+    capture = _BoundedBinaryCapture(
+        _MAX_FINGERPRINT_OUTPUT_BYTES,
+        on_overflow=lambda: terminate_and_reap(process),
+    )
     thread = threading.Thread(
         target=capture.drain,
         args=(stream,),
@@ -685,8 +706,7 @@ class AcoustIDRecognitionProvider:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(source_path),
+            *local_ffmpeg_input_args(source_path),
             "-map",
             "0:a:0",
             "-vn",
@@ -715,8 +735,9 @@ class AcoustIDRecognitionProvider:
         output_thread: threading.Thread | None = None
         try:
             _assert_executable_unchanged(runtime.ffmpeg, "FFmpeg executable")
-            process = subprocess.Popen(
+            process = start_media_process(
                 command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -724,6 +745,7 @@ class AcoustIDRecognitionProvider:
             if process.stdout is None or process.stderr is None:
                 raise RecognitionError("FFmpeg did not expose its fingerprint pipes.")
             output_capture, output_thread = _start_binary_capture(
+                process,
                 cast(BinaryIO, process.stdout),
                 name="groove-serpent-chromaprint-stdout",
             )
@@ -797,8 +819,7 @@ class AcoustIDRecognitionProvider:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(source_path),
+            *local_ffmpeg_input_args(source_path),
             "-map",
             "0:a:0",
             "-vn",
@@ -835,8 +856,9 @@ class AcoustIDRecognitionProvider:
         try:
             _assert_executable_unchanged(runtime.ffmpeg, "FFmpeg executable")
             _assert_executable_unchanged(runtime.fpcalc, "fpcalc executable")
-            ffmpeg_process = subprocess.Popen(
+            ffmpeg_process = start_media_process(
                 ffmpeg_command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -849,8 +871,9 @@ class AcoustIDRecognitionProvider:
                 name="groove-serpent-ffmpeg-stderr",
             )
 
-            fpcalc_process = subprocess.Popen(
+            fpcalc_process = start_media_process(
                 fpcalc_command,
+                timeout=self._fingerprint_timeout_seconds,
                 stdin=ffmpeg_process.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -861,6 +884,7 @@ class AcoustIDRecognitionProvider:
             if fpcalc_process.stdout is None or fpcalc_process.stderr is None:
                 raise RecognitionError("fpcalc did not expose its result pipes.")
             output_capture, output_thread = _start_binary_capture(
+                fpcalc_process,
                 cast(BinaryIO, fpcalc_process.stdout),
                 name="groove-serpent-fpcalc-stdout",
             )
@@ -956,16 +980,13 @@ class AcoustIDRecognitionProvider:
 
         self._wait_for_request_slot()
         try:
-            with urllib.request.urlopen(
-                request, timeout=self._timeout_seconds
-            ) as response:
-                raw = response.read(self._max_response_bytes + 1)
-        except urllib.error.HTTPError as exc:
-            detail = _http_error_detail(exc, self._max_response_bytes)
-            suffix = f": {detail}" if detail else ""
-            raise RecognitionError(
-                f"AcoustID lookup failed with HTTP {exc.code}{suffix}"
-            ) from exc
+            response = fetch_provider_response(
+                lambda remaining: open_validated_https(
+                    request, timeout=remaining, policy=_ACOUSTID_REQUEST_POLICY
+                ),
+                timeout=self._timeout_seconds,
+                max_bytes=self._max_response_bytes,
+            )
         except urllib.error.URLError as exc:
             raise RecognitionError(f"AcoustID lookup could not connect: {exc.reason}") from exc
         except TimeoutError as exc:
@@ -973,6 +994,14 @@ class AcoustIDRecognitionProvider:
         except OSError as exc:
             raise RecognitionError(f"AcoustID lookup failed: {exc}") from exc
 
+        if not 200 <= response.status < 300:
+            detail = _http_error_detail(response.body, self._max_response_bytes)
+            suffix = f": {detail}" if detail else ""
+            raise RecognitionError(
+                f"AcoustID lookup failed with HTTP {response.status}{suffix}"
+            )
+
+        raw = response.body
         if len(raw) > self._max_response_bytes:
             raise RecognitionError("AcoustID returned an unexpectedly large response.")
         try:
@@ -1172,11 +1201,8 @@ def _parse_fingerprint_output(
     return {"fingerprint": fingerprint, "duration": authoritative_duration}
 
 
-def _http_error_detail(error: urllib.error.HTTPError, limit: int) -> str:
-    try:
-        raw = error.read(min(limit, _MAX_DIAGNOSTIC_BYTES) + 1)
-    except OSError:
-        return ""
+def _http_error_detail(raw: bytes, limit: int) -> str:
+    raw = raw[: min(limit, _MAX_DIAGNOSTIC_BYTES) + 1]
     if len(raw) > min(limit, _MAX_DIAGNOSTIC_BYTES):
         return "response was too large"
     try:

@@ -23,10 +23,18 @@ import numpy as np
 
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
-from .media import MAX_DIAGNOSTIC_BYTES, find_tool
+from .media import MAX_DIAGNOSTIC_BYTES, find_tool, local_ffmpeg_input_args
 from .models import AudioSource, Project, resolve_source_path
 from .project_io import load_project
-from .subprocess_policy import terminate_and_reap
+from .subprocess_policy import (
+    BoundedDiagnostic,
+    MEDIA_EVIDENCE_TIMEOUT_SECONDS,
+    join_diagnostic_reader,
+    media_process_timed_out,
+    start_diagnostic_reader,
+    start_media_process,
+    terminate_and_reap,
+)
 
 
 EVIDENCE_SCHEMA = "groove-serpent.evidence-window/1"
@@ -223,8 +231,7 @@ def _decode_exact_float(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
         "-map",
         "0:a:0",
         "-vn",
@@ -240,41 +247,58 @@ def _decode_exact_float(
         "pcm_f32le",
         "-f",
         "f32le",
+        "-fs",
+        str(expected_bytes),
         "pipe:1",
     ]
     process: subprocess.Popen[bytes] | None = None
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        if cancelled is None:
-            completed = subprocess.run(
+    diagnostic_capture: BoundedDiagnostic | None = None
+    diagnostic_thread: threading.Thread | None = None
+    try:
+        with tempfile.TemporaryFile() as stdout_file:
+            process = start_media_process(
                 command,
-                check=False,
+                timeout=MEDIA_EVIDENCE_TIMEOUT_SECONDS,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
-                stderr=stderr_file,
+                stderr=subprocess.PIPE,
             )
-            returncode = completed.returncode
-        else:
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                )
+            diagnostic_capture, diagnostic_thread = start_diagnostic_reader(
+                process,
+                name="groove-serpent-evidence-stderr",
+            )
+            if cancelled is None:
+                returncode = process.wait()
+            else:
                 while True:
                     _raise_if_cancelled(cancelled)
                     try:
                         returncode = process.wait(timeout=0.025)
                         break
                     except subprocess.TimeoutExpired:
+                        if media_process_timed_out(process):
+                            raise
                         continue
-            finally:
-                terminate_and_reap(process)
-        stderr_file.seek(0)
-        diagnostic = stderr_file.read(MAX_DIAGNOSTIC_BYTES + 1)
-        stdout_file.seek(0)
-        decoded = stdout_file.read(expected_bytes + 1)
+            stdout_file.seek(0)
+            decoded = stdout_file.read(expected_bytes + 1)
+            join_diagnostic_reader(process, diagnostic_thread)
+            diagnostic = diagnostic_capture.payload() if diagnostic_capture else b""
+    except subprocess.TimeoutExpired as exc:
+        raise GrooveSerpentError(
+            "The evidence decoder exceeded its safety deadline."
+        ) from exc
+    finally:
+        terminate_and_reap(process)
+        join_diagnostic_reader(process, diagnostic_thread)
     _raise_if_cancelled(cancelled)
+    if len(decoded) > expected_bytes:
+        raise GrooveSerpentError(
+            "The evidence decoder exceeded its exact PCM output bound."
+        )
+    if diagnostic_capture is not None and diagnostic_capture.truncated:
+        raise GrooveSerpentError(
+            "The evidence decoder exceeded its diagnostic output bound."
+        )
     if returncode != 0:
         detail = diagnostic[:MAX_DIAGNOSTIC_BYTES].decode(
             "utf-8", errors="replace"

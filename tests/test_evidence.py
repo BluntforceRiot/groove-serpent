@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import shutil
 import subprocess
 import tempfile
@@ -210,6 +211,7 @@ class EvidenceTests(unittest.TestCase):
     def test_cancelled_decoder_terminates_and_reaps_ffmpeg(self) -> None:
         class FakeProcess:
             def __init__(self) -> None:
+                self.stderr = io.BytesIO()
                 self.terminated = False
                 self.killed = False
 
@@ -231,7 +233,7 @@ class EvidenceTests(unittest.TestCase):
         process = FakeProcess()
         checks = iter((False, True))
         with patch(
-            "groove_serpent.evidence.subprocess.Popen",
+            "groove_serpent.evidence.start_media_process",
             return_value=process,
         ), self.assertRaises(EvidenceRequestSuperseded):
             _decode_exact_float(
@@ -257,9 +259,25 @@ class EvidenceTests(unittest.TestCase):
                 analyze_evidence_window(self.source_path, self.source, **kwargs)
 
     def test_decoder_refuses_non_exact_pcm_length(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stderr = io.BytesIO()
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return 0
+
+        def fake_start(command, *, timeout, stdin, stdout, stderr):
+            del command, timeout, stdin, stderr
+            stdout.write(b"\0" * 7)
+            return FakeProcess()
+
         with patch(
-            "groove_serpent.evidence.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0, stdout=b"\0" * 7, stderr=b""),
+            "groove_serpent.evidence.start_media_process",
+            side_effect=fake_start,
         ):
             with self.assertRaises(GrooveSerpentError):
                 analyze_evidence_window(

@@ -693,6 +693,39 @@ def _build_plan(
     }
 
 
+def _reconstruct_project_migration(
+    path: Path, backup_raw: bytes
+) -> tuple[dict[str, Any], MigrationArtifactPaths, bytes]:
+    """Rebuild the only migration plan and candidate authorized by a backup."""
+
+    try:
+        original_data = decode_project_json(backup_raw)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProjectValidationError(
+            f"Migration backup is not a valid project: {exc}"
+        ) from exc
+    original_schema = original_data.get("schema_version")
+    if type(original_schema) is not int or original_schema not in _MIGRATORS:
+        raise ProjectValidationError(
+            "Migration backup is not a supported legacy project."
+        )
+    original_sha256 = _sha256(backup_raw)
+    migrated_project, steps = migrate_project_data(original_data)
+    migrated_raw = _project_payload_bytes(migrated_project)
+    artifacts = migration_artifact_paths(path, original_sha256, original_schema)
+    plan = _build_plan(
+        path=path,
+        original_data=original_data,
+        original_schema=original_schema,
+        original_sha256=original_sha256,
+        migrated_project=migrated_project,
+        migrated_sha256=_sha256(migrated_raw),
+        artifacts=artifacts,
+        steps=steps,
+    )
+    return plan, artifacts, migrated_raw
+
+
 def _validate_digest(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -881,24 +914,38 @@ def _resume_pending(
 ) -> ProjectMigrationResult:
     plan, artifacts, pending_sha256 = _read_pending(path, pending_path)
     original_sha256 = str(plan["original_sha256"])
-    migrated_sha256 = str(plan["migrated_sha256"])
 
     backup_raw, _ = _read_snapshot(artifacts.backup)
     if _sha256(backup_raw) != original_sha256:
         raise ProjectValidationError("Migration backup no longer matches the original hash.")
+    expected_plan, expected_artifacts, expected_candidate_raw = (
+        _reconstruct_project_migration(path, backup_raw)
+    )
+    if plan != expected_plan or artifacts != expected_artifacts:
+        raise ProjectValidationError(
+            "Migration plan does not match the deterministic migration reconstructed "
+            "from the backup."
+        )
+    plan = expected_plan
+    artifacts = expected_artifacts
+    original_sha256 = str(plan["original_sha256"])
+    migrated_sha256 = str(plan["migrated_sha256"])
 
     parent_snapshot = _assert_plain_parent(path)
     current_raw, current_snapshot = _read_snapshot(path)
     current_sha256 = _sha256(current_raw)
-    if current_sha256 == original_sha256:
+    if current_raw == backup_raw and current_sha256 == original_sha256:
         if _lexists(artifacts.receipt):
             raise ProjectValidationError(
                 "A committed receipt exists while the original project is still "
                 "present; the inconsistent transaction was left untouched."
             )
         candidate_raw, _ = _read_snapshot(artifacts.candidate)
-        if _sha256(candidate_raw) != migrated_sha256:
-            raise ProjectValidationError("Migration candidate hash does not match the plan.")
+        if candidate_raw != expected_candidate_raw:
+            raise ProjectValidationError(
+                "Migration candidate does not match the deterministic migration "
+                "reconstructed from the backup."
+            )
         candidate_project = Project.from_dict(decode_project_json(candidate_raw))
         if (
             candidate_project.state_sha256 != plan["editable_state_sha256"]
@@ -908,6 +955,7 @@ def _resume_pending(
         repeated_raw, repeated_snapshot = _read_snapshot(path)
         if (
             repeated_snapshot != current_snapshot
+            or repeated_raw != backup_raw
             or _sha256(repeated_raw) != original_sha256
             or _assert_plain_parent(path) != parent_snapshot
         ):
@@ -917,7 +965,7 @@ def _resume_pending(
         _commit_project_candidate(
             path,
             artifacts.candidate,
-            candidate_raw,
+            expected_candidate_raw,
             migrated_sha256,
             backup_raw,
             original_sha256,
@@ -926,13 +974,13 @@ def _resume_pending(
         current_raw, _ = _read_snapshot(path)
         current_sha256 = _sha256(current_raw)
 
-    if current_sha256 != migrated_sha256:
+    if current_raw != expected_candidate_raw or current_sha256 != migrated_sha256:
         raise ProjectValidationError(
             "Pending migration conflicts with the current project bytes; no file was changed."
         )
     if _lexists(artifacts.candidate):
         candidate_raw, _ = _read_snapshot(artifacts.candidate)
-        if _sha256(candidate_raw) != migrated_sha256:
+        if candidate_raw != expected_candidate_raw:
             raise ProjectValidationError(
                 "The migrated project and a changed candidate both exist; the "
                 "inconsistent transaction was left untouched."

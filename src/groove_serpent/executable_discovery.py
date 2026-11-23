@@ -1,14 +1,14 @@
-"""Resolve external tools without allowing an implicit current-directory search."""
+"""Resolve native external tools without allowing unsafe search behavior."""
 
 from __future__ import annotations
 
 import os
-import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
-_WINDOWS_DEFAULT_PATHEXT = (".COM", ".EXE", ".BAT", ".CMD")
-_WINDOWS_PATHEXT_RE = re.compile(r"\.[A-Za-z0-9_-]{1,16}\Z")
+_WINDOWS_EXECUTABLE_SUFFIX = ".exe"
+_WINDOWS_EXECUTABLE_IMAGE = 0x0002
+_WINDOWS_OPTIONAL_HEADER_MAGICS = {b"\x0b\x01", b"\x0b\x02"}
 
 
 def _simple_executable_name(value: str) -> bool:
@@ -17,28 +17,49 @@ def _simple_executable_name(value: str) -> bool:
     )
 
 
-def _windows_extensions() -> tuple[str, ...]:
-    if os.name != "nt":
-        return ()
-    raw = os.environ.get("PATHEXT", "")
-    extensions: list[str] = []
-    for value in raw.split(os.pathsep):
-        extension = value.strip()
-        if (
-            _WINDOWS_PATHEXT_RE.fullmatch(extension) is not None
-            and extension.casefold() not in {item.casefold() for item in extensions}
-        ):
-            extensions.append(extension)
-    return tuple(extensions) or _WINDOWS_DEFAULT_PATHEXT
+def _windows_candidate_names(name: str) -> tuple[str, ...]:
+    suffix = PureWindowsPath(name).suffix
+    if not suffix:
+        return (f"{name}{_WINDOWS_EXECUTABLE_SUFFIX}",)
+    if suffix.casefold() == _WINDOWS_EXECUTABLE_SUFFIX:
+        return (name,)
+    return ()
 
 
 def _candidate_names(name: str) -> tuple[str, ...]:
-    extensions = _windows_extensions()
-    if not extensions or any(
-        name.casefold().endswith(extension.casefold()) for extension in extensions
-    ):
+    if os.name != "nt":
         return (name,)
-    return tuple(f"{name}{extension}" for extension in extensions)
+    return _windows_candidate_names(name)
+
+
+def _is_windows_native_executable(path: Path) -> bool:
+    if path.suffix.casefold() != _WINDOWS_EXECUTABLE_SUFFIX:
+        return False
+
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        dos_header = handle.read(64)
+        if len(dos_header) != 64 or dos_header[:2] != b"MZ":
+            return False
+        pe_offset = int.from_bytes(dos_header[60:64], "little")
+        if pe_offset < 64 or pe_offset > size - 26:
+            return False
+
+        handle.seek(pe_offset)
+        if handle.read(4) != b"PE\x00\x00":
+            return False
+        coff_header = handle.read(20)
+        if len(coff_header) != 20:
+            return False
+        optional_header_size = int.from_bytes(coff_header[16:18], "little")
+        characteristics = int.from_bytes(coff_header[18:20], "little")
+        if (
+            optional_header_size < 2
+            or pe_offset + 24 + optional_header_size > size
+            or not characteristics & _WINDOWS_EXECUTABLE_IMAGE
+        ):
+            return False
+        return handle.read(2) in _WINDOWS_OPTIONAL_HEADER_MAGICS
 
 
 def _resolved_executable(candidate: Path) -> str | None:
@@ -46,7 +67,10 @@ def _resolved_executable(candidate: Path) -> str | None:
         resolved = candidate.resolve(strict=True)
         if not resolved.is_file():
             return None
-        if os.name != "nt" and not os.access(resolved, os.X_OK):
+        if os.name == "nt":
+            if not _is_windows_native_executable(resolved):
+                return None
+        elif not os.access(resolved, os.X_OK):
             return None
     except (OSError, RuntimeError):
         return None
@@ -78,9 +102,11 @@ def find_executable(name: str, *, explicit: str | None = None) -> str | None:
     Ordinary discovery considers only absolute PATH directories and never the
     process current directory. Empty and relative PATH entries are ignored, so
     Windows cannot prepend the current directory through
-    ``NeedCurrentDirectoryForExePath``. An explicit override may name a fully
-    qualified path, or a bare executable name that is searched by the same
-    rules; relative configured paths are deliberately refused.
+    ``NeedCurrentDirectoryForExePath``. Windows candidates must be ``.exe`` PE
+    images; PATHEXT command scripts and custom associations are not considered.
+    An explicit override may name a fully qualified path, or a bare executable
+    name that is searched by the same rules; relative configured paths are
+    deliberately refused.
     """
 
     search_name = name.strip()

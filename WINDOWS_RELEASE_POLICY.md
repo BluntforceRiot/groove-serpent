@@ -12,19 +12,25 @@ For an unsigned release:
 2. Obtain the ZIP SHA-256 and portable-manifest SHA-256 from the separately published release
    receipt. Do not copy the expected hash from inside the ZIP being checked.
 3. Hash the downloaded ZIP with `Get-FileHash -Algorithm SHA256` and compare it exactly.
-4. Extract to a new directory, then run:
+4. Extract to a new directory that others cannot modify. Before starting anything from it,
+   use absolute paths to a separately installed, trusted Python and a reviewed
+   `scripts/verify_windows_portable.py` from a trusted checkout or source release.
+   Keep the working directory and both executables outside the bundle:
 
    ```powershell
-   .\verify-portable.cmd --expected-manifest-sha256 EXPECTED_64_HEX_DIGEST
+   & $TrustedPython -I -S -B $TrustedVerifier --root $ExtractedBundle `
+     --expected-manifest-sha256 $ExpectedManifestSha256
    ```
 
-5. Continue only when the single JSON receipt reports `ok: true`, authenticity
-   `anchored-to-expected-manifest-sha256`, and the expected application version.
+5. Proceed only when the command exits zero and prints one JSON receipt with `ok: true`,
+   `authenticity: anchored-to-expected-manifest-sha256`, the expected manifest SHA-256,
+   and the expected application version. A `--consistency-only` result is not authority to launch.
 6. Run `.\groove-serpent.cmd doctor --json` before opening a capture.
 
-The verifier establishes integrity relative to the separately trusted manifest digest. It does not
-replace a trusted code-signing certificate. Never disable antivirus, bypass an organization policy,
-or treat a SmartScreen warning as proof that a file is either malicious or safe.
+The host verifies the exact manifest and inventory as data, without starting the bundled
+interpreter, script, or `verify-portable.cmd`. Do not use instructions from an unverified bundle
+to establish trust. Keep the directory protected after verification and while using the app.
+Verification does not replace a trusted signature; never disable antivirus or bypass policy.
 
 ## Antivirus and SmartScreen evidence
 
