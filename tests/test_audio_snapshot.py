@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -101,6 +102,9 @@ class VerifiedAudioSnapshotTests(unittest.TestCase):
             )
             try:
                 captured_stat = snapshot.path.stat()
+                # The lease compares change time; cross a filesystem clock tick
+                # so this test observes the edit even on coarse timestamp stores.
+                time.sleep(0.1)
                 with snapshot.path.open("r+b") as handle:
                     handle.seek(len(payload) // 2)
                     handle.write(b"B")
