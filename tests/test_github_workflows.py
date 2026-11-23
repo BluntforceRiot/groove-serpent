@@ -57,14 +57,34 @@ def test_ci_uses_canonical_runner_temp_without_weakening_path_checks() -> None:
 
 def test_windows_ci_installs_pinned_full_ffmpeg_with_libsoxr_smoke() -> None:
     text = _ci_workflow_text()
-
-    assert (
-        "choco install ffmpeg-full --version=8.1.2 --yes --no-progress" in text
+    windows = text.split(
+        "      - name: Install checksum-pinned FFmpeg on Windows\n", maxsplit=1
+    )[1].split("\n      - name:", maxsplit=1)[0]
+    url = (
+        "https://github.com/GyanD/codexffmpeg/releases/download/"
+        "8.1.2/ffmpeg-8.1.2-full_build.zip"
     )
-    assert "choco install ffmpeg --yes --no-progress" not in text
+    assert f"FFMPEG_URL: {url}" in windows
+    assert "FFMPEG_SHA256: B8CDEFAB5F50590A076C27C2B56B0294A0E6154FADED28BA1BA05EBC4F801F57" in (
+        windows
+    )
+    assert "if: runner.os == 'Windows'" in windows
+    download = windows.index("Invoke-WebRequest -Uri $env:FFMPEG_URL")
+    verify = windows.index("Get-FileHash -LiteralPath $archive -Algorithm SHA256")
+    extract = windows.index("Expand-Archive -LiteralPath $archive")
+    use = windows.index("Add-Content -LiteralPath $env:GITHUB_PATH")
+    assert download < verify < extract < use
+    assert "throw 'FFmpeg archive does not match the pinned SHA-256.'" in windows[verify:extract]
     assert (
         'aresample=44100:resampler=soxr:precision=33:cutoff=0.99' in text
     )
+
+
+def test_linux_ci_keeps_the_supported_media_recipe_host_in_the_python_matrix() -> None:
+    test_job = _ci_workflow_text().split("\n  browser-e2e:", maxsplit=1)[0]
+    matrix = test_job.split("        os:\n", maxsplit=1)[1].split("        python:\n")[0]
+    assert "- ubuntu-24.04" in matrix
+    assert "- ubuntu-latest" not in matrix
 
 
 def test_macos_ci_pins_libsoxr_enabled_ffmpeg_formula() -> None:
