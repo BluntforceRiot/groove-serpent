@@ -782,7 +782,7 @@ class ExporterTests(unittest.TestCase):
         track = Track(1, "One", 0, 48_000, 0.0, 1.0)
         with mock.patch("groove_serpent.exporter.find_tool", return_value="ffmpeg"):
             command = _build_command(
-                source_path=Path("source.bin"),
+                source_path=Path("source.flac"),
                 output_path=Path("track.flac"),
                 track=track,
                 total_tracks=1,
@@ -855,6 +855,16 @@ class ExporterTests(unittest.TestCase):
                 ]
                 self.assertEqual(
                     inputs, ["source.flac", str(Path("artwork/cover.jpg"))]
+                )
+                source_index = command.index("-i")
+                artwork_index = command.index("-i", source_index + 1)
+                self.assertEqual(
+                    command[source_index - 4 : source_index],
+                    ["-protocol_whitelist", "file,pipe", "-f", "flac"],
+                )
+                self.assertEqual(
+                    command[artwork_index - 4 : artwork_index],
+                    ["-protocol_whitelist", "file,pipe", "-f", "image2"],
                 )
                 self.assertEqual(mappings, ["0:a:0", "1:v:0"])
                 self.assertNotIn("-vn", command)

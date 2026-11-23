@@ -23,6 +23,44 @@ from .subprocess_policy import (
 
 
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
+_LOCAL_MEDIA_PROTOCOLS = "file,pipe"
+_LOCAL_MEDIA_DEMUXERS = {
+    ".aif": "aiff",
+    ".aiff": "aiff",
+    ".flac": "flac",
+    ".jpeg": "image2",
+    ".jpg": "image2",
+    ".m4a": "mov",
+    ".png": "image2",
+    ".wav": "wav",
+    ".wave": "wav",
+}
+
+
+def _local_media_input_options(path: Path) -> list[str]:
+    demuxer = _LOCAL_MEDIA_DEMUXERS.get(path.suffix.casefold())
+    if demuxer is None:
+        raise GrooveSerpentError(
+            f"Unsupported local media container for '{path.name}'."
+        )
+    return [
+        "-protocol_whitelist",
+        _LOCAL_MEDIA_PROTOCOLS,
+        "-f",
+        demuxer,
+    ]
+
+
+def local_ffmpeg_input_args(path: Path) -> list[str]:
+    """Build one local-only FFmpeg input with an explicit expected demuxer."""
+
+    return [*_local_media_input_options(path), "-i", str(path)]
+
+
+def local_ffprobe_input_args(path: Path) -> list[str]:
+    """Build one local-only ffprobe input with an explicit expected demuxer."""
+
+    return [*_local_media_input_options(path), str(path)]
 
 
 def audio_source_descriptor_mismatches(
@@ -90,6 +128,7 @@ def probe_audio(path: Path, stored_path: str | None = None) -> AudioSource:
     if not path.is_file():
         raise GrooveSerpentError(f"Input audio does not exist: {path}")
 
+    input_args = local_ffprobe_input_args(path)
     ffprobe = find_tool("ffprobe")
     command = [
         ffprobe,
@@ -106,7 +145,7 @@ def probe_audio(path: Path, stored_path: str | None = None) -> AudioSource:
         "format=duration",
         "-of",
         "json",
-        str(path),
+        *input_args,
     ]
     completed = subprocess.run(
         command,
@@ -185,6 +224,7 @@ def decode_rms_envelope(
     if analysis_rate <= 0 or window_ms <= 0:
         raise ValueError("analysis_rate and window_ms must be positive")
 
+    input_args = local_ffmpeg_input_args(path)
     ffmpeg = find_tool("ffmpeg")
     window_samples = max(1, round(analysis_rate * window_ms / 1000.0))
     window_seconds = window_samples / analysis_rate
@@ -194,8 +234,7 @@ def decode_rms_envelope(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(path),
+        *input_args,
         "-map",
         "0:a:0",
         "-vn",

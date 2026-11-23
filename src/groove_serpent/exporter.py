@@ -18,6 +18,8 @@ from .errors import ExportError, GrooveSerpentError, ProjectValidationError
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
+    local_ffprobe_input_args,
     probe_audio,
     run_ffmpeg,
     tool_version,
@@ -499,7 +501,7 @@ def _probe_m4a_presentation_sample_count(path: Path, expected_sample_rate: int) 
             "stream=sample_rate,duration_ts,time_base",
             "-of",
             "json",
-            str(path),
+            *local_ffprobe_input_args(path),
         ],
         check=False,
         capture_output=True,
@@ -560,7 +562,7 @@ def _probe_exact_audio_stream(path: Path) -> dict[str, Any]:
             ),
             "-of",
             "json",
-            str(path),
+            *local_ffprobe_input_args(path),
         ],
         check=False,
         capture_output=True,
@@ -637,7 +639,7 @@ def _probe_track_numbering_tags(path: Path) -> dict[str, str]:
             "format_tags:stream_tags",
             "-of",
             "json",
-            str(path),
+            *local_ffprobe_input_args(path),
         ],
         check=False,
         capture_output=True,
@@ -761,8 +763,7 @@ def _complete_decode(path: Path) -> None:
                 "-loglevel",
                 "error",
                 "-xerror",
-                "-i",
-                str(path),
+                *local_ffmpeg_input_args(path),
                 "-map",
                 "0:a:0",
                 "-vn",
@@ -797,8 +798,7 @@ def _decoded_pcm_sha256(
         "-loglevel",
         "error",
         "-xerror",
-        "-i",
-        str(path),
+        *local_ffmpeg_input_args(path),
         "-map",
         "0:a:0",
         "-vn",
@@ -1093,11 +1093,10 @@ def _build_command(
         "-loglevel",
         "error",
         "-y" if overwrite else "-n",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
     ]
     if artwork_path is not None:
-        command.extend(["-i", str(artwork_path)])
+        command.extend(local_ffmpeg_input_args(artwork_path))
     command.extend(
         [
             "-map",

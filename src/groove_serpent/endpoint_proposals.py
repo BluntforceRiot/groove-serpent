@@ -29,7 +29,13 @@ from .atomic_create import (
 )
 from .audio_snapshot import verified_audio_snapshot
 from .errors import ExportError, GrooveSerpentError, ProjectValidationError
-from .media import audio_source_descriptor_mismatches, find_tool, probe_audio, tool_version
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    local_ffmpeg_input_args,
+    probe_audio,
+    tool_version,
+)
 from .models import Project, resolve_source_path
 from .portable_names import portable_name_key
 from .project_io import load_project_with_sha256
@@ -1099,8 +1105,7 @@ def _decode_scope_features(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(snapshot_path),
+        *local_ffmpeg_input_args(snapshot_path),
         "-map",
         "0:a:0",
         "-vn",

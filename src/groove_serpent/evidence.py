@@ -23,7 +23,7 @@ import numpy as np
 
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
-from .media import MAX_DIAGNOSTIC_BYTES, find_tool
+from .media import MAX_DIAGNOSTIC_BYTES, find_tool, local_ffmpeg_input_args
 from .models import AudioSource, Project, resolve_source_path
 from .project_io import load_project
 from .subprocess_policy import terminate_and_reap
@@ -223,8 +223,7 @@ def _decode_exact_float(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
         "-map",
         "0:a:0",
         "-vn",

@@ -70,7 +70,13 @@ from .exporter import (
     render_verified_track,
     sanitize_filename,
 )
-from .media import audio_source_descriptor_mismatches, find_tool, probe_audio
+from .media import (
+    audio_source_descriptor_mismatches,
+    find_tool,
+    local_ffmpeg_input_args,
+    local_ffprobe_input_args,
+    probe_audio,
+)
 from .models import Project, Track
 from .portable_names import (
     PortablePathError,
@@ -1132,7 +1138,7 @@ def _semantic_tags_and_artwork(path: Path) -> dict[str, Any]:
             ("format_tags:stream=index,codec_type:stream_disposition=attached_pic:stream_tags"),
             "-of",
             "json",
-            str(path),
+            *local_ffprobe_input_args(path),
         ],
         stdout_limit=1024 * 1024,
     )
@@ -1193,8 +1199,7 @@ def _semantic_tags_and_artwork(path: Path) -> dict[str, Any]:
                 "-loglevel",
                 "error",
                 "-xerror",
-                "-i",
-                str(path),
+                *local_ffmpeg_input_args(path),
                 "-map",
                 "0:v:0",
                 "-frames:v",

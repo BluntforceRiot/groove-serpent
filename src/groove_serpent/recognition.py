@@ -20,6 +20,7 @@ from .album_publication_policy import speed_correction_details
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
 from .executable_discovery import find_executable
+from .media import local_ffmpeg_input_args
 from .subprocess_policy import (
     BoundedDiagnostic,
     MAX_DIAGNOSTIC_BYTES,
@@ -685,8 +686,7 @@ class AcoustIDRecognitionProvider:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(source_path),
+            *local_ffmpeg_input_args(source_path),
             "-map",
             "0:a:0",
             "-vn",
@@ -797,8 +797,7 @@ class AcoustIDRecognitionProvider:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(source_path),
+            *local_ffmpeg_input_args(source_path),
             "-map",
             "0:a:0",
             "-vn",

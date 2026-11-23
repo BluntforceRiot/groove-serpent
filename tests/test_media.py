@@ -4,12 +4,21 @@ import io
 import math
 import struct
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 from groove_serpent.errors import GrooveSerpentError
-from groove_serpent.media import decode_rms_envelope, run_ffmpeg, tool_version
+from groove_serpent.media import (
+    decode_rms_envelope,
+    local_ffmpeg_input_args,
+    local_ffprobe_input_args,
+    probe_audio,
+    run_ffmpeg,
+    tool_version,
+)
 
 
 class _FakeProcess:
@@ -50,6 +59,74 @@ class _ExplodingStream(io.BytesIO):
 
 
 class MediaTests(unittest.TestCase):
+    def test_local_media_inputs_force_demuxers_and_local_protocols(self) -> None:
+        for filename, demuxer in (
+            ("side.flac", "flac"),
+            ("side.wav", "wav"),
+            ("side.wave", "wav"),
+            ("side.aif", "aiff"),
+            ("side.aiff", "aiff"),
+            ("track.m4a", "mov"),
+            ("cover.jpg", "image2"),
+            ("cover.jpeg", "image2"),
+            ("cover.png", "image2"),
+        ):
+            with self.subTest(filename=filename):
+                path = Path(filename)
+                options = [
+                    "-protocol_whitelist",
+                    "file,pipe",
+                    "-f",
+                    demuxer,
+                ]
+                self.assertEqual(
+                    local_ffmpeg_input_args(path),
+                    [*options, "-i", str(path)],
+                )
+                self.assertEqual(
+                    local_ffprobe_input_args(path),
+                    [*options, str(path)],
+                )
+
+    def test_local_media_inputs_reject_indirection_formats(self) -> None:
+        for filename in ("side.ffconcat", "side.m3u", "side.m3u8"):
+            for builder in (local_ffmpeg_input_args, local_ffprobe_input_args):
+                with (
+                    self.subTest(filename=filename, builder=builder.__name__),
+                    self.assertRaisesRegex(
+                        GrooveSerpentError, "Unsupported local media container"
+                    ),
+                ):
+                    builder(Path(filename))
+
+    def test_probe_forces_local_flac_before_reading_metadata(self) -> None:
+        payload = (
+            '{"streams":[{"codec_name":"flac","sample_rate":"48000",'
+            '"channels":2,"bits_per_raw_sample":"24","sample_fmt":"s32",'
+            '"duration":"1.0","duration_ts":"48000","time_base":"1/48000"}],'
+            '"format":{"duration":"1.0"}}'
+        )
+        with tempfile.TemporaryDirectory() as directory_value:
+            path = Path(directory_value) / "side.flac"
+            path.write_bytes(b"local capture")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=payload, stderr=""
+            )
+            with mock.patch(
+                "groove_serpent.media.find_tool", return_value="ffprobe"
+            ), mock.patch(
+                "groove_serpent.media.subprocess.run", return_value=completed
+            ) as run:
+                source = probe_audio(path)
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[-5:],
+            ["-protocol_whitelist", "file,pipe", "-f", "flac", str(path.resolve())],
+        )
+        self.assertEqual(source.codec_name, "flac")
+        self.assertEqual(source.sample_count, 48_000)
+
     def test_error_only_ffmpeg_requires_clean_diagnostics_and_zero_exit(self) -> None:
         for return_code, diagnostic in (
             (0, b""),
@@ -136,6 +213,12 @@ class MediaTests(unittest.TestCase):
                 decode_rms_envelope(Path("side.flac"), analysis_rate=10, window_ms=100)
 
         self.assertIn("-nostdin", captured["command"])
+        command = cast(list[str], captured["command"])
+        input_index = command.index("-i")
+        self.assertEqual(
+            command[input_index - 4 : input_index],
+            ["-protocol_whitelist", "file,pipe", "-f", "flac"],
+        )
         self.assertIs(captured["stdin"], subprocess.DEVNULL)
         self.assertIs(captured["stdout"], subprocess.PIPE)
         self.assertIs(captured["stderr"], subprocess.PIPE)

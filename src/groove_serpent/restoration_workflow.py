@@ -30,6 +30,7 @@ from .errors import GrooveSerpentError, ProjectValidationError
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
     probe_audio,
     sha256_file,
     tool_version,
@@ -541,8 +542,7 @@ def _decode_chunks(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(source_path),
+        *local_ffmpeg_input_args(source_path),
         "-map",
         "0:a:0",
         "-vn",

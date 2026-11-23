@@ -102,6 +102,7 @@ from .hum_preview import (
 from .media import (
     audio_source_descriptor_mismatches,
     find_tool,
+    local_ffmpeg_input_args,
     probe_audio,
     sha256_file,
     tool_version,
@@ -758,8 +759,7 @@ def _decode_scope(
             find_tool("ffmpeg"),
             "-v",
             "error",
-            "-i",
-            str(snapshot.path),
+            *local_ffmpeg_input_args(snapshot.path),
             "-map",
             "0:a:0",
             "-vn",
