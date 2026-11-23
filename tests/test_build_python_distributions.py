@@ -144,7 +144,7 @@ class BuildPythonDistributionsTests(unittest.TestCase):
         payload = (ROOT / "packaging" / "python-build-constraints.txt").read_bytes()
         receipt = builder._constraints(payload)
 
-        self.assertEqual(receipt["requirement"], "setuptools==83.0.0")
+        self.assertEqual(receipt["requirement"], "setuptools==84.2.1")
         hashes = cast(list[str], receipt["distribution_hashes"])
         self.assertEqual(set(hashes), builder.SETUPTOOLS_HASHES)
         self.assertEqual(receipt["file_sha256"], hashlib.sha256(payload).hexdigest())
@@ -155,7 +155,7 @@ class BuildPythonDistributionsTests(unittest.TestCase):
             source = root / "source tree"
             source.mkdir()
             constraints = root / "constraints with spaces.txt"
-            constraints.write_text("setuptools==83.0.0\n", encoding="utf-8")
+            constraints.write_text("setuptools==84.2.1\n", encoding="utf-8")
             environment = {"PATH": os.environ.get("PATH", "")}
 
             with mock.patch.object(builder, "_run_bounded") as run:

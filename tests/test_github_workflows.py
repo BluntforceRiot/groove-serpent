@@ -158,7 +158,7 @@ def test_ci_uses_the_audited_deterministic_python_distribution_builder() -> None
     assert "Upload audited Python distributions and receipt" in package_job
     assert (
         "uses: actions/upload-artifact@"
-        "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2"
+        "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2"
     ) in package_job
     assert "dist/groove_serpent-1.1.0-py3-none-any.whl" in package_job
     assert "dist/groove_serpent-1.1.0.tar.gz" in package_job

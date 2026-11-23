@@ -103,10 +103,10 @@ TRUSTED_UV_EXECUTABLES = {
     "b9f74e398b6b15826a4b68b5a83d039036d47df64013e7faf1a9974ec199c144":
         "aarch64-unknown-linux-gnu",
 }
-SETUPTOOLS_VERSION = "83.0.0"
+SETUPTOOLS_VERSION = "84.2.1"
 SETUPTOOLS_HASHES = {
-    "025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef",
-    "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3",
+    "3ff8b3b5492a0aa66960f4419365a86b84e013070d4313e4d4a6894f5d64d6bc",
+    "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
 }
 FORBIDDEN_SUFFIXES = {
     ".aif",
@@ -454,7 +454,9 @@ def _constraints(payload: bytes) -> dict[str, object]:
         logical.strip(),
     )
     if requirement is None or requirement.group("version") != SETUPTOOLS_VERSION:
-        raise RuntimeError("Python build constraints must pin exactly setuptools 83.0.0.")
+        raise RuntimeError(
+            f"Python build constraints must pin exactly setuptools {SETUPTOOLS_VERSION}."
+        )
     hashes = {
         token.removeprefix("--hash=sha256:")
         for token in requirement.group("hashes").split()
