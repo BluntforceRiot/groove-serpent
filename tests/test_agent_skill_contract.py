@@ -68,6 +68,9 @@ class AgentSkillContractTests(unittest.TestCase):
                 ),
                 "derive_expected_hash_from_bundle": "forbidden",
                 "without_external_expected_hash": "consistency-only-not-authenticity",
+                "first_stage": "trusted-host-powershell",
+                "manifest_hash_before_bundle_execution": True,
+                "payload_before_bundle_execution": "exact-inventory-and-sha256",
                 "required_authenticity": "anchored-to-expected-manifest-sha256",
                 "required_result": "strict-json-zero-exit-and-ok-true",
                 "required_fingerprint_backend": "ffmpeg-chromaprint",
@@ -221,9 +224,22 @@ class AgentSkillContractTests(unittest.TestCase):
         self.assertIn("$GroovePortable -eq $GrooveSource", self.skill)
         self.assertIn("verify-portable.cmd", self.skill)
         self.assertIn("A separately trusted portable manifest SHA-256 is required", self.skill)
+        manifest_hash = self.skill.index("$GrooveObservedManifestSha256")
+        manifest_members = self.skill.index("$GrooveMembers = @(")
+        exact_inventory = self.skill.index("$GrooveActualItems = @(")
+        payload_hash = self.skill.index("$GrooveObservedMemberSha256")
+        bundled_execution = self.skill.index("$GrooveVerifierOutput = @(&")
+        self.assertLess(manifest_hash, manifest_members)
+        self.assertLess(manifest_members, exact_inventory)
+        self.assertLess(exact_inventory, payload_hash)
+        self.assertLess(payload_hash, bundled_execution)
+        first_stage = self.skill[manifest_hash:bundled_execution]
+        self.assertIn("Get-ChildItem -LiteralPath $GrooveRoot -Recurse -Force", first_stage)
+        self.assertIn("Get-FileHash -LiteralPath $GrooveMemberPath", first_stage)
+        self.assertIn("The portable directory contains an unmanifested file", first_stage)
         self.assertIn("Never call the Album Workbench publication create-plan", self.skill)
         self.assertIn("Do not automate the approval controls.", self.skill)
-        self.assertLess(len(self.skill.splitlines()), 220)
+        self.assertLess(len(self.skill.splitlines()), 310)
 
         openai = OPENAI_PATH.read_text(encoding="utf-8")
         self.assertIn("$groove-serpent", openai)

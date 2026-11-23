@@ -12,19 +12,85 @@ For an unsigned release:
 2. Obtain the ZIP SHA-256 and portable-manifest SHA-256 from the separately published release
    receipt. Do not copy the expected hash from inside the ZIP being checked.
 3. Hash the downloaded ZIP with `Get-FileHash -Algorithm SHA256` and compare it exactly.
-4. Extract to a new directory, then run:
+4. Extract to a new directory. Before starting anything from that directory, use trusted host
+   PowerShell to bind the exact inventory and every payload member to the anchored manifest:
 
    ```powershell
-   .\verify-portable.cmd --expected-manifest-sha256 EXPECTED_64_HEX_DIGEST
+   $PortableRoot = (Resolve-Path "PATH_TO_EXTRACTED_PORTABLE_DIRECTORY").Path
+   $ExpectedManifestSha256 = "EXPECTED_64_HEX_DIGEST".ToLowerInvariant()
+   if ($ExpectedManifestSha256 -notmatch '^[0-9a-f]{64}$') { throw "Invalid manifest SHA-256" }
+   $RootItem = Get-Item -LiteralPath $PortableRoot -Force -ErrorAction Stop
+   if (-not $RootItem.PSIsContainer -or
+       ($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+     throw "Portable root is not a regular directory"
+   }
+   $ManifestPath = Join-Path $PortableRoot "PORTABLE-MANIFEST.json"
+   $ManifestItem = Get-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+   if ($ManifestItem.PSIsContainer -or
+       ($ManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+     throw "Portable manifest is not a regular file"
+   }
+   if ((Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() `
+       -cne $ExpectedManifestSha256) { throw "Portable manifest hash mismatch" }
+   $Manifest = [IO.File]::ReadAllText(
+     $ManifestPath, [Text.UTF8Encoding]::new($false, $true)
+   ) | ConvertFrom-Json -ErrorAction Stop
+   $Members = @($Manifest.payload.members)
+   $MemberPaths =
+     [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+   $PortablePaths =
+     [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+   foreach ($Member in $Members) {
+     if ($Member.path -isnot [string] -or $Member.sha256 -isnot [string] -or
+         $Member.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+         -not ($Member.size -is [int] -or $Member.size -is [long]) -or $Member.size -lt 0 -or
+         -not $MemberPaths.Add($Member.path) -or -not $PortablePaths.Add($Member.path)) {
+       throw "Anchored manifest contains an invalid or repeated member"
+     }
+   }
+   $ActualItems = @(Get-ChildItem -LiteralPath $PortableRoot -Recurse -Force -ErrorAction Stop)
+   if (@($ActualItems | Where-Object {
+     $_.Attributes -band [IO.FileAttributes]::ReparsePoint
+   }).Count -ne 0) { throw "Portable directory contains a reparse point" }
+   $ActualFiles = @($ActualItems | Where-Object { -not $_.PSIsContainer })
+   if ($ActualFiles.Count -ne ($Members.Count + 1)) { throw "Portable inventory mismatch" }
+   $RootPrefix = $PortableRoot.TrimEnd('\') + '\'
+   foreach ($ActualFile in $ActualFiles) {
+     if (-not $ActualFile.FullName.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+       throw "Portable file resolves outside the root"
+     }
+     $RelativePath = $ActualFile.FullName.Substring($RootPrefix.Length).Replace('\', '/')
+     if ($RelativePath -cne "PORTABLE-MANIFEST.json" -and
+         -not $MemberPaths.Contains($RelativePath)) { throw "Unmanifested portable file" }
+   }
+   foreach ($Member in $Members) {
+     $MemberPath = Join-Path $PortableRoot $Member.path
+     $MemberItem = Get-Item -LiteralPath $MemberPath -Force -ErrorAction Stop
+     if ($MemberItem.PSIsContainer -or
+         ($MemberItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+       throw "Payload member is not a regular file: $($Member.path)"
+     }
+     if ($MemberItem.Length -ne $Member.size) { throw "Payload member size mismatch" }
+     if ((Get-FileHash -LiteralPath $MemberPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() `
+         -cne $Member.sha256.ToLowerInvariant()) {
+       throw "Payload member hash mismatch: $($Member.path)"
+     }
+   }
+   & (Join-Path $PortableRoot "verify-portable.cmd") `
+     --expected-manifest-sha256 $ExpectedManifestSha256
    ```
 
 5. Continue only when the single JSON receipt reports `ok: true`, authenticity
    `anchored-to-expected-manifest-sha256`, and the expected application version.
 6. Run `.\groove-serpent.cmd doctor --json` before opening a capture.
 
-The verifier establishes integrity relative to the separately trusted manifest digest. It does not
-replace a trusted code-signing certificate. Never disable antivirus, bypass an organization policy,
-or treat a SmartScreen warning as proof that a file is either malicious or safe.
+The first stage uses only host PowerShell and .NET code to authenticate the manifest, reject
+unmanifested or linked files, and hash every payload member before any bundled component executes.
+That includes the interpreter's DLLs, standard library, startup paths, verifier script, and
+launcher. The packaged verifier then validates the directory's complete format and identity.
+Neither stage replaces a trusted code-signing certificate. Never disable antivirus, bypass an
+organization policy, or treat a SmartScreen warning as proof that a file is either malicious or
+safe.
 
 ## Antivirus and SmartScreen evidence
 

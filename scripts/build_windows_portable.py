@@ -848,13 +848,14 @@ UNINSTALL / REMOVE
 
 INTEGRITY AND SIGNING
   PORTABLE-MANIFEST.json records exact payload hashes and exact build inputs.
-  Run verify-portable.cmd before use. When a trusted release receipt provides
-  the manifest hash, pass:
-    verify-portable.cmd --expected-manifest-sha256 64_HEX_CHARACTERS
-  Without that external hash, verification proves consistency, not origin or
-  authenticity. The verifier does not execute the app, NumPy, FFmpeg, or
-  ffprobe while it hashes them; its bundled Python bootstrap is still part of
-  the externally anchored payload trust boundary.
+  Do not start verify-portable.cmd until trusted host PowerShell has matched the
+  manifest to a separately supplied release-receipt hash, rejected unmanifested
+  or linked files, and matched every payload member to that manifest. This must
+  cover all interpreter DLLs, startup files, the verifier, and its launcher.
+  Follow the trusted copy of WINDOWS_RELEASE_POLICY.md, not instructions copied
+  from this unverified directory. After that first stage, run verify-portable.cmd
+  with --expected-manifest-sha256. Without the external hash and host checks,
+  verification proves consistency, not authenticity.
   This private foundation does not claim Authenticode or other code signing.
 
 LICENSES

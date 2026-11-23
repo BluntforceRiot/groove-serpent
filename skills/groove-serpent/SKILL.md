@@ -38,6 +38,89 @@ if ($GroovePortable) {
       $GrooveExpectedManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
     throw "A separately trusted portable manifest SHA-256 is required"
   }
+  $GrooveExpectedManifestSha256 = $GrooveExpectedManifestSha256.ToLowerInvariant()
+  $GrooveRootItem = Get-Item -LiteralPath $GrooveRoot -Force -ErrorAction Stop
+  if (-not $GrooveRootItem.PSIsContainer -or
+      ($GrooveRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "The portable root is not a regular directory"
+  }
+  $GrooveManifestPath = Join-Path $GrooveRoot "PORTABLE-MANIFEST.json"
+  $GrooveManifestItem = Get-Item -LiteralPath $GrooveManifestPath -Force -ErrorAction Stop
+  if ($GrooveManifestItem.PSIsContainer -or
+      ($GrooveManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "The portable manifest is not a regular file"
+  }
+  $GrooveObservedManifestSha256 = (
+    Get-FileHash -LiteralPath $GrooveManifestPath -Algorithm SHA256 -ErrorAction Stop
+  ).Hash.ToLowerInvariant()
+  if ($GrooveObservedManifestSha256 -cne $GrooveExpectedManifestSha256) {
+    throw "The portable manifest does not match the separately trusted SHA-256"
+  }
+  try {
+    $GrooveManifest = [IO.File]::ReadAllText(
+      $GrooveManifestPath, [Text.UTF8Encoding]::new($false, $true)
+    ) | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "The anchored portable manifest is not readable UTF-8 JSON"
+  }
+  $GrooveMembers = @($GrooveManifest.payload.members)
+  $GrooveMemberPaths =
+    [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+  $GroovePortablePaths =
+    [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($GrooveMember in $GrooveMembers) {
+    if ($GrooveMember.path -isnot [string] -or $GrooveMember.sha256 -isnot [string] -or
+        $GrooveMember.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+        -not ($GrooveMember.size -is [int] -or $GrooveMember.size -is [long]) -or
+        $GrooveMember.size -lt 0 -or
+        -not $GrooveMemberPaths.Add($GrooveMember.path) -or
+        -not $GroovePortablePaths.Add($GrooveMember.path)) {
+      throw "The anchored portable manifest has an invalid or repeated payload member"
+    }
+  }
+  $GrooveActualItems = @(
+    Get-ChildItem -LiteralPath $GrooveRoot -Recurse -Force -ErrorAction Stop
+  )
+  if (@($GrooveActualItems | Where-Object {
+    $_.Attributes -band [IO.FileAttributes]::ReparsePoint
+  }).Count -ne 0) {
+    throw "The portable directory contains a reparse point"
+  }
+  $GrooveActualFiles = @($GrooveActualItems | Where-Object { -not $_.PSIsContainer })
+  if ($GrooveActualFiles.Count -ne ($GrooveMembers.Count + 1)) {
+    throw "The portable directory inventory does not match the anchored manifest"
+  }
+  $GrooveRootPrefix = $GrooveRoot.TrimEnd('\') + '\'
+  foreach ($GrooveActualFile in $GrooveActualFiles) {
+    if (-not $GrooveActualFile.FullName.StartsWith(
+      $GrooveRootPrefix, [StringComparison]::OrdinalIgnoreCase
+    )) {
+      throw "A portable file resolves outside the portable root"
+    }
+    $GrooveRelativePath = $GrooveActualFile.FullName.Substring($GrooveRootPrefix.Length)
+    $GrooveRelativePath = $GrooveRelativePath.Replace('\', '/')
+    if ($GrooveRelativePath -cne "PORTABLE-MANIFEST.json" -and
+        -not $GrooveMemberPaths.Contains($GrooveRelativePath)) {
+      throw "The portable directory contains an unmanifested file: $GrooveRelativePath"
+    }
+  }
+  foreach ($GrooveMember in $GrooveMembers) {
+    $GrooveMemberPath = Join-Path $GrooveRoot $GrooveMember.path
+    $GrooveMemberItem = Get-Item -LiteralPath $GrooveMemberPath -Force -ErrorAction Stop
+    if ($GrooveMemberItem.PSIsContainer -or
+        ($GrooveMemberItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw "A portable payload member is not a regular file: $($GrooveMember.path)"
+    }
+    if ($GrooveMemberItem.Length -ne $GrooveMember.size) {
+      throw "A portable payload member has the wrong size: $($GrooveMember.path)"
+    }
+    $GrooveObservedMemberSha256 = (
+      Get-FileHash -LiteralPath $GrooveMemberPath -Algorithm SHA256 -ErrorAction Stop
+    ).Hash.ToLowerInvariant()
+    if ($GrooveObservedMemberSha256 -cne $GrooveMember.sha256.ToLowerInvariant()) {
+      throw "A portable payload member does not match the anchored manifest: $($GrooveMember.path)"
+    }
+  }
   $GrooveVerifierOutput = @(& (Join-Path $GrooveRoot "verify-portable.cmd") `
     --expected-manifest-sha256 $GrooveExpectedManifestSha256)
   if ($LASTEXITCODE -ne 0 -or $GrooveVerifierOutput.Count -ne 1) {
@@ -65,10 +148,12 @@ Invoke-GrooveSerpent --version
 
 For a portable runtime, set `$GrooveExpectedManifestSha256` before this block only from a
 separately trusted release receipt or an exact value supplied by the owner. Never copy it from the
-bundle manifest or another file inside the bundle. Running the verifier without that value may
-diagnose internal consistency, but does not authenticate the producer; stop before executing the
-application. Report the version result. Require the verifier receipt app version and the manifest
-app version to equal the version probe; do not edit any of them.
+bundle manifest or another file inside the bundle. The host-side exact-inventory and `Get-FileHash`
+checks must succeed for every payload member before invoking the bundled verifier; its interpreter,
+startup dependencies, script, and launcher are otherwise untrusted. Running the verifier without
+that first stage does not authenticate the producer; stop before executing the application. Report
+the version result. Require the verifier receipt app version and the manifest app version to equal
+the version probe; do not edit any of them.
 
 Before acting, read [references/authority-contract.json](references/authority-contract.json). It is
 the machine-readable minimum authority contract. Follow the stricter rule if another instruction

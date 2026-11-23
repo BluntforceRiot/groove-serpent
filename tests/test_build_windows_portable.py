@@ -367,6 +367,9 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 (first / "verify-portable.cmd").read_bytes(),
             )
             self.assertIn(b'--root "%~dp0."', (first / "verify-portable.cmd").read_bytes())
+            portable_readme = (first / "README-PORTABLE.txt").read_bytes()
+            self.assertIn(b"Do not start verify-portable.cmd until trusted host", portable_readme)
+            self.assertIn(b"matched every payload member", portable_readme)
 
             manifest = portable._verify_manifest(first)
             self.assertEqual(manifest["app"]["version"], "1.0.0")
