@@ -318,6 +318,9 @@ os._exit(0)
             with self.assertRaisesRegex(ProjectValidationError, "Source audio changed"):
                 with verified_audio_snapshot(live) as snapshot:
                     snapshot_path = snapshot.path
+                    # Cross a filesystem timestamp tick before the deliberate
+                    # live edit so its change time remains observable on tmpfs.
+                    time.sleep(0.1)
                     live.write_bytes(b"temporary replacement")
                     self.assertEqual(snapshot.path.read_bytes(), original)
                     live.write_bytes(original)

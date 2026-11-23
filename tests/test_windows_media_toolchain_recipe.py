@@ -20,6 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN = ROOT / "toolchains" / "windows-media"
+RECIPE_HOST = sys.platform.startswith("linux") and os.access("/usr/bin/python3.12", os.X_OK)
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -261,7 +262,7 @@ def test_kernel_work_root_lock_excludes_a_second_builder(tmp_path: Path) -> None
     assert released.returncode == 0
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux recipe environment")
+@pytest.mark.skipif(not RECIPE_HOST, reason="Recipe requires /usr/bin/python3.12")
 def test_hostile_build_environment_is_normalized_before_artifact_creation(
     tmp_path: Path,
 ) -> None:
@@ -331,6 +332,7 @@ printf 'shell-printf=clean\n'
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            timeout=20,
             text=True,
             encoding="utf-8",
         )
@@ -357,7 +359,7 @@ printf 'shell-printf=clean\n'
         assert all(stat.S_IMODE(info.external_attr >> 16) == 0o644 for info in archive.infolist())
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux launcher boundary")
+@pytest.mark.skipif(not RECIPE_HOST, reason="Recipe requires /usr/bin/python3.12")
 def test_isolated_launcher_sanitizes_before_bash_startup(tmp_path: Path) -> None:
     probe = tmp_path / "launcher-probe"
     probe.mkdir()
@@ -420,6 +422,7 @@ fi
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=environment,
+        timeout=20,
         text=True,
         encoding="utf-8",
     )
@@ -429,7 +432,7 @@ fi
     assert not (probe / "python-env-ran").exists()
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux launcher boundary")
+@pytest.mark.skipif(not RECIPE_HOST, reason="Recipe requires /usr/bin/python3.12")
 @pytest.mark.parametrize("interpreter_flags", [[], ["-I"]])
 def test_launcher_refuses_missing_isolation_or_no_bytecode_before_bash(
     tmp_path: Path,
@@ -457,6 +460,7 @@ def test_launcher_refuses_missing_isolation_or_no_bytecode_before_bash(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=environment,
+        timeout=20,
         text=True,
         encoding="utf-8",
     )
