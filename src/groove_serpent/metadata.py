@@ -21,7 +21,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, cast
+from typing import Any, BinaryIO, Mapping
 
 from . import __user_agent__
 from .atomic_create import (
@@ -31,6 +31,7 @@ from .atomic_create import (
     rename_no_replace,
 )
 from .errors import GrooveSerpentError
+from .safe_http import HTTPSRequestPolicy, open_validated_https
 
 
 DEFAULT_USER_AGENT = __user_agent__
@@ -228,8 +229,13 @@ class MusicBrainzClient:
             raise ValueError("timeout must be a positive number of seconds.")
         self.base_url = str(base_url).rstrip("/")
         parsed = urllib.parse.urlsplit(self.base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("base_url must be an absolute HTTP or HTTPS URL.")
+        if parsed.scheme != "https" or not parsed.netloc or not parsed.hostname:
+            raise ValueError("base_url must be an absolute HTTPS URL.")
+        try:
+            self._request_policy = HTTPSRequestPolicy((parsed.hostname,))
+            self._request_policy.validate(self.base_url)
+        except urllib.error.URLError as exc:
+            raise ValueError("base_url must be an absolute HTTPS URL.") from exc
         self._rate_origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
     def _monotonic(self) -> float:
@@ -251,7 +257,11 @@ class MusicBrainzClient:
             )
 
     def _open(self, request: urllib.request.Request) -> BinaryIO:
-        return cast(BinaryIO, urllib.request.urlopen(request, timeout=self.timeout))
+        return open_validated_https(
+            request,
+            timeout=self.timeout,
+            policy=self._request_policy,
+        )
 
     def _request_json(self, path: str, params: Mapping[str, Any]) -> Any:
         query = urllib.parse.urlencode(params)
@@ -644,8 +654,17 @@ class CoverArtArchiveClient:
             raise ValueError("artwork_folder must stay inside the project directory.") from exc
         self.base_url = str(base_url).rstrip("/")
         parsed = urllib.parse.urlsplit(self.base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("base_url must be an absolute HTTP or HTTPS URL.")
+        if parsed.scheme != "https" or not parsed.netloc or not parsed.hostname:
+            raise ValueError("base_url must be an absolute HTTPS URL.")
+        try:
+            self._metadata_request_policy = HTTPSRequestPolicy((parsed.hostname,))
+            self._metadata_request_policy.validate(self.base_url)
+        except urllib.error.URLError as exc:
+            raise ValueError("base_url must be an absolute HTTPS URL.") from exc
+        self._artwork_request_policy = HTTPSRequestPolicy(
+            ("coverartarchive.org", "archive.org"),
+            subdomain_hosts=("coverartarchive.org", "archive.org"),
+        )
 
     def _prepare_artwork_directory(self) -> Path:
         """Create and verify each artwork-directory component without following links."""
@@ -700,7 +719,13 @@ class CoverArtArchiveClient:
         return current
 
     def _open(self, request: urllib.request.Request) -> BinaryIO:
-        return cast(BinaryIO, urllib.request.urlopen(request, timeout=self.timeout))
+        accept = request.get_header("Accept", "")
+        policy = (
+            self._artwork_request_policy
+            if accept == "image/jpeg, image/png"
+            else self._metadata_request_policy
+        )
+        return open_validated_https(request, timeout=self.timeout, policy=policy)
 
     def _request_json(self, path: str) -> Any:
         request = urllib.request.Request(

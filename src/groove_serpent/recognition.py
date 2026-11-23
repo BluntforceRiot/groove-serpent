@@ -20,6 +20,7 @@ from .album_publication_policy import speed_correction_details
 from .audio_snapshot import VerifiedAudioSnapshot, verified_audio_snapshot
 from .errors import GrooveSerpentError, ProjectValidationError
 from .executable_discovery import find_executable
+from .safe_http import HTTPSRequestPolicy, open_validated_https
 from .subprocess_policy import (
     BoundedDiagnostic,
     MAX_DIAGNOSTIC_BYTES,
@@ -33,6 +34,7 @@ _MAX_DIAGNOSTIC_BYTES = MAX_DIAGNOSTIC_BYTES
 
 
 ACOUSTID_LOOKUP_URL = "https://api.acoustid.org/v2/lookup"
+_ACOUSTID_REQUEST_POLICY = HTTPSRequestPolicy(("api.acoustid.org",))
 _MAX_FINGERPRINT_SECONDS = 120.0
 _LEAD_AMBIENCE_SECONDS = 8.0
 _MIN_AUDIO_AFTER_SKIP_SECONDS = 15.0
@@ -956,8 +958,10 @@ class AcoustIDRecognitionProvider:
 
         self._wait_for_request_slot()
         try:
-            with urllib.request.urlopen(
-                request, timeout=self._timeout_seconds
+            with open_validated_https(
+                request,
+                timeout=self._timeout_seconds,
+                policy=_ACOUSTID_REQUEST_POLICY,
             ) as response:
                 raw = response.read(self._max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
