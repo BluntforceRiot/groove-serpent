@@ -16,9 +16,9 @@ must not be used to authorize new entries in that file.
 The operator still passes every input path and expected hash. Inputs are copied
 through an open regular-file handle and rejected unless their observed bytes
 match the independently authorized values. Wheel `RECORD` hashes and metadata
-are also checked before extraction. The checked-in media capability-smoke
-implementation must exactly match the source companion and is the only smoke
-program the host interpreter executes.
+are also checked before extraction. The media capability-smoke script in the
+source companion must match the reviewed checkout. The builder runs the checkout's
+script for this check, not code supplied by the companion archive.
 
 ## Required inputs
 
@@ -29,7 +29,7 @@ program the host interpreter executes.
 - `groove-serpent-windows-media-8.1.2-corresponding-source.zip` with its exact
   SHA-256; the builder validates the pair and carries the source archive inside
   the portable directory;
-- Groove Serpent and FFmpeg license texts;
+- the Groove Serpent license; FFmpeg's license travels with the pinned media inputs;
 - a version-matched third-party notice;
 - the stdlib-only `scripts/verify_windows_portable.py` verifier;
 - all three files in `skills/groove-serpent`.
@@ -87,12 +87,12 @@ uv run python scripts/build_windows_portable.py `
   --output-root C:\private-builds\groove-serpent-portable
 ```
 
-`--execute-verified-inputs` is an explicit acknowledgement that the builder will
-run the authorized Python runtime, wheels, media binaries, and packaged verifier.
-It is evaluated only after the complete input set matches the checked-in release
-authority. Smoke subprocesses receive a minimal environment without inherited
-operator credentials, and the media runtime is required to expose no network
-protocols.
+`--execute-verified-inputs` explicitly authorizes the build-time smoke checks using
+the pinned Python runtime, packages, and media binaries. It is evaluated only
+after the complete input set matches the checked-in release authority. Smoke
+subprocesses use an allowlisted environment rather than inheriting operator
+credentials; this is not an operating-system sandbox. The vetted media runtime
+must expose no network protocols.
 
 The output name is
 `Groove-Serpent-VERSION-windows-x64`. Existing output and staging names are
