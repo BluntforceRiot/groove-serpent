@@ -19,6 +19,15 @@ MEDIA_QUERY_TIMEOUT_SECONDS = 30.0
 MEDIA_EVIDENCE_TIMEOUT_SECONDS = 300.0
 MEDIA_ANALYSIS_TIMEOUT_SECONDS = 3_600.0
 MEDIA_RENDER_TIMEOUT_SECONDS = 7_200.0
+_POSIX_KILLPG = getattr(os, "killpg", None)
+_POSIX_SIGKILL = getattr(signal, "SIGKILL", None)
+
+
+def _signal_posix_group(pid: int, *, force: bool) -> None:
+    """Use the POSIX group API without importing it on Windows."""
+    if _POSIX_KILLPG is None or _POSIX_SIGKILL is None:
+        raise OSError("POSIX process-group signaling is unavailable.")
+    _POSIX_KILLPG(pid, _POSIX_SIGKILL if force else signal.SIGTERM)
 
 
 _WINDOWS_JOB_WRAPPER = r"""
@@ -150,7 +159,7 @@ class _DeadlineProcess(subprocess.Popen[bytes]):
             return
         self._media_scope_closed.set()
         try:
-            os.killpg(self.pid, signal.SIGKILL)
+            _signal_posix_group(self.pid, force=True)
         except OSError:
             pass
 
@@ -212,6 +221,8 @@ def start_media_process(
             *launched_command,
         ]
     else:
+        if _POSIX_KILLPG is None or _POSIX_SIGKILL is None:
+            raise OSError("POSIX process-group signaling is unavailable.")
         kwargs["start_new_session"] = True
     return _DeadlineProcess(
         launched_command,
@@ -408,7 +419,7 @@ def join_diagnostic_reader(
 def _signal_process_scope(process: subprocess.Popen[bytes], *, force: bool) -> None:
     if os.name != "nt" and isinstance(process, _DeadlineProcess):
         try:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            _signal_posix_group(process.pid, force=force)
         except OSError:
             pass
         return
