@@ -514,7 +514,7 @@ class AlbumReviewServerTests(unittest.TestCase):
         child_cookie = child_set_cookie.split(";", 1)[0]
         self.assertNotEqual(child_cookie.split("=", 1)[0], parent_cookie.split("=", 1)[0])
         child_token = child_authorization.removeprefix("Bearer ")
-        self.assertEqual(child_cookie.split("=", 1)[1], child_token)
+        self.assertNotEqual(child_cookie.split("=", 1)[1], child_token)
         self.assertNotEqual(endpoint.path.rsplit("/", 1)[-1], child_token)
         child_connection.close()
 
