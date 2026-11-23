@@ -285,10 +285,22 @@ class RecognitionDiscoveryTests(unittest.TestCase):
             path_directory.mkdir()
             suffix = ".exe" if os.name == "nt" else ""
             executable = root / f"fp calc{suffix}"
-            executable.write_bytes(b"configured")
             path_executable = path_directory / f"fpcalc{suffix}"
-            path_executable.write_bytes(b"path")
-            if os.name != "nt":
+            if os.name == "nt":
+                # Discovery now requires a native PE image, including for an
+                # explicit override. The fixture is never executed.
+                dos_header = bytearray(64)
+                dos_header[:2] = b"MZ"
+                dos_header[60:64] = (64).to_bytes(4, "little")
+                coff_header = bytearray(20)
+                coff_header[16:18] = (2).to_bytes(2, "little")
+                coff_header[18:20] = (0x0002).to_bytes(2, "little")
+                image = bytes(dos_header) + b"PE\x00\x00" + bytes(coff_header) + b"\x0b\x02"
+                executable.write_bytes(image)
+                path_executable.write_bytes(image)
+            else:
+                executable.write_bytes(b"configured")
+                path_executable.write_bytes(b"path")
                 executable.chmod(0o755)
                 path_executable.chmod(0o755)
             with mock.patch.dict(
@@ -716,6 +728,14 @@ class RecognitionPipelineTests(unittest.TestCase):
                     return {"fingerprint": "encoded", "duration": 10}
                 finally:
                     source.write_bytes(original)
+                    # A very fast rewrite can retain the same timestamp tick
+                    # on some filesystems. Keep the restored bytes identical
+                    # while making the receipt change deterministic.
+                    restored = source.stat()
+                    os.utime(
+                        source,
+                        ns=(restored.st_atime_ns, restored.st_mtime_ns + 5_000_000_000),
+                    )
 
             runtime = _runtime(Path(temp_dir), "ffmpeg-chromaprint")
             ready = RecognitionReadiness(
