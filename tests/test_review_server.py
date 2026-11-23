@@ -263,7 +263,7 @@ class ReviewServerTests(unittest.TestCase):
         cookie_header = headers["Set-Cookie"]
         self.assertIn("; Path=/; HttpOnly; SameSite=Strict", cookie_header)
         cookie = cookie_header.split(";", 1)[0]
-        self.assertEqual(cookie.split("=", 1)[1], token)
+        self.assertNotEqual(cookie.split("=", 1)[1], token)
 
         status, _headers, _body, _will_close = self.request(
             "GET",
@@ -1296,13 +1296,14 @@ class ReviewServerTests(unittest.TestCase):
 
     def test_post_requires_json_and_same_origin_and_rejects_transfer_encoding(self) -> None:
         cases = [
-            ({"Content-Type": "text/plain"}, 415),
+            ({"Content-Type": "text/plain"}, 415, "Content-Type must be application/json."),
             (
                 {
                     "Content-Type": "application/json",
                     "Origin": f"http://localhost:{self.port}",
                 },
                 403,
+                "Origin does not match this server.",
             ),
             (
                 {
@@ -1310,14 +1311,19 @@ class ReviewServerTests(unittest.TestCase):
                     "Transfer-Encoding": "chunked",
                 },
                 400,
+                "Transfer-Encoding is not supported.",
             ),
         ]
-        for headers, expected_status in cases:
+        for headers, expected_status, expected_error in cases:
             with self.subTest(headers=headers):
-                status, response_headers, _body, will_close = self.request(
-                    "POST", "/api/save", body=b"{}", headers=headers
+                # This header is rejected before any body is read. Sending bytes after
+                # it can race the immediate close and hide the response on Windows.
+                request_body = None if "Transfer-Encoding" in headers else b"{}"
+                status, response_headers, response_body, will_close = self.request(
+                    "POST", "/api/save", body=request_body, headers=headers
                 )
                 self.assertEqual(status, expected_status)
+                self.assertEqual(json.loads(response_body)["error"], expected_error)
                 self.assertEqual(response_headers["Connection"], "close")
                 self.assertTrue(will_close)
 

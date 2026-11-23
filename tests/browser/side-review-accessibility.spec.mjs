@@ -178,6 +178,11 @@ for (const projectResult of ["verified", "missing-receipt"]) {
         }
         await expect.poll(() => player.evaluate((element) => element.currentSrc))
           .toBe(sourceUrl);
+        // Keep the fixture alive until its initial evidence request settles.
+        // Stopping the server during that bounded decode cancels the request.
+        await expect(page.locator("#evidenceStatus")).toHaveText(
+          "Evidence is aligned to the selected marker on one exact sample grid.",
+        );
       } else {
         await expect(page.locator("#sourceIntegrity")).toHaveText("INTEGRITY FAILED");
         await expect(page.locator("#status"))

@@ -138,6 +138,7 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.port = self.server.server_address[1]
         self.authority = f"{self.server.session_auth.public_host}:{self.port}"
         self.base = self.server.session_auth.origin(port=self.port)
+        self._owner_cookie_header: str | None = None
 
     def tearDown(self) -> None:
         self._synthetic_source_probe.stop()
@@ -213,9 +214,12 @@ class AlbumReviewServerTests(unittest.TestCase):
         request_headers = dict(headers or {})
         request_headers.setdefault("Host", self.authority)
         if authenticate:
-            request_headers.setdefault(
-                "Authorization", self.server.session_auth.authorization_header
-            )
+            if method == "POST" and path == "/api/album/open-side":
+                request_headers.setdefault("Cookie", self._owner_cookie())
+            else:
+                request_headers.setdefault(
+                    "Authorization", self.server.session_auth.authorization_header
+                )
         if body is not None:
             request_headers.setdefault("Content-Type", "application/json")
             if add_origin:
@@ -227,6 +231,25 @@ class AlbumReviewServerTests(unittest.TestCase):
         result = response.status, response.headers, response_body
         connection.close()
         return result
+
+    def _owner_cookie(self) -> str:
+        if self._owner_cookie_header is not None:
+            return self._owner_cookie_header
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        connection.request(
+            "GET",
+            self.server.session_auth.bootstrap_path,
+            headers={"Host": self.authority},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 303, body)
+        set_cookie = response.headers.get("Set-Cookie")
+        self.assertIsNotNone(set_cookie)
+        assert set_cookie is not None
+        self._owner_cookie_header = set_cookie.split(";", 1)[0]
+        connection.close()
+        return self._owner_cookie_header
 
     def test_normalized_request_targets_are_rejected_before_bootstrap(self) -> None:
         bootstrap = self.server.session_auth.bootstrap_path
@@ -434,7 +457,17 @@ class AlbumReviewServerTests(unittest.TestCase):
             "POST",
             "/api/album/open-side",
             payload=self.open_side_payload(state),
-            add_origin=False,
+            headers={"Authorization": self.server.session_auth.authorization_header},
+            authenticate=False,
+        )
+        self.assertEqual(status, 403, body)
+        self.assertNotIn(b'"url"', body)
+        status, _headers, body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=self.open_side_payload(state),
+            headers={"Cookie": parent_cookie},
+            authenticate=False,
         )
         self.assertEqual(status, 200, body)
         opened = json.loads(body)
@@ -481,7 +514,7 @@ class AlbumReviewServerTests(unittest.TestCase):
         child_cookie = child_set_cookie.split(";", 1)[0]
         self.assertNotEqual(child_cookie.split("=", 1)[0], parent_cookie.split("=", 1)[0])
         child_token = child_authorization.removeprefix("Bearer ")
-        self.assertEqual(child_cookie.split("=", 1)[1], child_token)
+        self.assertNotEqual(child_cookie.split("=", 1)[1], child_token)
         self.assertNotEqual(endpoint.path.rsplit("/", 1)[-1], child_token)
         child_connection.close()
 
@@ -1367,6 +1400,17 @@ class AlbumReviewServerTests(unittest.TestCase):
     def test_open_side_returns_exact_child_and_reuses_it(self) -> None:
         state = self.state()
         payload = self.open_side_payload(state)
+        status, _headers, rejected_body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=payload,
+            headers={"Authorization": self.server.session_auth.authorization_header},
+            authenticate=False,
+        )
+        self.assertEqual(status, 403, rejected_body)
+        self.assertNotIn(b'"url"', rejected_body)
+        self.assertNotIn("A", self.server._side_review_children)
+
         status, _headers, body = self.request("POST", "/api/album/open-side", payload=payload)
         self.assertEqual(status, 200, body)
         opened = json.loads(body)
@@ -1407,6 +1451,18 @@ class AlbumReviewServerTests(unittest.TestCase):
         self.assertEqual(response.status, 200, project_body)
         project = json.loads(project_body)
         self.assertEqual(project["tracks"][0]["title"], "First")
+
+        status, _headers, rejected_body = self.request(
+            "POST",
+            "/api/album/open-side",
+            payload=payload,
+            headers={"Authorization": self.server.session_auth.authorization_header},
+            authenticate=False,
+        )
+        self.assertEqual(status, 403, rejected_body)
+        self.assertNotIn(b'"url"', rejected_body)
+        self.assertEqual(child.server.session_auth.bootstrap_path, endpoint.path)
+        self.assertEqual(child.url, opened["url"])
 
         status, _headers, body = self.request("POST", "/api/album/open-side", payload=payload)
         self.assertEqual(status, 200, body)
