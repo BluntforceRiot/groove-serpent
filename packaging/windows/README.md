@@ -5,11 +5,20 @@ directory. It does not wrap or call a system Python installation. The bundle has
 an isolated Windows embeddable Python runtime, exact application and dependency
 wheels, and the exact auditable Groove Serpent minimal Windows media runtime.
 
-The builder does not download anything. A release operator must acquire every
-input separately, record its SHA-256, and pass both path and hash. Inputs are
-copied through an open regular-file handle and rejected unless their observed
-bytes match. Wheel `RECORD` hashes and metadata are independently checked before
-extraction.
+The builder does not download anything. Before staging or executing an input,
+it requires the complete release input set to match
+`packaging/windows/input-authority.json`, which is part of the reviewed source
+tree. A release authority must add those exact filenames, versions, roles, and
+SHA-256 values from an independent source before the operator obtains the build
+inputs. Hashes calculated from the acquired files are transport checks only and
+must not be used to authorize new entries in that file.
+
+The operator still passes every input path and expected hash. Inputs are copied
+through an open regular-file handle and rejected unless their observed bytes
+match the independently authorized values. Wheel `RECORD` hashes and metadata
+are also checked before extraction. The media capability-smoke script in the
+source companion must match the reviewed checkout. The builder runs the checkout's
+script for this check, not code supplied by the companion archive.
 
 ## Required inputs
 
@@ -20,10 +29,25 @@ extraction.
 - `groove-serpent-windows-media-8.1.2-corresponding-source.zip` with its exact
   SHA-256; the builder validates the pair and carries the source archive inside
   the portable directory;
-- Groove Serpent and FFmpeg license texts;
+- the Groove Serpent license; FFmpeg's license travels with the pinned media inputs;
 - a version-matched third-party notice;
 - the stdlib-only `scripts/verify_windows_portable.py` verifier;
 - all three files in `skills/groove-serpent`.
+
+Every item above must have one exact record in the selected release entry of
+`input-authority.json`. Adding a release entry is a separate reviewed authority
+step, not part of acquiring artifacts or invoking the builder. The empty
+checked-in authority intentionally refuses all builds until that step is
+complete.
+
+The authority document has schema
+`groove-serpent.windows-portable-input-authority/1` and a `releases` array. Each
+release object has exactly `version`, `python_version`, and `inputs`. Every input
+record binds `role`, basename `filename`, and lowercase `sha256`; wheel records
+also bind normalized `distribution` and `version`, the Python record binds its
+`version`, and skill records bind their portable `destination`. The complete
+input list is compared without relying on record order, and unknown, missing,
+duplicate-release, or mismatched records fail closed.
 
 The media pair must have exact, internally consistent manifests and inventories.
 Its source archive must contain every source input named by the runtime and the
@@ -34,8 +58,9 @@ smoke requires Groove Serpent's app fingerprint to equal direct bundled FFmpeg.
 
 ## Example invocation
 
-First calculate every digest with `Get-FileHash -Algorithm SHA256`. Then run the
-builder with explicit values; placeholders below are intentional:
+First obtain the independently reviewed release entry, then use
+`Get-FileHash -Algorithm SHA256` only to confirm each acquired file matches it.
+Run the builder with those exact values; placeholders below are intentional:
 
 ```powershell
 uv run python scripts/build_windows_portable.py `
@@ -58,8 +83,16 @@ uv run python scripts/build_windows_portable.py `
   --skill-file agents/openai.yaml skills\groove-serpent\agents\openai.yaml AGENT_SHA256 `
   --skill-file references/authority-contract.json `
     skills\groove-serpent\references\authority-contract.json AUTHORITY_SHA256 `
+  --execute-verified-inputs `
   --output-root C:\private-builds\groove-serpent-portable
 ```
+
+`--execute-verified-inputs` explicitly authorizes the build-time smoke checks using
+the pinned Python runtime, packages, and media binaries. It is evaluated only
+after the complete input set matches the checked-in release authority. Smoke
+subprocesses use an allowlisted environment rather than inheriting operator
+credentials; this is not an operating-system sandbox. The vetted media runtime
+must expose no network protocols.
 
 The output name is
 `Groove-Serpent-VERSION-windows-x64`. Existing output and staging names are
@@ -109,13 +142,14 @@ caches outside it are not removed. Inspect before deleting anything.
 
 ## Proven and unproven boundaries
 
-The builder proves exact input bytes, safe bounded extraction, packaged browser
-assets and skill files, exact app/Python/NumPy versions, bundle-local FFmpeg and
-ffprobe identity, exercised libsoxr, an exercised FFmpeg Chromaprint fingerprint,
-deterministic payload bytes, an exact member manifest, and new-directory publication
-on the machine that ran it. Local fingerprint generation is self-contained; an
-owner-supplied AcoustID key and opt-in network lookup are still required to identify
-a recording.
+The builder proves a complete match to the checked-in release input authority,
+exact input bytes, safe bounded extraction, packaged browser assets and skill
+files, exact app/Python/NumPy versions, bundle-local FFmpeg and ffprobe identity,
+exercised libsoxr, an exercised FFmpeg Chromaprint fingerprint, deterministic
+payload bytes, an exact member manifest, and new-directory publication on the
+machine that ran it. Local fingerprint generation is self-contained; an
+owner-supplied AcoustID key and opt-in network lookup are still required to
+identify a recording.
 
 It does not by itself prove an independent clean-machine run, Windows SmartScreen
 reputation, Authenticode signing, legal compliance, general antivirus compatibility,
