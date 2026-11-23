@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -311,6 +312,11 @@ class EvidenceTests(unittest.TestCase):
                 )
             finally:
                 self.source_path.write_bytes(original)
+                restored = self.source_path.stat()
+                os.utime(
+                    self.source_path,
+                    ns=(restored.st_atime_ns, restored.st_mtime_ns + 5_000_000_000),
+                )
 
         with patch(
             "groove_serpent.evidence._decode_exact_float",
