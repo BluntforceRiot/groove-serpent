@@ -138,12 +138,18 @@ def _snapshot_response(
         validate_response(metadata)
 
     body_limit = max_bytes + 1
-    remaining = _remaining(deadline)
-    _set_response_timeout(response, remaining)
-    body = response.read(body_limit)
-    if not isinstance(body, (bytes, bytearray)):
-        raise OSError("Provider response returned non-binary data.")
-    _remaining(deadline)
+    body = bytearray()
+    while len(body) < body_limit:
+        remaining = _remaining(deadline)
+        _set_response_timeout(response, remaining)
+        requested = min(64 * 1024, body_limit - len(body))
+        chunk = response.read(requested)
+        if not isinstance(chunk, (bytes, bytearray)) or len(chunk) > requested:
+            raise OSError("Provider response returned invalid binary data.")
+        _remaining(deadline)
+        if not chunk:
+            break
+        body.extend(chunk)
     return ProviderResponse(
         status=status,
         reason=reason,

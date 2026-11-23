@@ -118,6 +118,7 @@ def _macos_namespace_probe_process(command: list[str]) -> _FakeProcess:
 class _FakeResponse:
     def __init__(self, payload: object) -> None:
         self._raw = json.dumps(payload).encode("utf-8")
+        self._stream = io.BytesIO(self._raw)
 
     def __enter__(self) -> _FakeResponse:
         return self
@@ -126,7 +127,7 @@ class _FakeResponse:
         return None
 
     def read(self, size: int = -1) -> bytes:
-        return self._raw[:size]
+        return self._stream.read(size)
 
 
 def _runtime(

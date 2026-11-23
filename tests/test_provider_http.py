@@ -37,6 +37,11 @@ class _ObservedResponse(_Response):
         return super().read(size)
 
 
+class _ShortReadResponse(_ObservedResponse):
+    def read(self, size: int = -1) -> bytes:
+        return super().read(min(size, 3))
+
+
 class _TrickledBodyResponse:
     status = 200
     reason = "OK"
@@ -108,6 +113,18 @@ class ProviderHTTPTests(unittest.TestCase):
             )
 
         self.assertEqual(response.reads, 0)
+
+    def test_short_reads_are_collected_until_end_of_response(self) -> None:
+        source = _ShortReadResponse(b'{"ok":true}')
+
+        response = fetch_provider_response(
+            lambda _timeout: source,
+            timeout=1.0,
+            max_bytes=1024,
+        )
+
+        self.assertEqual(response.body, b'{"ok":true}')
+        self.assertGreater(source.reads, 2)
 
     def test_stalled_open_expires_total_deadline(self) -> None:
         started = threading.Event()
