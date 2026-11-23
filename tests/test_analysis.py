@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -446,6 +447,11 @@ class AnalysisTests(unittest.TestCase):
                     return [-20.0] * 200, 0.05
                 finally:
                     live.write_bytes(original)
+                    restored = live.stat()
+                    os.utime(
+                        live,
+                        ns=(restored.st_atime_ns, restored.st_mtime_ns + 5_000_000_000),
+                    )
 
             with (
                 self.assertRaisesRegex(ProjectValidationError, "Source audio changed"),

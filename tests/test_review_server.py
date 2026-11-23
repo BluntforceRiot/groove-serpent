@@ -2318,6 +2318,11 @@ class ReviewServerTests(unittest.TestCase):
                     self_outer.assertEqual(source.path.read_bytes(), original)
                 finally:
                     self_live.write_bytes(original)
+                    restored = self_live.stat()
+                    os.utime(
+                        self_live,
+                        ns=(restored.st_atime_ns, restored.st_mtime_ns + 5_000_000_000),
+                    )
                 return []
 
         self_outer = self
