@@ -554,6 +554,29 @@ class ExporterTests(unittest.TestCase):
             with self.assertRaisesRegex(PortablePathError, "ambiguous"):
                 resolve_portable_path(target)
 
+    def test_portable_resolution_detects_new_sibling_with_unchanged_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_value:
+            root = Path(directory_value)
+            first = root / "Cafe\u0301"
+            second = root / "Caf\u00e9"
+            first.mkdir()
+            target = second / "new-batch"
+            portable_names_module._clear_directory_cache()
+
+            # Windows may not update the parent metadata immediately after
+            # mkdir, so a matching stat tuple cannot authorize cached names.
+            with mock.patch.object(
+                portable_names_module, "_directory_identity", return_value=(1,) * 8
+            ):
+                initial = resolve_portable_path(target)
+                self.assertEqual(initial.path.parent, first)
+                try:
+                    second.mkdir()
+                except FileExistsError:
+                    self.skipTest("This filesystem normalizes Unicode directory names.")
+                with self.assertRaisesRegex(PortablePathError, "ambiguous"):
+                    resolve_portable_path(target)
+
     def test_portable_directory_cache_is_safe_under_concurrent_resolution(
         self,
     ) -> None:

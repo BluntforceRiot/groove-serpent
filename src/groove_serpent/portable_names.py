@@ -177,7 +177,7 @@ def resolve_portable_path(
     path: Path,
     *,
     create_parents: bool = False,
-    fresh: bool = False,
+    fresh: bool = True,
 ) -> PortablePathResolution:
     """Resolve every component using NFC/casefold equivalence.
 
@@ -185,8 +185,9 @@ def resolve_portable_path(
     siblings are unsafe and fail closed. Missing components are normalized to
     NFC; when ``create_parents`` is true, missing ancestor directories are
     created one at a time after another equivalence check. The final component
-    is never created by this function. ``fresh`` forces a live directory read
-    when a commit must observe names added after an earlier lookup.
+    is never created by this function. A live directory read is the default:
+    Windows can retain unchanged directory metadata after a sibling appears.
+    ``fresh=False`` is only suitable for non-authoritative display lookups.
     """
 
     absolute = _absolute_path(path)
