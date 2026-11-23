@@ -701,6 +701,98 @@ class RestorationServerTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(render_workflow.call_count, 1)
 
+    def test_continuous_render_and_reject_require_owner_browser(self) -> None:
+        receipt = self._receipt()
+        proposal_sha256 = "1" * 64
+        proposal = {"proposal_sha256": proposal_sha256}
+        attestation = {"owner_attested_scope_reviewed": True}
+        preview_receipt = {
+            "kind": "hum",
+            "receipt_sha256": "2" * 64,
+            "proposal_sha256": proposal_sha256,
+            "created_at": "2026-01-01T00:00:00Z",
+            "context": {"context_sha256": "3" * 64},
+            "audio": {
+                "original": {},
+                "proposed": {},
+                "removed": {},
+            },
+        }
+        render_payload = {
+            **receipt,
+            "action": "render-reviewed-continuous-preview",
+            "proposal_sha256": proposal_sha256,
+            "attestation": attestation,
+        }
+        with (
+            patch(
+                "groove_serpent.review_server.find_current_continuous_artifact",
+                return_value={"payload": proposal},
+            ),
+            patch(
+                "groove_serpent.review_server.validate_continuous_attestation",
+                return_value=attestation,
+            ),
+            patch(
+                "groove_serpent.review_server.render_continuous_preview",
+                return_value=(self.directory / "preview-hum-1", preview_receipt),
+            ) as render_workflow,
+        ):
+            status, headers, body = self._request(
+                "POST",
+                "/api/restoration/continuous/preview",
+                render_payload,
+                authentication="bearer",
+            )
+            self.assertEqual(status, 403, body)
+            self.assertEqual(headers["Connection"], "close")
+            render_workflow.assert_not_called()
+
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/continuous/preview",
+                render_payload,
+                authentication="cookie",
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(render_workflow.call_count, 1)
+
+        reject_payload = {
+            **receipt,
+            "action": "reject-continuous-preview-proposal",
+            "proposal_sha256": proposal_sha256,
+            "reason": "Owner heard audible damage.",
+        }
+        decision = {"decision": "reject_continuous_preview_proposal"}
+        with (
+            patch(
+                "groove_serpent.review_server.find_current_continuous_artifact",
+                return_value={"payload": proposal},
+            ),
+            patch(
+                "groove_serpent.review_server.reject_continuous_proposal",
+                return_value=(self.directory / "decision-hum-1.json", decision),
+            ) as reject_workflow,
+        ):
+            status, headers, body = self._request(
+                "POST",
+                "/api/restoration/continuous/reject",
+                reject_payload,
+                authentication="bearer",
+            )
+            self.assertEqual(status, 403, body)
+            self.assertEqual(headers["Connection"], "close")
+            reject_workflow.assert_not_called()
+
+            status, _headers, body = self._request(
+                "POST",
+                "/api/restoration/continuous/reject",
+                reject_payload,
+                authentication="cookie",
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(reject_workflow.call_count, 1)
+
     def test_recipe_rejects_approved_candidates_without_matching_preview_evidence(
         self,
     ) -> None:
