@@ -500,14 +500,16 @@ class WindowsPortableBuildTests(unittest.TestCase):
     def test_archive_smoke_must_match_checked_in_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            runtime, source = _media_pair(root / "original")
+            original = root / "original"
+            original.mkdir()
+            runtime, source = _media_pair(original)
             with zipfile.ZipFile(source.path, "r") as archive:
                 source_members = {
                     member.filename: archive.read(member)
                     for member in archive.infolist()
                     if member.filename != "SHA256SUMS"
                 }
-            source_members["recipe/capability_smoke.py"] = b"raise SystemExit('attacker')\n"
+            source_members["recipe/capability_smoke.py"] = b"# different fixture bytes\n"
             substituted = _write_zip_with_sums(root / "substituted-source.zip", source_members)
             trusted_smoke = portable.WINDOWS_MEDIA_CAPABILITY_SMOKE.read_bytes()
             with self.assertRaisesRegex(
@@ -532,6 +534,7 @@ class WindowsPortableBuildTests(unittest.TestCase):
             capability_script = root / "capability_smoke.py"
             capability_script.write_text("# checked-in fixture\n", encoding="utf-8")
             observed: dict[str, str] = {}
+            fixture_report = root / ".windows-media-capability-smoke.json"
 
             def complete(
                 command: list[str],
@@ -545,12 +548,26 @@ class WindowsPortableBuildTests(unittest.TestCase):
                 report.write_bytes(embedded)
                 return subprocess.CompletedProcess(command, 0, b"", b"")
 
-            with mock.patch.object(portable, "_run_bounded", side_effect=complete):
+            def remove_fixture_report(report: Path, _identity: portable.PathIdentity) -> bool:
+                # This unit test observes the child environment, not platform file identity.
+                # Cleanup ownership is tested independently on supported filesystems.
+                self.assertEqual(report, fixture_report)
+                report.unlink()
+                return True
+
+            with (
+                mock.patch.object(portable, "_run_bounded", side_effect=complete),
+                mock.patch.object(
+                    portable, "unlink_if_owned_file", side_effect=remove_fixture_report
+                ) as cleanup,
+            ):
                 portable._smoke_windows_media_runtime(
                     root,
                     capability_script,
                     hashlib.sha256(embedded).hexdigest(),
                 )
+            cleanup.assert_called_once()
+            self.assertFalse(fixture_report.exists())
             self.assertEqual(
                 set(observed),
                 {
