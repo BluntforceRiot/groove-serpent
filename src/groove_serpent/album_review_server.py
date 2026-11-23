@@ -2247,6 +2247,24 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _require_owner_browser_channel(self) -> bool:
+        """Reserve child bootstrap capabilities for the album owner's browser."""
+
+        origins = self.headers.get_all("Origin", [])
+        if (
+            self._session_authentication == "cookie"
+            and len(origins) == 1
+            and self._origin_is_same_origin(origins[0])
+        ):
+            return True
+        self._discard_declared_request_body()
+        self.close_connection = True
+        self._error(
+            HTTPStatus.FORBIDDEN,
+            "Opening a side review requires the owner browser session.",
+        )
+        return False
+
     def _discard_declared_request_body(self) -> None:
         _drain_rejected_request_body(self, _MAX_REQUEST_BODY)
 
@@ -4325,6 +4343,8 @@ class AlbumReviewHandler(BaseHTTPRequestHandler):
         )
 
     def _open_side(self) -> None:
+        if not self._require_owner_browser_channel():
+            return
         payload = self._read_json()
         fields = frozenset(
             {
